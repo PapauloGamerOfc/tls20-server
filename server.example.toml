@@ -1,0 +1,14 @@
+# Local-only by default. To expose the prototype deliberately, use 0.0.0.0:1021
+# and configure your firewall. This is an experimental port, not an assignment.
+listen = "127.0.0.1:1021"
+upstream = "127.0.0.1:8080"
+server_name = "localhost"
+certificate_chain = "lab/fullchain.pem"
+private_key = "lab/server.key"
+
+max_connections = 128
+handshake_timeout_seconds = 10
+connect_timeout_seconds = 5
+idle_timeout_seconds = 60
+max_connection_seconds = 3600
+max_bytes_per_direction = 16777216

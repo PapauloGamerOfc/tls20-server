@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+import tempfile
+import unittest
+
+from tls20_server.config import Config, ConfigError, Endpoint, MAX_CONFIG_BYTES, load_config, parse_endpoint
+
+
+class ConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "server.toml"
+
+    def load(self, content):
+        self.path.write_bytes(content if isinstance(content, bytes) else content.encode())
+        return load_config(self.path)
+
+    def test_defaults_are_local_experimental_and_paths_are_relative_to_config(self):
+        config = self.load("")
+        self.assertEqual(config.listen, Endpoint("127.0.0.1", 1021))
+        self.assertEqual(config.upstream, Endpoint("127.0.0.1", 8080))
+        self.assertEqual(config.certificate_chain, self.path.parent / "fullchain.pem")
+        self.assertEqual(config.private_key, self.path.parent / "server.key")
+        self.assertEqual(config.max_connections, 128)
+        self.assertEqual(config.handshake_timeout_seconds, 10)
+        self.assertEqual(config.max_bytes_per_direction, 16777216)
+
+    def test_valid_ipv4_ipv6_and_port_boundaries(self):
+        self.assertEqual(parse_endpoint("0.0.0.0:343"), Endpoint("0.0.0.0", 343))
+        self.assertEqual(parse_endpoint("[::]:65535"), Endpoint("::", 65535))
+        self.assertEqual(parse_endpoint("[::1]:1", loopback=True), Endpoint("::1", 1))
+        config = self.load('listen = "[::]:1021"\nupstream = "[::1]:8080"')
+        self.assertEqual(str(config.listen), "[::]:1021")
+
+    def test_remote_backend_dns_and_ambiguous_endpoints_are_rejected(self):
+        for value in (
+            "localhost:8080", "https://127.0.0.1:8080", "127.0.0.1:0",
+            "127.0.0.1:65536", "127.0.0.1:-1", "127.0.0.1:+443",
+            "127.0.0.1: 443", " 127.0.0.1:443", "::1:8080", "[::1]8080",
+            "[127.0.0.1]:443", "[::1%eth0]:443", None, 123, "x" * 129,
+        ):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                parse_endpoint(value)
+        for value in ("192.0.2.1:80", "0.0.0.0:80", "[::]:80", "[2001:db8::1]:80"):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                parse_endpoint(value, loopback=True)
+        with self.assertRaises(ConfigError):
+            Config(upstream=Endpoint("192.0.2.1", 80))
+
+    def test_strict_fields_and_value_types(self):
+        for content in (
+            "typo = 1", "[section]\nlisten='127.0.0.1:1021'", "max_connections = true",
+            "max_connections = 0", "max_connections = 1.5", "max_bytes_per_direction = -1",
+            "handshake_timeout_seconds = 31", "handshake_timeout_seconds = 0",
+            "handshake_timeout_seconds = true", "idle_timeout_seconds = inf",
+            "idle_timeout_seconds = nan", "connect_timeout_seconds = -inf",
+            'connect_timeout_seconds = "10"', "max_connection_seconds = 0",
+            'private_key = ""', "certificate_chain = []", "listen = false",
+        ):
+            with self.subTest(content=content), self.assertRaises(ConfigError):
+                self.load(content)
+        config = self.load("max_connections=1\nhandshake_timeout_seconds=30\nidle_timeout_seconds=0.5")
+        self.assertEqual(config.idle_timeout_seconds, 0.5)
+        with self.assertRaises(ConfigError):
+            replace(config, idle_timeout_seconds=10 ** 1000)
+
+    def test_dns_name_profile(self):
+        for value in (
+            "", "Example.com", "example.com.", "*.example.com", "127.0.0.1",
+            "a..b", "-a.com", "a-.com", "a_b.com", "é.com", "a" * 64 + ".com",
+            12, "a." * 127,
+        ):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                Config(server_name=value)
+        self.assertEqual(Config(server_name="xn--test-9ta.invalid").server_name, "xn--test-9ta.invalid")
+
+    def test_invalid_toml_encoding_missing_file_and_size(self):
+        for content in (b"\xff", "listen =", "listen='127.0.0.1:1'\nlisten='127.0.0.1:2'"):
+            with self.subTest(content=content), self.assertRaises(ConfigError):
+                self.load(content)
+        with self.assertRaises(ConfigError):
+            self.load(b"#" * (MAX_CONFIG_BYTES + 1))
+        self.assertEqual(self.load(b"#" * MAX_CONFIG_BYTES).server_name, "localhost")
+        with self.assertRaises(ConfigError):
+            load_config(self.path.parent / "missing.toml")
+
+    def test_paths_and_api_port_zero(self):
+        config = self.load('private_key="secrets/key.pem"\ncertificate_chain="certs/fullchain.pem"')
+        self.assertEqual(config.private_key, self.path.parent / "secrets" / "key.pem")
+        self.assertEqual(Config(listen=Endpoint("127.0.0.1", 0)).listen.port, 0)
+        with self.assertRaises(ConfigError):
+            self.load('listen="127.0.0.1:0"')
+
+
+if __name__ == "__main__":
+    unittest.main()
