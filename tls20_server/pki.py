@@ -21,7 +21,7 @@ import stat
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519, x25519
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils, x25519
 from cryptography.x509.oid import ExtendedKeyUsageOID, ExtensionOID
 
 from .errors import ConfigurationError, ProtocolError
@@ -130,9 +130,27 @@ def _encoding(cert: x509.Certificate) -> tuple[bytes, bytes]:
         raise ProtocolError("X.509 v3 certificate required")
     if tbs[2][2] != outer[1][2]:
         raise ProtocolError("certificate signature algorithms differ")
+    # Signatures in this profile are octet strings carried by ASN.1 BIT STRING.
+    # Some parsers accept a nonzero unused-bit count while returning unchanged
+    # signature octets when those trailing bits happen to be zero. That byte is
+    # outside TBSCertificate, so signature verification alone cannot reject it.
+    signature_bits = outer[2][1]
+    if len(signature_bits) < 2 or signature_bits[0] != 0:
+        raise ProtocolError("certificate signature BIT STRING must be octet-aligned")
+    signature = signature_bits[1:]
+    algorithm = outer[1][2]
+    if algorithm == _ED25519_ALGORITHM and len(signature) != 64:
+        raise ProtocolError("Ed25519 certificate signature must be 64 bytes")
+    if algorithm == _P256_SHA256_ALGORITHM:
+        try:
+            r, s = utils.decode_dss_signature(signature)
+        except ValueError as exc:
+            raise ProtocolError("invalid ECDSA certificate signature encoding") from exc
+        if not (0 < r < 1 << 256 and 0 < s < 1 << 256):
+            raise ProtocolError("ECDSA certificate signature is outside the P-256 size bounds")
     if tbs[6][0] != 0x30:
         raise ProtocolError("invalid public key encoding")
-    return tbs[6][2], outer[1][2]
+    return tbs[6][2], algorithm
 
 
 def _parse_der(der: bytes) -> x509.Certificate:

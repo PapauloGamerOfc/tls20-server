@@ -9,16 +9,28 @@ import unittest
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519, x25519
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils, x25519
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from tls20_server.errors import ConfigurationError, ProtocolError
 from tls20_server.lab import create_lab, generate_lab_credentials
-from tls20_server.pki import load_credentials, load_trust_roots, validate_chain, validate_server_name
+from tls20_server.pki import _children, _element, _parse_der, load_credentials, load_trust_roots, validate_chain, validate_server_name
 
 
 def der(cert):
     return cert.public_bytes(serialization.Encoding.DER)
+
+
+def replace_signature(cert, signature):
+    """Re-envelope a test signature without relying on a valid signing key."""
+    def tlv(tag, body):
+        size = len(body)
+        count = max(1, (size.bit_length() + 7) // 8)
+        length = bytes([size]) if size < 128 else bytes([0x80 | count]) + size.to_bytes(count, "big")
+        return bytes([tag]) + length + body
+    _, body, _, _ = _element(der(cert))
+    children = _children(body)
+    return tlv(0x30, children[0][2] + children[1][2] + tlv(0x03, b"\x00" + signature))
 
 
 def issue(key, issuer_key, subject, issuer, *, ca=False, path_length=None,
@@ -107,6 +119,39 @@ class CertificateTests(unittest.TestCase):
         mutated[version] = 3
         with self.assertRaises(ProtocolError):
             self.validate(chain=[bytes(mutated)])
+
+    def test_signature_bit_string_unused_bits_are_rejected_deterministically(self):
+        # Public fixed test keys, dates and serial make this independent of the
+        # random CA/leaf fixtures. Its signature ends with 0x0a (one zero bit).
+        # cryptography accepts unused_bits=1 and preserves signature octets, so
+        # ordinary signature verification would accept the alternate encoding.
+        ca_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "BIT STRING regression")])
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                .public_key(x25519.X25519PrivateKey.from_private_bytes(bytes(range(32, 64))).public_key())
+                .serial_number(3).not_valid_before(datetime(2020, 1, 1, tzinfo=timezone.utc))
+                .not_valid_after(datetime(2040, 1, 1, tzinfo=timezone.utc)).sign(ca_key, None))
+        self.assertEqual(cert.signature[-1], 0x0a)
+        original = der(cert)
+        signature_offset = len(original) - len(cert.signature) - 1
+        self.assertEqual(original[signature_offset - 2:signature_offset + 1], b"\x03\x41\x00")
+        self.assertEqual(_parse_der(original).signature, cert.signature)
+        for unused_bits in range(1, 8):
+            changed = original[:signature_offset] + bytes([unused_bits]) + original[signature_offset + 1:]
+            with self.subTest(unused_bits=unused_bits), self.assertRaises(ProtocolError):
+                _parse_der(changed)
+
+    def test_signature_algorithm_encoding_and_size_bounds(self):
+        for size in (0, 63, 65):
+            with self.subTest(algorithm="Ed25519", size=size), self.assertRaises(ProtocolError):
+                _parse_der(replace_signature(self.leaf, bytes(size)))
+        ca_key = ec.generate_private_key(ec.SECP256R1())
+        leaf = issue(self.key, ca_key, self.name, self.ca_name)
+        malformed = (b"", b"garbage", utils.encode_dss_signature(0, 1),
+                     utils.encode_dss_signature(1, 0), utils.encode_dss_signature(1 << 256, 1))
+        for signature in malformed:
+            with self.subTest(algorithm="P256", signature=signature.hex()), self.assertRaises(ProtocolError):
+                _parse_der(replace_signature(leaf, signature))
 
     def test_unsupported_general_name_is_normalized_to_protocol_error(self):
         # A signed SubjectAlternativeName with the unsupported x400Address arm.

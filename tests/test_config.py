@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -22,8 +23,8 @@ class ConfigurationTests(unittest.TestCase):
         config = self.load("")
         self.assertEqual(config.listen, Endpoint("127.0.0.1", 1021))
         self.assertEqual(config.upstream, Endpoint("127.0.0.1", 8080))
-        self.assertEqual(config.certificate_chain, self.path.parent / "fullchain.pem")
-        self.assertEqual(config.private_key, self.path.parent / "server.key")
+        self.assertEqual(config.certificate_chain, (self.path.parent / "fullchain.pem").resolve())
+        self.assertEqual(config.private_key, (self.path.parent / "server.key").resolve())
         self.assertEqual(config.max_connections, 128)
         self.assertEqual(config.handshake_timeout_seconds, 10)
         self.assertEqual(config.max_bytes_per_direction, 16777216)
@@ -89,10 +90,27 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_paths_and_api_port_zero(self):
         config = self.load('private_key="secrets/key.pem"\ncertificate_chain="certs/fullchain.pem"')
-        self.assertEqual(config.private_key, self.path.parent / "secrets" / "key.pem")
+        self.assertEqual(config.private_key, (self.path.parent / "secrets" / "key.pem").resolve())
+        self.assertEqual(config.certificate_chain, (self.path.parent / "certs" / "fullchain.pem").resolve())
         self.assertEqual(Config(listen=Endpoint("127.0.0.1", 0)).listen.port, 0)
         with self.assertRaises(ConfigError):
             self.load('listen="127.0.0.1:0"')
+
+    @unittest.skipUnless(os.name == "posix", "Symlink creation can require Windows privileges")
+    def test_symlinked_configuration_resolves_paths_at_its_real_directory(self):
+        directory = self.path.parent / "actual"
+        directory.mkdir()
+        real_config = directory / "server.toml"
+        real_config.write_text('private_key="keys/server.key"', encoding="utf-8")
+        directory_alias = self.path.parent / "directory-alias"
+        directory_alias.symlink_to(directory, target_is_directory=True)
+        file_alias = self.path.parent / "file-alias.toml"
+        file_alias.symlink_to(real_config)
+        for path in (directory_alias / "server.toml", file_alias):
+            with self.subTest(path=path):
+                config = load_config(path)
+                self.assertEqual(config.private_key, (directory / "keys" / "server.key").resolve())
+                self.assertEqual(config.certificate_chain, (directory / "fullchain.pem").resolve())
 
 
 if __name__ == "__main__":
