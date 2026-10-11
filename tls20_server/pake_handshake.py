@@ -131,7 +131,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             receive_limit = _record_limit(record_size_limit) if 28 in ext else 16385
             if 1 in ext and 28 not in ext:
                 send_limit = receive_limit = _peer_fragment_limit(ext[1])
-            context = policy.context(protocol, receive_limit) + (signaling.context() if signaling is not None else b"")
+            context = policy.context(protocol) + (signaling.context() if signaling is not None else b"")
             ticket = None
             identity_index = 0
             pwd = bool({29, 30} & set(ext))
@@ -273,7 +273,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                     role="server",hash_name=selected.hash_name)
             if ticket and hello.early_data:
                 early_secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE + ch)
-                early_receiver = c.RecordState(early_secret, "open", selected_id, receive_limit) if accepted else None
+                early_receiver = c.RecordState(early_secret, "open", selected_id, ticket.record_size_limit) if accepted else None
                 if accepted:
                     emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", hello.random, early_secret)
                 total = discarded = 0
@@ -329,7 +329,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                 for _ in range(controls.expected_tickets if controls.expected_tickets is not None else 1):
                     message = ticket_store.issue(resumption, policy.service, protocol, early_limit, context,
                                                  cipher_suite=ordinary_suite, pake_identity=identity,
-                                                 allowed_psk_modes=successor_modes)
+                                                 allowed_psk_modes=successor_modes, record_size_limit=receive_limit)
                     if message:
                         await channel.send_handshake(message)
             return channel

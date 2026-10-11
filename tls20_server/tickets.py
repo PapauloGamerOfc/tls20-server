@@ -71,11 +71,13 @@ class TicketStore:
     def issue(self, secret, name, protocol, max_early_data=0, context=b"", client_certificate_chain=None,
               *, cipher_suite=0x1301, client_certificate_type=0, client_certificate_extensions=(),
               external_psk_identity=b"", pake_identity=b"", native_provider=None,
-              allowed_psk_modes=(1, 0)):
+              allowed_psk_modes=(1, 0), record_size_limit=16385):
         allowed_psk_modes = tuple(allowed_psk_modes)
         if (not allowed_psk_modes or len(set(allowed_psk_modes)) != len(allowed_psk_modes)
                 or any(type(mode) is not int or mode not in (0, 1) for mode in allowed_psk_modes)):
             raise ValueError("invalid ticket PSK key exchange modes")
+        if type(record_size_limit) is not int or not 64 <= record_size_limit <= 16385:
+            raise ValueError("invalid ticket early record size limit")
         nonce, identity = os.urandom(8), os.urandom(32)
         age_add = int.from_bytes(os.urandom(4), "big")
         selected = c.suite(cipher_suite)
@@ -106,6 +108,9 @@ class TicketStore:
             ticket.external_psk_identity = external_psk_identity
             ticket.pake_identity = pake_identity
             ticket.allowed_psk_modes = allowed_psk_modes
+            # The next handshake renegotiates its own limits; early records
+            # still use the receive limit established with this ticket's PSK.
+            ticket.record_size_limit = record_size_limit
             self._tickets[identity] = ticket
             self._bytes += size
         return message

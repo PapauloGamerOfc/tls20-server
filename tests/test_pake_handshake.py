@@ -259,6 +259,38 @@ class PakeHandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.sender.record_limit,64)
         self.assertEqual(second.early_exporter("fixture"),self.channels[-1].early_exporter("fixture"))
 
+    async def test_password_resumption_remembers_early_limit_when_rsl_changes(self):
+        self.options = {"record_size_limit": 64}
+        await self.connect()
+        previous = next(iter(self.cache._tickets.values()))
+        self.assertEqual(self.store._tickets[previous.identity].record_size_limit, 16385)
+        channel = await self.connect(record_size_limit=512, early_data=b"x" * 100)
+        self.assertTrue(channel.resumed)
+        self.assertTrue(channel.early_data_accepted)
+        self.assertEqual(self.early, [b"x" * 100, b""])
+        self.assertEqual(channel.sender.record_limit, 64)
+        current = next(iter(self.cache._tickets.values()))
+        self.assertEqual(self.store._tickets[current.identity].record_size_limit, 64)
+        self.early.clear()
+        self.options["record_size_limit"] = 128
+        channel = await self.connect(early_data=b"x" * 100)
+        self.assertTrue(channel.resumed)
+        self.assertTrue(channel.early_data_accepted)
+        self.assertEqual([len(value) for value in self.early], [63, 37, 0])
+        self.assertEqual(channel.sender.record_limit, 16385)
+        self.assertFalse(self.errors)
+
+    async def test_password_early_limit_cannot_be_relaxed_by_omitting_rsl(self):
+        self.options = {"record_size_limit": 64}
+        await self.connect(record_size_limit=512)
+        previous = next(iter(self.cache._tickets.values()))
+        self.assertEqual(self.store._tickets[previous.identity].record_size_limit, 64)
+        previous.record_size_limit = 16385  # Model a nonconforming early sender.
+        with self.assertRaises(ProtocolError) as failure:
+            await self.connect(early_data=b"x" * 100)
+        self.assertEqual(failure.exception.alert, 22)
+        self.assertFalse(self.early)
+
     async def test_consumed_early_ticket_not_replayed_and_exporter_lifecycle(self):
         await self.connect()
         captured=replace(next(iter(self.cache._tickets.values())))

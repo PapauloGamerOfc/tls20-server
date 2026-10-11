@@ -14,6 +14,29 @@ class GenericHandshakeTests(unittest.IsolatedAsyncioTestCase):
     handle = test_sessions.SessionTests.handle
     connect = test_sessions.SessionTests.connect
 
+    async def test_psk_ke_ignores_groups_without_a_common_traffic_group(self):
+        key = ExternalPSK(b"PSK-only groups", b"explicit public test fixture", "localhost")
+        self.server_options = {"external_psks": (key,)}
+        for groups in (b"\x2a\x2a", b"\xfe\xff", b"\x2a\x2a\xfe\xff"):
+            with self.subTest(groups=groups):
+                channel = await self.connect(external_psk=key, psk_modes=(0,),
+                    certificate_evidence_extensions=((10, m._vec(groups, 2)),))
+                await channel.send(b"PSK-only data")
+                self.assertEqual(await channel.recv(), b"PSK-only data")
+        self.assertFalse(self.errors)
+
+    async def test_wire_sni_is_case_insensitive_across_retry_and_resumption(self):
+        original = m.client_hello
+        def mixed_case(*args, **kwargs):
+            return original(*args, **kwargs).replace(b"localhost", b"LocalHost")
+        with patch.object(m, "client_hello", mixed_case):
+            for options in ({"force_retry": True}, {}, {"early_data": b"early case-insensitive SNI"}):
+                channel = await self.connect(**options)
+                self.assertIn(b"LocalHost", channel.handshake_transcript)
+                await channel.send(b"case-insensitive service identity")
+                self.assertEqual(await channel.recv(), b"case-insensitive service identity")
+        self.assertFalse(self.errors)
+
     async def test_supported_groups_in_encrypted_extensions_is_advisory(self):
         original = m.encrypted_extensions
         def with_groups(*args, **kwargs):

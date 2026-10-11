@@ -44,6 +44,17 @@ class MessageTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ProtocolError):
                 m.validate_name(name)
 
+    def test_wire_sni_normalization_preserves_actual_extension_bytes(self):
+        for canonical, offered in ((b"example.test", b"EXAMPLE.TeSt"),
+                                   (b"xn--bcher-kva.test", b"XN--BCHER-KVA.TeSt")):
+            hello = m.client_hello(self.A, self.B, canonical.decode(), self.random)
+            wire = hello.replace(canonical, offered)
+            parsed = m.parse_client_hello(wire[4:])
+            self.assertEqual(parsed.name, canonical.decode())
+            self.assertIn(offered, dict(parsed.extension_values)[0])
+            with self.assertRaises(ProtocolError):
+                m.validate_service_identity(offered.decode())
+
     def test_client_hello_exact_consumption_and_mutations(self):
         body = self.ch[4:]
         for length in range(len(body)):

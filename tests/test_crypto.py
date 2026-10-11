@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import unittest
+from unittest.mock import Mock, patch
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -22,6 +23,71 @@ def unhex(value):
 
 
 class CryptoTests(unittest.TestCase):
+    def test_provider_record_failures_close_state_and_release_secrets(self):
+        record = c.RecordState(bytes(32), "seal").seal(b"fixture", 23)
+        for operation in ("seal", "open"):
+            for failure in (RuntimeError, MemoryError):
+                with self.subTest(operation=operation, failure=failure.__name__):
+                    state = c.RecordState(bytes(32), operation)
+                    state._cipher = Mock()
+                    method = state._cipher.encrypt if operation == "seal" else state._cipher.decrypt
+                    method.side_effect = failure("provider failed")
+                    with self.assertRaises(failure):
+                        if operation == "seal":
+                            state.seal(b"fixture", 23)
+                        else:
+                            state.open(record)
+                    self.assertTrue(state.failed)
+                    self.assertEqual((state.secret, state.key, state.iv), (b"", b"", b""))
+                    self.assertIsNone(state._cipher)
+                    self.assertIsNone(state.provider)
+                    with self.assertRaises(ProtocolError):
+                        if operation == "seal":
+                            state.seal(b"retry", 23)
+                        else:
+                            state.open(record)
+
+    def test_failed_record_update_releases_partial_epoch_state(self):
+        for target, name in ((c, "label_expand"), (c, "key_iv"), (c.RecordState, "_reset_cipher")):
+            with self.subTest(stage=name):
+                state = c.RecordState(bytes(32), "seal")
+                with patch.object(target, name, side_effect=RuntimeError("provider failed")):
+                    with self.assertRaisesRegex(RuntimeError, "provider failed"):
+                        state.update()
+                self.assertTrue(state.failed)
+                self.assertEqual((state.secret, state.key, state.iv), (b"", b"", b""))
+                self.assertIsNone(state._cipher)
+                with self.assertRaises(ProtocolError):
+                    state.seal(b"inconsistent epoch", 23)
+
+    def test_epoch_probe_releases_trial_secrets_without_closing_receiver(self):
+        from contextlib import nullcontext
+        record = c.RecordState(bytes(32), "seal").seal(b"probe", 23)
+        original_close = c.RecordState.close
+        for outcome in ("valid", "bad_tag", "provider_error"):
+            with self.subTest(outcome=outcome):
+                state, trials = c.RecordState(bytes(32), "open"), []
+                def track_close(trial):
+                    trials.append(trial)
+                    original_close(trial)
+                fault = (patch.object(c.RecordState, "open", side_effect=RuntimeError("provider failed"))
+                         if outcome == "provider_error" else nullcontext())
+                with patch.object(c.RecordState, "close", track_close), fault:
+                    if outcome == "provider_error":
+                        with self.assertRaisesRegex(RuntimeError, "provider failed"):
+                            state.try_open(record)
+                    elif outcome == "bad_tag":
+                        self.assertIsNone(state.try_open(record[:-1] + bytes((record[-1] ^ 1,))))
+                    else:
+                        self.assertEqual(state.try_open(record), (b"probe", 23))
+                self.assertFalse(state.failed)
+                self.assertEqual(state.sequence, int(outcome == "valid"))
+                self.assertTrue(trials)
+                for trial in trials:
+                    self.assertIsNot(trial, state)
+                    self.assertEqual((trial.secret, trial.key, trial.iv), (b"", b"", b""))
+                    self.assertIsNone(trial._cipher)
+
     def test_rfc7748_known_answer(self):
         alice = X25519PrivateKey.from_private_bytes(unhex(
             "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"))

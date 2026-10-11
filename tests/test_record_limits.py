@@ -89,6 +89,71 @@ class RecordLimitNetworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b"".join(self.early), b"x" * 513)
         self.assertTrue(all(len(chunk) <= 63 for chunk in self.early))
 
+    async def test_early_limit_survives_adding_rsl_on_resumption(self):
+        self.server_options = {"record_size_limit": 64}
+        await self.connect()
+        old = next(iter(self.cache._tickets.values()))
+        self.assertEqual(self.store._tickets[old.identity].record_size_limit, 16385)
+        channel = await self.connect(record_size_limit=512, early_data=b"x" * 100)
+        self.assertTrue(channel.resumed)
+        self.assertTrue(channel.early_data_accepted)
+        self.assertEqual(self.early, [b"x" * 100, b""])
+        self.assertEqual(channel.sender.record_limit, 64)
+        current = next(iter(self.cache._tickets.values()))
+        self.assertEqual(current.record_size_limit, 64)
+        self.assertEqual(self.store._tickets[current.identity].record_size_limit, 64)
+
+    async def test_early_limit_survives_new_server_limit_and_mfl(self):
+        # MFL is remembered for early records just like an RSL negotiation.
+        await self.connect(max_fragment_length=1)
+        old = next(iter(self.cache._tickets.values()))
+        self.assertEqual(self.store._tickets[old.identity].record_size_limit, 513)
+        self.server_options = {"record_size_limit": 64}
+        channel = await self.connect(record_size_limit=512, early_data=b"x" * 300)
+        self.assertTrue(channel.resumed)
+        self.assertTrue(channel.early_data_accepted)
+        self.assertEqual(self.early, [b"x" * 300, b""])
+        self.assertEqual(channel.sender.record_limit, 64)
+
+    async def test_omitting_rsl_does_not_relax_early_receive_limit(self):
+        self.server_options = {"record_size_limit": 64}
+        await self.connect(record_size_limit=512)
+        old = next(iter(self.cache._tickets.values()))
+        self.assertEqual(self.store._tickets[old.identity].record_size_limit, 64)
+        old.record_size_limit = 16385  # Model a nonconforming early sender.
+        with self.assertRaises(ProtocolError) as failure:
+            await self.connect(early_data=b"x" * 100)
+        self.assertEqual(failure.exception.alert, 22)
+        self.assertFalse(self.early)
+
+    async def test_external_psk_early_limit_is_provisioned_independently_of_new_rsl(self):
+        from dataclasses import replace
+        from tls20_server.psk import ExternalPSK
+        key = ExternalPSK(b"early limits", b"explicit public test fixture", "localhost",
+                          max_early_data=1024, record_size_limit=512)
+        self.server_options = {"record_size_limit": 64, "external_psks": (key,),
+                               "external_early_replay": lambda *args: True}
+        channel = await self.connect(external_psk=key, record_size_limit=512, early_data=b"x" * 100)
+        self.assertTrue(channel.early_data_accepted)
+        self.assertEqual(self.early, [b"x" * 100, b""])
+        self.cache._tickets.clear()
+        self.early.clear()
+        self.server_options["external_psks"] = (replace(key, record_size_limit=64),)
+        with self.assertRaises(ProtocolError) as failure:
+            await self.connect(external_psk=key, early_data=b"x" * 100)
+        self.assertEqual(failure.exception.alert, 22)
+        self.assertFalse(self.early)
+
+    async def test_rsl_ignores_malformed_and_unknown_mfl(self):
+        self.server_options = {"record_size_limit": 128}
+        for value in (b"", b"\x00", b"\x05", b"\x01\x00"):
+            with self.subTest(value=value):
+                channel = await self.connect(record_size_limit=512,
+                    certificate_evidence_extensions=((1, value),))
+                self.assertEqual(channel.sender.record_limit, 128)
+                self.assertEqual(channel.receiver.record_limit, 512)
+        self.assertFalse(self.errors)
+
     async def test_oversized_early_record_is_rejected_before_callback(self):
         self.server_options = {"record_size_limit": 64}
         await self.connect(record_size_limit=512)

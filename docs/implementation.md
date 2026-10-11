@@ -84,9 +84,21 @@ before selecting ordinary credentials or resumption. This also applies to
 initial/PHA/cached certificate requests and application-authenticator requests.
 Version negotiation uses the specification's distinct `protocol_version`,
 `missing_extension`, `decode_error` and `illegal_parameter` alerts. Unknown
-offers still follow their defined ignore rules. `user_canceled` is advisory
-during and after the handshake, and received fatal/closure alerts do not cause
-an alert-response loop.
+offers still follow their defined ignore rules. An unknown-only supported-group
+list does not prevent an otherwise valid PSK-only (`psk_ke`) exchange. Received
+DNS SNI is compared case-insensitively; the original extension bytes remain in
+the transcript and retry-continuity checks. Configuration names stay canonical.
+`user_canceled` is advisory between complete handshake messages, not permission
+to interleave an alert into a fragmented message. Received fatal alerts terminate
+the connection without an alert-response loop.
+
+When both record-size extensions are offered, `record_size_limit` takes precedence
+and `max_fragment_length` is ignored, including an unrecognized MFL value.
+Tickets retain the previously negotiated server receive limit for 0-RTT; external
+PSKs use their explicitly provisioned early-record limit. The resumed handshake
+negotiates independent limits for its later handshake/application records. This
+also applies to password-authenticated sessions: adding, omitting or changing a
+record-limit offer cannot retroactively change the limit on early records.
 
 ### Client certificate policy
 
@@ -285,6 +297,11 @@ possession; a policy callback is not a success notification. Additional identiti
 never replace the original connection identity, and consumed contexts cannot be
 reused. An appropriate application framing can use these over `h2`; its TLS PHA
 prohibition is not a prohibition of application authenticators.
+Recognized OID filters (including key usage and extended key usage) constrain
+both local credential selection and received authenticators, before application
+authorization. An unsuitable requested credential produces an authenticated
+refusal; a peer cannot bypass the filter with a valid MAC/Finished. CA-name lists
+remain selection preferences, not independent trust or authorization decisions.
 
 ### Test-only diagnostic build
 
@@ -324,7 +341,27 @@ and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
 
-### Local validation: 2026-10-11
+### Conformance and secret-lifecycle validation: 2026-10-11
+
+The final Windows suite ran 586 tests successfully with all optional native
+providers supplied; two POSIX-specific checks were skipped. The minimal-provider
+run also completed 586 tests, with 76 optional-provider/OS skips. Regressions
+cover remembered/provisioned 0-RTT record limits (including PAKE), MFL/RSL
+precedence, PSK-only unknown groups, mixed-case SNI through retry/resumption,
+authenticator KU/EKU filters, and alert interleaving in both initial and
+post-handshake messages. Terminal connection and record-state cleanup is checked
+with references retained across teardown, injected key-derivation failures,
+cancellation, idempotent cleanup, unavailable exporters and valid half-close.
+
+All 19 portable Phromium interoperability invocations and all 18 optional-provider
+commands passed against this worktree, including the pinned-spec oracle. Python
+module compilation, documentation links, wheel/source-archive build and an
+isolated wheel installation/CLI check passed. Test logs are retained locally under
+`build/conformance-fixes-*`; these results do not claim that a future remote CI
+run or full-browser Linux/macOS build has passed. The Python memory-erasure
+limitations in [SECURITY.md](../SECURITY.md#keys-and-process-memory) still apply.
+
+### Historical local validation: 2026-10-11
 
 The final Windows native-provider suite completed successfully: 534 tests.
 The two skips are Windows-specific POSIX-mode and

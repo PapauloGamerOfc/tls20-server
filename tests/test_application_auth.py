@@ -5,9 +5,11 @@ import hashlib
 import hmac
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from cryptography import x509
-from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.asymmetric import ec, x25519
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from tls20_server import crypto as c, messages as m
 from tls20_server.application_auth import (
@@ -15,6 +17,10 @@ from tls20_server.application_auth import (
 )
 from tls20_server.errors import ProtocolError
 from tls20_server.lab import generate_lab_credentials
+from tls20_server.credential_profiles import CredentialPolicy
+from tls20_server.credential_selection import encode_oid_filters
+from tls20_server.pki import Credentials
+from tests.test_pki import issue, der
 
 
 def endpoint(role, root, private, peer, suite=0x1301):
@@ -102,6 +108,52 @@ class AuthenticatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.server.validate(response, self.policy)).authenticated)
         with self.assertRaises(ProtocolError):
             self.server.authenticate(self.credentials, request=request)
+
+    async def test_requested_oid_filters_select_credentials_or_authenticated_refusal(self):
+        ca = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Authenticator filter CA")])
+        root = issue(ca, ca, name, name, ca=True)
+        for role, verifier, prover, eku in (
+                ("server", self.client, self.server, ExtendedKeyUsageOID.SERVER_AUTH),
+                ("client", self.server, self.client, ExtendedKeyUsageOID.CLIENT_AUTH)):
+            private = x25519.X25519PrivateKey.generate()
+            leaf = issue(private, ca, name, name, hostname="localhost", eku=False,
+                         extra=[(x509.ExtendedKeyUsage([eku]), False)])
+            credentials = Credentials([der(leaf)], private)
+            policy = CredentialPolicy(trust_roots=(root,), peer_name="localhost",
+                revocation_policy="offline", authorize_client=lambda material, evidence: material == (der(leaf),))
+            validator = credential_validator(policy, role=role, authorize=lambda identity: True)
+            for oid, requirement, accepted in (
+                    ("2.5.29.37", x509.ExtendedKeyUsage([eku]), True),
+                    ("2.5.29.37", b"", True),
+                    ("2.5.29.37", x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CODE_SIGNING]), False),
+                    ("2.5.29.15", x509.KeyUsage(True, False, False, False, False, False, False, False, False), False),
+                    ("1.2.3.4", b"", True)):
+                with self.subTest(role=role, oid=oid, accepted=accepted):
+                    request = verifier.request(extra_extensions=[(48, encode_oid_filters([(oid, requirement)]))])
+                    response = prover.authenticate(credentials, request=request, entry_extensions=[()])
+                    self.assertEqual(response[0], 11 if accepted else 20)
+                    result = await verifier.validate(response, validator, request=request)
+                    self.assertEqual(result.authenticated, accepted)
+                    if not accepted:
+                        self.assertIsNone(result.identity)
+                        self.assertIsNone(result.certificate)
+
+    async def test_peer_cannot_bypass_authenticator_oid_filters(self):
+        requirement = encode_oid_filters([
+            ("2.5.29.37", x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CODE_SIGNING]))])
+        for verifier, prover in ((self.client, self.server), (self.server, self.client)):
+            request = verifier.request(extra_extensions=[(48, requirement)])
+            # Simulate a nonconforming peer: its proof and Finished are valid,
+            # but its certificate fails this request's mandatory EKU filter.
+            with patch("tls20_server.application_auth.match_credentials", return_value=True):
+                response = prover.authenticate(self.credentials, request=request)
+            with self.assertRaisesRegex(ProtocolError, "OID filters"):
+                await verifier.validate(response, self.policy, request=request)
+            self.assertFalse(verifier._pending)
+            with self.assertRaises(ProtocolError):
+                await verifier.validate(response, self.policy, request=request)
+        self.assertEqual(self.validations, 0)
 
     async def test_finished_independent_literal_oracle(self):
         request = self.client.request(context=b"oracle")

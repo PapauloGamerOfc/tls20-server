@@ -104,6 +104,15 @@ roots to a protected new file; no environment variable activates it. Treat that
 output as sensitive decryption material. Do not enable a debugger or
 collect process dumps if their exposure would be unacceptable.
 
+Fatal errors, explicit abort and full channel closure release connection-owned
+traffic/cipher references, exporter and resumption secrets, pending authentication
+state and credential references. Exporters become unavailable on these terminal
+paths. Shared provisioning and an independently owned ticket cache are not erased
+or closed. A peer's `close_notify` closes only the receive direction; the send
+direction remains available until local closure. Cancelling a read makes the
+stream unusable and retains only the sender needed for an authenticated close.
+These are tested object-lifecycle guarantees, not physical-memory-erasure claims.
+
 ## Resource limits and operational precautions
 
 Keep the listener on loopback for initial tests. Never serve the repository or

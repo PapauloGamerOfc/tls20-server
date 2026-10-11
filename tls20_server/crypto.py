@@ -504,6 +504,15 @@ class RecordState:
         self._cipher = (self.provider.record_cipher(self.cipher_suite, self.key) if self._tree_cipher
                         else self.suite.aead(self.key, self.provider))
 
+    def close(self):
+        """Release this direction's secrets and cipher, without closing a shared provider.
+
+        Dropping Python references does not guarantee physical memory erasure.
+        """
+        self.failed = True
+        self.secret = self.key = self.iv = b""
+        self._cipher = self.provider = self.hash_context = None
+
     def _ready(self, operation: str, content_length: int) -> None:
         if self.failed:
             raise ProtocolError("record state is closed")
@@ -539,8 +548,8 @@ class RecordState:
                                else self._cipher.encrypt(iv,plaintext,header))
             self._advance(len(content))
             return result
-        except (ValueError, OverflowError):
-            self.failed = True
+        except BaseException:
+            self.close()
             raise
 
     def open(self, record: bytes) -> tuple[bytes, int]:
@@ -575,14 +584,16 @@ class RecordState:
             self.max_opened_plaintext = max(self.max_opened_plaintext, len(plaintext))
             self._advance(len(content))
             return content, inner_type
-        except (ValueError, OverflowError, InvalidTag) as exc:
-            self.failed = True
+        except BaseException as exc:
+            self.close()
             if isinstance(exc, InvalidTag):
                 raise ProtocolError("record authentication failed", alert=20) from exc
             raise
 
     def try_open(self, record: bytes) -> tuple[bytes, int] | None:
         """Probe an epoch transition; failed AEAD trial never mutates this state."""
+        if self.failed:
+            raise ProtocolError("record state is closed")
         trial = RecordState(self.secret, self.operation, self.cipher_suite, self.record_limit, self.provider)
         trial.sequence, trial.content_bytes = self.sequence, self.content_bytes
         trial.epoch = self.epoch
@@ -590,9 +601,12 @@ class RecordState:
             result = trial.open(record)
         except ProtocolError:
             return None
-        self.sequence, self.content_bytes = trial.sequence, trial.content_bytes
-        self.max_opened_plaintext = max(self.max_opened_plaintext, trial.max_opened_plaintext)
-        return result
+        else:
+            self.sequence, self.content_bytes = trial.sequence, trial.content_bytes
+            self.max_opened_plaintext = max(self.max_opened_plaintext, trial.max_opened_plaintext)
+            return result
+        finally:
+            trial.close()
 
     def update(self) -> None:
         if self.failed:
@@ -601,8 +615,12 @@ class RecordState:
         # continue accepting conforming key updates beyond this policy bound.
         if self.operation == "seal" and self.epoch >= MAX_SEND_EPOCH:
             raise ProtocolError("sending key-update epoch exhausted", alert=80)
-        self.secret = label_expand(self.secret, "traffic upd", b"", len(self.secret), self.hash_context)
-        self.epoch += 1
-        self.sequence = self.content_bytes = 0
-        self.key, self.iv = key_iv(self.secret, self.cipher_suite, self.provider)
-        self._reset_cipher()
+        try:
+            self.secret = label_expand(self.secret, "traffic upd", b"", len(self.secret), self.hash_context)
+            self.epoch += 1
+            self.sequence = self.content_bytes = 0
+            self.key, self.iv = key_iv(self.secret, self.cipher_suite, self.provider)
+            self._reset_cipher()
+        except BaseException:
+            self.close()
+            raise

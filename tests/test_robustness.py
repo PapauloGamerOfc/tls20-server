@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from tls20_server import crypto as c, messages as m
-from tls20_server.errors import ProtocolError
+from tls20_server.errors import PeerClosed, ProtocolError
 from tls20_server.handshake import SecureChannel, Wire, Transcript
 from tls20_server.lab import generate_lab_credentials
 from tls20_server.pki import validate_chain
@@ -79,6 +79,29 @@ class MemoryWriter:
 
 
 class AsyncRobustnessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_alerts_cannot_interleave_fragmented_handshakes(self):
+        message = m.frame(20, bytes(32))
+        for protected in (False, True):
+            for alert in (0, 40, 90):
+                with self.subTest(protected=protected, alert=alert):
+                    reader = asyncio.StreamReader()
+                    sender = c.RecordState(bytes(32), "seal") if protected else None
+                    receiver = c.RecordState(bytes(32), "open") if protected else None
+                    for content, kind in ((message[:2], 22), (bytes((1, alert)), 21), (message[2:], 22)):
+                        reader.feed_data(sender.seal(content, kind) if sender else
+                            bytes((kind, 3, 3)) + len(content).to_bytes(2, "big") + content)
+                    with self.assertRaises(ProtocolError) as failure:
+                        await Wire(reader, MemoryWriter()).receive_frame(20, receiver)
+                    self.assertEqual(failure.exception.alert, 40 if alert == 40 else 10)
+                    self.assertEqual(isinstance(failure.exception, PeerClosed), alert == 40)
+
+    async def test_user_canceled_between_complete_handshake_messages_is_advisory(self):
+        message = m.frame(20, bytes(32))
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"\x15\x03\x03\x00\x02\x01\x5a"
+                         + b"\x16\x03\x03" + len(message).to_bytes(2, "big") + message)
+        self.assertEqual(await Wire(reader, MemoryWriter()).receive_frame(20), message)
+
     async def test_plaintext_record_legacy_version_is_not_version_negotiation(self):
         for legacy in (b"\x00\x00", b"\x03\x01", b"\x04\x00", b"\xff\xff"):
             reader = asyncio.StreamReader()

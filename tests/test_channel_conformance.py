@@ -7,7 +7,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from tests.test_robustness import MemoryWriter
 from tls20_server import crypto as c, messages as m
-from tls20_server.errors import ProtocolError
+from tls20_server.errors import PeerClosed, ProtocolError
 from tls20_server.handshake import SecureChannel, Wire
 
 
@@ -65,6 +65,145 @@ class ChannelConformanceTests(unittest.IsolatedAsyncioTestCase):
     def channel(self, writer=None, **options):
         reader, writer = asyncio.StreamReader(), writer or MemoryWriter()
         return SecureChannel(Wire(reader, writer), bytes(32), bytes(32), **options)
+
+    def assert_secrets_unavailable(self, channel, states):
+        for state in states:
+            self.assertTrue(state.failed)
+            self.assertEqual((state.secret, state.key, state.iv), (b"", b"", b""))
+            self.assertIsNone(state._cipher)
+            self.assertIsNone(state.provider)
+            state.close()  # Repeated cleanup must remain safe.
+            with self.assertRaises(ProtocolError):
+                state.update()
+        self.assertIsNone(channel.exporter_secret)
+        self.assertIsNone(channel.resumption_secret)
+        self.assertIsNone(channel.early_exporter_secret)
+        self.assertIsNone(channel.client_credentials)
+        self.assertFalse(channel.client_credential_candidates)
+        with self.assertRaises(ProtocolError):
+            channel.exporter("after teardown")
+        with self.assertRaises(ProtocolError):
+            channel.early_exporter("after teardown")
+        with self.assertRaises(ProtocolError):
+            states[0].seal(b"after teardown", 23)
+        record = c.RecordState(bytes(32), "seal").seal(b"after teardown", 23)
+        with self.assertRaises(ProtocolError):
+            states[1].open(record)
+        with self.assertRaises(ProtocolError):
+            states[1].try_open(record)
+
+    async def test_terminal_paths_release_secrets_and_owned_capabilities(self):
+        from unittest.mock import Mock
+        from tls20_server.exporter_access import ExporterAccess
+        credential, provider = object(), Mock()
+        for ending in ("fatal", "malformed", "abort", "close"):
+            with self.subTest(ending=ending):
+                channel = self.channel(exporter_secret=b"e" * 32, resumption_secret=b"r" * 32,
+                    early_exporter_secret=b"v" * 32, client_credentials=credential, native_provider=provider)
+                states = channel.sender, channel.receiver  # Keep references across teardown.
+                access = ExporterAccess(channel.exporter_secret, stage="server-finished", role="client")
+                channel._exporter_accesses = (access,)
+                if ending in ("fatal", "malformed"):
+                    record = (c.RecordState(bytes(32), "seal").seal(b"\x02\x28", 21)
+                              if ending == "fatal" else b"\x17\x03\x03\x00\x00")
+                    channel.wire.reader.feed_data(record)
+                    with self.assertRaises(ProtocolError) as failure:
+                        await channel.recv()
+                    self.assertEqual(failure.exception.alert, 40 if ending == "fatal" else 20)
+                    if ending == "fatal":
+                        self.assertEqual(channel.wire.writer.data, b"")
+                    else:
+                        self.assertEqual(c.RecordState(bytes(32), "open").open(bytes(channel.wire.writer.data)),
+                                         (b"\x02\x14", 21))
+                elif ending == "abort":
+                    channel.abort()
+                else:
+                    await channel.close()
+                    self.assertEqual(c.RecordState(bytes(32), "open").open(bytes(channel.wire.writer.data)),
+                                     (b"\x01\x00", 21))
+                self.assertTrue(channel.closed)
+                self.assertFalse(access.active)
+                self.assert_secrets_unavailable(channel, states)
+                provider.close.assert_not_called()
+
+    async def test_peer_half_close_preserves_send_until_full_close(self):
+        channel = self.channel(exporter_secret=b"e" * 32)
+        states = channel.sender, channel.receiver
+        expected = channel.exporter("half close")
+        peer = c.RecordState(bytes(32), "seal")
+        channel.wire.reader.feed_data(peer.seal(b"\x01\x00", 21))
+        self.assertIsNone(await channel.recv())
+        self.assertFalse(channel.closed)
+        self.assertTrue(channel.receiver.failed)
+        self.assertEqual(channel.receiver.secret, b"")
+        self.assertEqual(channel.exporter("half close"), expected)
+        await channel.send(b"last response")
+        observer = c.RecordState(bytes(32), "open")
+        self.assertEqual(observer.open(bytes(channel.wire.writer.data)), (b"last response", 23))
+        channel.wire.writer.data.clear()
+        await channel.close()
+        self.assertEqual(observer.open(bytes(channel.wire.writer.data)), (b"\x01\x00", 21))
+        self.assert_secrets_unavailable(channel, states)
+
+    async def test_cancelled_read_releases_secrets_but_can_send_authenticated_close(self):
+        channel = self.channel(exporter_secret=b"e" * 32, resumption_secret=b"r" * 32,
+                               early_exporter_secret=b"v" * 32)
+        states = channel.sender, channel.receiver
+        task = asyncio.create_task(channel.recv())
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(channel.read_cancelled)
+        self.assertFalse(channel.sender.failed)
+        self.assertTrue(channel.receiver.failed)
+        self.assertEqual(channel.receiver.secret, b"")
+        with self.assertRaises(ProtocolError):
+            channel.exporter("cancelled")
+        with self.assertRaises(ProtocolError):
+            channel.early_exporter("cancelled")
+        with self.assertRaises(ProtocolError):
+            await channel.key_update()
+        with self.assertRaises(ProtocolError):
+            await channel.send_handshake(m.frame(24, b"\x00"))
+        await channel.close()
+        self.assertEqual(c.RecordState(bytes(32), "open").open(bytes(channel.wire.writer.data)),
+                         (b"\x01\x00", 21))
+        self.assert_secrets_unavailable(channel, states)
+
+    async def test_cancelled_write_releases_both_record_directions(self):
+        class BlockedWriter(MemoryWriter):
+            async def drain(self):
+                await asyncio.Future()
+        channel = self.channel(BlockedWriter(), exporter_secret=b"e" * 32,
+                               resumption_secret=b"r" * 32, early_exporter_secret=b"v" * 32)
+        states = channel.sender, channel.receiver
+        task = asyncio.create_task(channel.send(b"pending"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(channel.closed)
+        self.assertTrue(channel.wire.writer.transport.aborted)
+        self.assert_secrets_unavailable(channel, states)
+
+    async def test_cancelled_fatal_flush_aborts_and_releases_secrets(self):
+        channel = self.channel(exporter_secret=b"e" * 32, resumption_secret=b"r" * 32,
+                               early_exporter_secret=b"v" * 32)
+        states = channel.sender, channel.receiver
+        await channel.send_lock.acquire()
+        try:
+            channel.wire.reader.feed_data(b"\x17\x03\x03\x00\x00")
+            task = asyncio.create_task(channel.recv())
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            channel.send_lock.release()
+        self.assertTrue(channel.closed)
+        self.assertTrue(channel.wire.writer.transport.aborted)
+        self.assert_secrets_unavailable(channel, states)
 
     async def test_requested_update_waits_for_peer_but_unrequested_does_not_clear_it(self):
         channel = self.channel()
@@ -172,6 +311,40 @@ class ChannelConformanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await channel.recv())
         self.assertTrue(future.cancelled())
         self.assertIsNone(channel._active_client_auth)
+
+    async def test_fragmented_post_handshake_alerts_abort_and_clear_authentication(self):
+        for active_pha in (False, True):
+            for alert in (0, 40, 90):
+                with self.subTest(active_pha=active_pha, alert=alert):
+                    channel, future, certificate, finished = await self.pha()
+                    pending = next(iter(channel.pending_client_auth.values()))
+                    observer = c.RecordState(bytes(32), "open")
+                    observer.open(bytes(channel.wire.writer.data))  # Initial PHA request.
+                    channel.wire.writer.data.clear()
+                    peer = c.RecordState(bytes(32), "seal")
+                    if active_pha:
+                        channel.wire.reader.feed_data(peer.seal(certificate, 22))
+                    frame = finished if active_pha else m.frame(24, b"\x00")
+                    for content, kind in ((frame[:2], 22), (bytes((2, alert)), 21),
+                                          (frame[2:], 22), (b"must not escape", 23)):
+                        channel.wire.reader.feed_data(peer.seal(content, kind))
+                    with self.assertRaises(ProtocolError) as failure:
+                        await channel.recv()
+                    self.assertEqual(failure.exception.alert, 40 if alert == 40 else 10)
+                    self.assertEqual(isinstance(failure.exception, PeerClosed), alert == 40)
+                    if alert == 40:
+                        self.assertEqual(channel.wire.writer.data, b"")
+                    else:
+                        self.assertEqual(observer.open(bytes(channel.wire.writer.data)), (b"\x02\x0a", 21))
+                    self.assertTrue(channel.closed)
+                    self.assertTrue(channel.wire.writer.transport.is_closing())
+                    self.assertFalse(channel.received_close)
+                    self.assertTrue(future.cancelled())
+                    self.assertIsNone(pending["private"])
+                    self.assertFalse(channel.pending_client_auth)
+                    self.assertIsNone(channel._active_client_auth)
+                    with self.assertRaisesRegex(ProtocolError, "closed"):
+                        await channel.recv()
 
 
 if __name__ == "__main__":

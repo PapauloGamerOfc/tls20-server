@@ -175,9 +175,8 @@ class PasswordServer:
         self._attempts, self._global, self._revoked = OrderedDict(), deque(), set()
         self._lock, self._active = threading.Lock(), 0
 
-    def context(self, protocol, receive_limit):
-        return hashlib.sha256(b"TLS20 PWD server\x00" + self._policy + protocol
-                              + receive_limit.to_bytes(2, "big")).digest()
+    def context(self, protocol):
+        return hashlib.sha256(b"TLS20 PWD server\x00" + self._policy + protocol).digest()
 
     def revoke(self, username):
         with self._lock:

@@ -12,12 +12,14 @@ from dataclasses import dataclass
 import hmac
 import inspect
 import secrets
+from types import SimpleNamespace
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
 from . import crypto as c
 from . import messages as m
+from .credential_selection import match_credentials
 from .errors import ProtocolError
 
 
@@ -185,6 +187,11 @@ def _check_certificate_extensions(identity, offered):
                 raise ProtocolError("unsolicited or misplaced authenticator certificate extension")
 
 
+def _check_certificate_filters(identity, offered):
+    if not match_credentials(SimpleNamespace(chain_der=identity.chain, credential_type=0), offered):
+        raise ProtocolError("authenticator certificate does not satisfy requested OID filters")
+
+
 def _proof(finished_key, private, share, transcript, role, name):
     hashed = c.digest(transcript, name)
     root = c.extract(finished_key, c.dh(private, share), name)
@@ -279,6 +286,12 @@ class AuthenticatorManager:
             context = secrets.token_bytes(32) if context is None else context
             share, offers = self.channel.peer_auth_share, dict(self.channel.peer_capabilities)
             _offers(offers, "server")
+        if credentials is not None and not match_credentials(credentials, offers):
+            if request is None:
+                raise ProtocolError("no acceptable spontaneous authenticator credential")
+            # A requested identity that fails recognized KU/EKU constraints is
+            # an authenticated refusal, with no credential or entry metadata.
+            credentials, entry_extensions = None, None
         self._claim(context)
         handshake_context, finished_key = self._keys(role)
         name = c.hash_context(c.suite(self.channel.cipher_suite).hash_name, self.channel.native_provider)
@@ -358,6 +371,7 @@ class AuthenticatorManager:
         authorized = None
         if not refusal:
             _check_certificate_extensions(identity, offers)
+            _check_certificate_filters(identity, offers)
             cv, body = _read_frame(reader, 15)
             cv_reader = m._Reader(body)
             algorithm, proof = int.from_bytes(cv_reader.take(2), "big"), cv_reader.vector(2)

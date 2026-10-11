@@ -335,8 +335,6 @@ def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticat
     if VERSION not in [versions[i:i+2] for i in range(0, len(versions), 2)]:
         raise ProtocolError("unsupported protocol version", alert=70)
     groups = _u16_list(ext[10]) if 10 in ext else ()
-    if groups and not set(groups) & c.GROUP_LENGTHS.keys():
-        raise ProtocolError("no supported traffic group")
     sr = _Reader(ext.get(51, b"\x00\x00")); shares = _Reader(sr.vector(2)); sr.end()
     names = {29, 30} & set(ext)
     pwd_suites = [c.suite(value) for value in cipher_suites if value in c.CIPHER_SUITES
@@ -383,7 +381,10 @@ def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticat
         if names.take(1) != b"\x00":
             raise ProtocolError("unsupported name type", alert=47)
         try:
-            name = names.vector(2).decode("ascii")
+            # DNS SNI is case-insensitive. Only normalize the lookup value;
+            # extension_values retains the original bytes for the transcript
+            # and the byte-for-byte ClientHello retry continuity checks.
+            name = names.vector(2).decode("ascii").lower()
         except UnicodeDecodeError as exc:
             raise ProtocolError("non-ASCII server name", alert=47) from exc
         validate_name(name)

@@ -223,6 +223,14 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TicketBoundsTests(unittest.TestCase):
+    def test_issued_ticket_remembers_early_record_limit_and_rejects_invalid_limits(self):
+        store = TicketStore()
+        store.issue(bytes(32), "localhost", b"http/1.1", record_size_limit=512)
+        self.assertEqual(next(iter(store._tickets.values())).record_size_limit, 512)
+        for limit in (True, 63, 16386, 512.0):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                store.issue(bytes(32), "localhost", b"http/1.1", record_size_limit=limit)
+
     def test_store_and_cache_reject_boolean_and_noninteger_bounds(self):
         for value in (True, False, 1.5, "3", None, 0, -1):
             with self.subTest(value=value):

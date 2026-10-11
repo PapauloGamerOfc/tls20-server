@@ -175,6 +175,10 @@ class Wire:
             if kind == 21:
                 if len(fragment) != 2:
                     raise ProtocolError("malformed alert", alert=50)
+                if fragment[1] not in (0, 90):
+                    raise PeerClosed("peer aborted the handshake", alert=fragment[1])
+                if self.pending:
+                    raise ProtocolError("alert interleaves a fragmented handshake", alert=10)
                 if fragment[1] == 90:
                     continue  # advisory user_canceled; normally followed by close_notify
                 raise PeerClosed("peer closed or aborted the handshake", alert=fragment[1])
@@ -286,6 +290,23 @@ class SecureChannel:
             state["private"] = None
             if not state["future"].done():
                 state["future"].cancel()
+
+    def _clear_connection_secrets(self, *, keep_sender=False):
+        """Release connection-owned secret references, not shared provisioning.
+
+        An interrupted read retains only the sending state needed to flush an
+        authenticated close_notify. Python cannot guarantee physical erasure.
+        """
+        self._clear_auth()
+        self.receiver.close()
+        if not keep_sender:
+            self.sender.close()
+        self.exporter_secret = self.resumption_secret = self.early_exporter_secret = None
+        self.client_credentials = self.client_credential_policy = self.client_auth_validator = None
+        self.client_credential_candidates = ()
+        self.ticket_cache = self.native_provider = self.schedule = self._authenticators = None
+        self.post_handshake.clear()
+        self.handshake_transcript = b""
 
     async def request_client_auth(self, *, required=False, max_pending=128,
                                   certificate_authorities=None, oid_filters=None,
@@ -495,7 +516,7 @@ class SecureChannel:
 
     async def send_handshake(self, message):
         async with self.send_lock:
-            if self.closed or self.sent_close:
+            if self.closed or self.sent_close or self.read_cancelled:
                 raise ProtocolError("connection is closing")
             try:
                 await self.wire.send_frame(message, self.sender)
@@ -505,7 +526,7 @@ class SecureChannel:
 
     async def key_update(self, request_peer=False):
         async with self.send_lock:
-            if self.closed or self.sent_close:
+            if self.closed or self.sent_close or self.read_cancelled:
                 raise ProtocolError("connection is closing")
             if request_peer and self._key_update_requested:
                 raise ProtocolError("a peer key update is already pending")
@@ -578,7 +599,7 @@ class SecureChannel:
 
     def abort(self):
         self.closed = True
-        self._clear_auth()
+        self._clear_connection_secrets()
         transport = self.wire.writer.transport
         # A completed close can detach the transport from its event loop.
         # is_closing() alone is insufficient: close() can still be waiting
@@ -596,6 +617,11 @@ class SecureChannel:
             try:
                 while True:
                     content, kind = await self.wire.read_record(self.receiver)
+                    if kind == 21:
+                        if len(content) != 2:
+                            raise ProtocolError("malformed alert", alert=50)
+                        if content[1] not in (0, 90):
+                            raise PeerClosed("peer fatal alert", alert=content[1])
                     if kind == 22:
                         await self._post_handshake(content)
                         continue
@@ -611,13 +637,10 @@ class SecureChannel:
                     if kind == 21 and len(content) == 2 and content[1] == 0:
                         self.received_close = True
                         self._clear_auth()
+                        self.receiver.close()
                         return None
                     if kind == 21 and len(content) == 2 and content[1] == 90:
                         continue  # user_canceled does not terminate the connection.
-                    if kind == 21:
-                        if len(content) != 2:
-                            raise ProtocolError("malformed alert", alert=50)
-                        raise PeerClosed("peer fatal alert", alert=content[1])
                     raise ProtocolError("peer alert or unexpected post-handshake message")
             except asyncio.CancelledError:
                 # A partial record cannot be resumed, but the independent send
@@ -627,12 +650,19 @@ class SecureChannel:
                 # Do not retain verifier scalars/futures after interruption.
                 if self.pending_client_auth:
                     self.abort()
+                else:
+                    self._clear_connection_secrets(keep_sender=True)
                 raise
             except ProtocolError as error:
-                async with self.send_lock:
-                    await self.wire.fatal(error, self.sender)
-                self.closed = True
-                self._clear_auth()
+                try:
+                    async with self.send_lock:
+                        await self.wire.fatal(error, self.sender)
+                except BaseException:
+                    self.abort()
+                    raise
+                finally:
+                    self.closed = True
+                    self._clear_connection_secrets()
                 raise
             except BaseException:
                 self.abort()
@@ -669,7 +699,7 @@ class SecureChannel:
             # Preserve queued close_notify on the normal path; force-abort only
             # if flushing/closing does not finish within the bounded deadline.
             self.closed = True
-            self._clear_auth()
+            self._clear_connection_secrets()
             self.wire.writer.close()
             try:
                 async with asyncio.timeout(1):
@@ -1114,8 +1144,8 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 client_auth_offers += ((27, m._vec(b"".join(value.to_bytes(2,"big") for value in certificate_compression),1)),)
             send_limit = _peer_record_limit(ext_values[28], server=True) if 28 in ext_values else 16385
             receive_limit = local_limit if 28 in ext_values else 16385
-            mfl = _peer_fragment_limit(ext_values[1]) if 1 in ext_values else None
-            if mfl is not None and 28 not in ext_values:
+            mfl = _peer_fragment_limit(ext_values[1]) if 1 in ext_values and 28 not in ext_values else None
+            if mfl is not None:
                 send_limit = receive_limit = mfl
             initial_controls = server_controls(ext_values, heartbeat=heartbeat_mode,
                 ticket_limit=ticket_count_limit, tickets_enabled=ticket_store is not None and 45 in hello.extensions,
@@ -1149,8 +1179,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 + (b"" if bootstrap_bindings else _policy_context(client_credential_policy))
                 + initial_controls.signaling_context
                 + repr(_credential_extensions(credentials) if credentials else ()).encode()
-                + repr(client_auth_offers).encode()
-                + local_limit.to_bytes(2, "big"))
+                + repr(client_auth_offers).encode())
             def ticket_scope(binding=None):
                 scoped = bootstrap_scoped_psks[binding.spki] if binding is not None else provisioned
                 return c.digest(ticket_context_base
@@ -1434,7 +1463,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                                       stage="early", role="server", hash_name=schedule.hash_name)
             if hello.early_data:
                 early_receiver = (c.RecordState(schedule.derive_secret(c.extract(bytes(selected.hash_length), ticket.psk, schedule.hash_name),
-                    "c e traffic", c.PREFACE + ch), "open", selected_id, receive_limit, provider=native_provider) if accepted else None)
+                    "c e traffic", c.PREFACE + ch), "open", selected_id, ticket.record_size_limit, provider=native_provider) if accepted else None)
                 if early_receiver is not None:
                     emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", hello.random, early_receiver.secret)
                 total, discarded = 0, 0
@@ -1559,6 +1588,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         cipher_suite=selected_id, client_certificate_type=client_credential_type or 0,
                         client_certificate_extensions=client_metadata, external_psk_identity=selected_external_identity,
                         allowed_psk_modes=successor_modes,
+                         record_size_limit=receive_limit,
                         native_provider=native_provider)
                     if message is not None:
                         await channel.send_handshake(message)
