@@ -118,10 +118,11 @@ def _offers(extensions, role):
     if (34 in extensions) != (0xff04 in extensions):
         raise ProtocolError("delegation requires independent grant and MAC offers")
     if 34 in extensions:
-        macs = m._u16_list(extensions[34])
+        # An offer may contain only unknown or unsupported delegated schemes.
+        # That disables delegation for this request, not direct credentials.
+        # Credential selection and validation enforce the role's actual scheme.
+        m._u16_list(extensions[34])
         grants = m._u16_list(extensions[0xff04])
-        if (0xfe00 if role == "server" else 0xfe01) not in macs:
-            raise ProtocolError("delegation does not offer the required online MAC")
         if {0xfe00, 0xfe01} & set(grants):
             raise ProtocolError("MAC identifiers are not grant signing algorithms")
 

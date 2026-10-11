@@ -318,6 +318,10 @@ offers independently, in both directions. An incompatible requested identity
 produces a Finished-only refusal; an incompatible spontaneous identity is a
 local error. Malformed requests or delegated credentials remain errors rather
 than being hidden by credential selection.
+Well-framed unknown/GREASE or wrong-role schemes in the optional delegation
+offer do not exclude an independently compatible direct X25519 credential.
+They do not authorize an unoffered delegated proof: actual grant selection and
+verification still enforce the role-specific MAC and grant-signature lists.
 
 ### Test-only diagnostic build
 

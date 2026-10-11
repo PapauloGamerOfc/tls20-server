@@ -206,6 +206,74 @@ class AuthenticatorTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ProtocolError):
                 prover.authenticate(credentials, request=request, entry_extensions=(((34, grant[:-1]),),))
 
+    async def test_unknown_delegated_offers_allow_direct_requested_and_spontaneous_identity(self):
+        for role, verifier, prover in (("server", self.client, self.server), ("client", self.server, self.client)):
+            required = 0xfe00 if role == "server" else 0xfe01
+            for schemes in ((0x0a0a,), (0xaaaa,), (required ^ 1,), (0x0a0a, required)):
+                with self.subTest(role=role, schemes=schemes):
+                    extra = ((34, m._vec(b"".join(value.to_bytes(2, "big") for value in schemes), 2)),
+                             (0xff04, m._vec(b"\x08\x07", 2)))
+                    request = verifier.request(extra_extensions=extra)
+                    self.assertEqual(m._u16_list(dict(parse_request(request).extensions)[34]), schemes)
+                    response = prover.authenticate(self.credentials, request=request)
+                    self.assertEqual(response[0], 11)
+                    self.assertTrue((await verifier.validate(response, self.policy, request=request)).authenticated)
+                    refusal_request = verifier.request(extra_extensions=extra)
+                    refusal = prover.authenticate(request=refusal_request)
+                    self.assertFalse((await verifier.validate(refusal, self.policy, request=refusal_request)).authenticated)
+        offers = self.client_channel.local_capabilities + (
+            (34, m._vec(b"\x0a\x0a", 2)), (0xff04, m._vec(b"\x08\x07", 2)))
+        self.client_channel.local_capabilities = self.server_channel.peer_capabilities = offers
+        validator = credential_validator(CredentialPolicy(trust_roots=(self.root_cert,),
+            peer_name="localhost", revocation_policy="offline"), role="server",
+            authorize=lambda identity: True, spontaneous_offers=offers)
+        response = self.server.authenticate(self.credentials)
+        self.assertTrue((await self.client.validate(response, validator)).authenticated)
+
+    async def test_unknown_delegated_offers_refuse_delegation_and_reject_peer_bypass(self):
+        from tests.test_credential_profiles import CredentialProfileTests
+        fixture = CredentialProfileTests(); fixture.setUp()
+        for role, verifier, prover in (("server", self.client, self.server), ("client", self.server, self.client)):
+            parent, grant = fixture.parent_and_grant(role=role)
+            credentials = Credentials([der(parent)], fixture.key)
+            entries = (((34, grant),),)
+            policy = replace(fixture.policy, authorize_client=lambda material, evidence: True)
+            required = 0xfe00 if role == "server" else 0xfe01
+            for schemes, accepted in (((0x0a0a,), False), ((0xaaaa,), False),
+                                      ((required ^ 1,), False), ((0x0a0a, required), True)):
+                with self.subTest(role=role, schemes=schemes):
+                    extra = ((34, m._vec(b"".join(value.to_bytes(2, "big") for value in schemes), 2)),
+                             (0xff04, m._vec(b"\x08\x07", 2)))
+                    validator = credential_validator(policy, role=role, authorize=lambda identity: True)
+                    request = verifier.request(certificate_algorithms=(0x0403,), extra_extensions=extra)
+                    response = prover.authenticate(credentials, request=request, entry_extensions=entries)
+                    self.assertEqual(response[0], 11 if accepted else 20)
+                    self.assertEqual((await verifier.validate(response, validator, request=request)).authenticated, accepted)
+                    if not accepted:
+                        request = verifier.request(certificate_algorithms=(0x0403,), extra_extensions=extra)
+                        with patch("tls20_server.application_auth._credential_matches_algorithms", return_value=True):
+                            response = prover.authenticate(credentials, request=request, entry_extensions=entries)
+                        with self.assertRaises(ProtocolError):
+                            await verifier.validate(response, validator, request=request)
+            if role == "server":
+                offers = ((50, m._vec(b"\x04\x03", 2)), (34, m._vec(b"\x0a\x0a", 2)),
+                          (0xff04, m._vec(b"\x08\x07", 2)))
+                self.client_channel.local_capabilities = self.server_channel.peer_capabilities = offers
+                with self.assertRaisesRegex(ProtocolError, "no acceptable spontaneous"):
+                    prover.authenticate(credentials, entry_extensions=entries)
+                with patch("tls20_server.application_auth._credential_matches_algorithms", return_value=True):
+                    response = prover.authenticate(credentials, entry_extensions=entries)
+                validator = credential_validator(policy, role=role, authorize=lambda identity: True,
+                                                   spontaneous_offers=offers)
+                with self.assertRaises(ProtocolError):
+                    await verifier.validate(response, validator)
+
+    async def test_unknown_delegation_does_not_relax_offer_vector_structure(self):
+        for verifier in (self.client, self.server):
+            for encoded in (b"\0\0", b"\0\x01\x0a", b"\0\x02\x0a"):
+                with self.subTest(role=verifier.channel.role, encoded=encoded), self.assertRaises(ProtocolError):
+                    verifier.request(extra_extensions=((34, encoded), (0xff04, m._vec(b"\x08\x07", 2))))
+
     async def test_selection_does_not_relax_malformed_requests_or_receiver_validation(self):
         from tls20_server.application_auth import _frame
         policy = CredentialPolicy(trust_roots=(self.root_cert,), peer_name="localhost", revocation_policy="offline")
