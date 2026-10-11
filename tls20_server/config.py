@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import tomllib
 
+from .constants import DEFAULT_PORT
 
 MAX_CONFIG_BYTES = 65536
 
@@ -29,7 +30,7 @@ class Endpoint:
 
 @dataclass(frozen=True)
 class Config:
-    listen: Endpoint = Endpoint("127.0.0.1", 1021)
+    listen: Endpoint = Endpoint("127.0.0.1", DEFAULT_PORT)
     upstream: Endpoint = Endpoint("127.0.0.1", 8080)
     server_name: str = "localhost"
     certificate_chain: Path = Path("fullchain.pem")
@@ -40,6 +41,12 @@ class Config:
     idle_timeout_seconds: float = 60
     max_connection_seconds: float = 3600
     max_bytes_per_direction: int = 16777216
+    session_tickets: bool = True
+    ticket_lifetime_seconds: int = 86400
+    ticket_capacity: int = 4096
+    upstream_early_data_aware: bool = False
+    early_data_paths: tuple[str, ...] = ()
+    max_early_data_bytes: int = 16384
 
     def __post_init__(self) -> None:
         # Port zero is useful only to callers of the Python API (OS-selected
@@ -57,8 +64,28 @@ class Config:
             "idle_timeout_seconds", "max_connection_seconds",
         ):
             _positive_number(name, getattr(self, name))
-        if self.handshake_timeout_seconds > 30:
-            raise ConfigError("handshake_timeout_seconds must not exceed 30")
+        for name in ("session_tickets", "upstream_early_data_aware"):
+            if type(getattr(self, name)) is not bool:
+                raise ConfigError(f"{name} must be a boolean")
+        _positive_integer("ticket_lifetime_seconds", self.ticket_lifetime_seconds)
+        if self.ticket_lifetime_seconds > 604800:
+            raise ConfigError("ticket_lifetime_seconds exceeds the seven-day TLS ticket lifetime")
+        _positive_integer("ticket_capacity", self.ticket_capacity)
+        if self.ticket_capacity > 100000:
+            raise ConfigError("ticket_capacity exceeds this implementation's in-memory budget")
+        if type(self.max_early_data_bytes) is not int or not 0 <= self.max_early_data_bytes <= 0xffffffff:
+            raise ConfigError("max_early_data_bytes must fit the TLS uint32 field")
+        if type(self.early_data_paths) is not tuple or any(
+            type(path) is not str or not path.startswith("/") or path.startswith("//")
+            or not path.isascii() or any(ord(char) < 33 or ord(char) == 127 for char in path)
+            or any(char in path for char in ("?", "#", "\\", "%"))
+            for path in self.early_data_paths
+        ):
+            raise ConfigError("early_data_paths must be exact ASCII origin paths without query or escapes")
+        if len(set(self.early_data_paths)) != len(self.early_data_paths):
+            raise ConfigError("early_data_paths contains duplicate paths")
+        if self.early_data_paths and (not self.session_tickets or not self.upstream_early_data_aware):
+            raise ConfigError("Early HTTP requires session_tickets and an explicitly early-data-aware upstream")
 
 
 def _positive_integer(name: str, value: object) -> None:
@@ -157,6 +184,10 @@ def load_config(path: str | Path) -> Config:
         # Do not repeat arbitrary user-controlled TOML keys in a log message.
         raise ConfigError("Configuration contains unsupported keys")
     defaults = Config()
+    if "early_data_paths" in values:
+        if type(values["early_data_paths"]) is not list:
+            raise ConfigError("early_data_paths must be an array of paths")
+        values["early_data_paths"] = tuple(values["early_data_paths"])
     values["listen"] = parse_endpoint(values.get("listen", str(defaults.listen)))
     values["upstream"] = parse_endpoint(
         values.get("upstream", str(defaults.upstream)), loopback=True

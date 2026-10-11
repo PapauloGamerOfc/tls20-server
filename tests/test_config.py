@@ -21,7 +21,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_defaults_are_local_experimental_and_paths_are_relative_to_config(self):
         config = self.load("")
-        self.assertEqual(config.listen, Endpoint("127.0.0.1", 1021))
+        self.assertEqual(config.listen, Endpoint("127.0.0.1", 343))
         self.assertEqual(config.upstream, Endpoint("127.0.0.1", 8080))
         self.assertEqual(config.certificate_chain, (self.path.parent / "fullchain.pem").resolve())
         self.assertEqual(config.private_key, (self.path.parent / "server.key").resolve())
@@ -55,7 +55,7 @@ class ConfigurationTests(unittest.TestCase):
         for content in (
             "typo = 1", "[section]\nlisten='127.0.0.1:1021'", "max_connections = true",
             "max_connections = 0", "max_connections = 1.5", "max_bytes_per_direction = -1",
-            "handshake_timeout_seconds = 31", "handshake_timeout_seconds = 0",
+            "handshake_timeout_seconds = 0",
             "handshake_timeout_seconds = true", "idle_timeout_seconds = inf",
             "idle_timeout_seconds = nan", "connect_timeout_seconds = -inf",
             'connect_timeout_seconds = "10"', "max_connection_seconds = 0",
@@ -67,6 +67,26 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(config.idle_timeout_seconds, 0.5)
         with self.assertRaises(ConfigError):
             replace(config, idle_timeout_seconds=10 ** 1000)
+
+    def test_session_and_early_http_policy(self):
+        config = self.load('upstream_early_data_aware=true\nearly_data_paths=["/static"]\nhandshake_timeout_seconds=60')
+        self.assertTrue(config.session_tickets)
+        self.assertEqual(config.early_data_paths, ("/static",))
+        self.assertEqual(config.handshake_timeout_seconds, 60)
+        for value in (
+            'early_data_paths=["/"]', 'session_tickets=1', 'ticket_capacity=0',
+            'ticket_lifetime_seconds=604801', 'ticket_lifetime_seconds=true',
+            'max_early_data_bytes=-1', 'max_early_data_bytes=4294967296',
+            'max_early_data_bytes=true', 'early_data_paths="/"',
+            'upstream_early_data_aware=1',
+            'upstream_early_data_aware=true\nearly_data_paths=["/", "/"]',
+            'upstream_early_data_aware=true\nearly_data_paths=["/?action=x"]',
+            'upstream_early_data_aware=true\nearly_data_paths=["/%2f"]',
+            'upstream_early_data_aware=true\nearly_data_paths=[42]',
+            'session_tickets=false\nupstream_early_data_aware=true\nearly_data_paths=["/"]',
+        ):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                self.load(value)
 
     def test_dns_name_profile(self):
         for value in (

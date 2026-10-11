@@ -9,8 +9,10 @@ import time
 from typing import Any
 
 from .config import Config
+from .early_http import EarlyRequestGate, TOO_EARLY_RESPONSE
 from .handshake import server_handshake
 from .pki import load_credentials
+from .tickets import TicketStore
 
 
 LOG = logging.getLogger(__name__)
@@ -46,12 +48,13 @@ async def _close_writer(writer: asyncio.StreamWriter | None) -> None:
         _abort_writer(writer)
 
 
-async def _relay(channel: Any, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, config: Config) -> None:
+async def _relay(channel: Any, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                 config: Config, *, initial_upload_bytes: int = 0) -> None:
     last_activity = time.monotonic()
 
     async def to_backend() -> None:
         nonlocal last_activity
-        total = 0
+        total = initial_upload_bytes
         while True:
             content = await channel.recv()
             if content is None:
@@ -120,6 +123,12 @@ class RunningServer:
     def __init__(self, config: Config, credentials: Any):
         self.config = config
         self.credentials = credentials
+        # Tickets and replay reservations are confined to this listener's
+        # lifetime. Restarting or replacing its credentials invalidates them;
+        # no reusable ticket keys are silently restored without replay state.
+        self.ticket_store = (TicketStore(lifetime=config.ticket_lifetime_seconds,
+                                         capacity=config.ticket_capacity)
+                             if config.session_tickets else None)
         self.server: asyncio.AbstractServer
         self._tasks: set[asyncio.Task[None]] = set()
         self._writers: set[asyncio.StreamWriter] = set()
@@ -149,23 +158,61 @@ class RunningServer:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         channel = None
         upstream_writer = None
+        upstream_reader = None
         clean_end = False
+        early_upload_bytes = 0
+        early_enabled = bool(self.config.session_tickets and self.config.upstream_early_data_aware
+                             and self.config.early_data_paths and self.config.max_early_data_bytes)
+        local_address = writer.get_extra_info("sockname")
+        local_port = local_address[1] if local_address else self.config.listen.port
+        gate = EarlyRequestGate(self.config.early_data_paths, self.config.server_name,
+                                local_port, min(self.config.max_early_data_bytes,
+                                                self.config.max_bytes_per_direction))
+
+        async def open_upstream() -> None:
+            nonlocal upstream_reader, upstream_writer
+            if upstream_writer is None:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.config.upstream.host, self.config.upstream.port),
+                    timeout=self.config.connect_timeout_seconds,
+                )
+                self._upstream_writers.add(upstream_writer)
+
+        async def accept_early(data: bytes) -> None:
+            nonlocal early_upload_bytes
+            # Called only after PSK/binder validation and atomic replay
+            # reservation by the handshake. This is deliberately BEFORE CF.
+            request = gate.feed(data)
+            if request is None:
+                return
+            if len(request) > self.config.max_bytes_per_direction:
+                raise RelayLimitError("Early HTTP request exceeds the client byte quota")
+            await open_upstream()
+            upstream_writer.write(request)
+            await upstream_writer.drain()
+            early_upload_bytes += len(request)
         try:
             async with asyncio.timeout(self.config.max_connection_seconds):
                 channel = await asyncio.wait_for(
                     server_handshake(
                         reader, writer, self.credentials, self.config.server_name,
                         timeout=self.config.handshake_timeout_seconds,
+                        ticket_store=self.ticket_store,
+                        max_early_data=self.config.max_early_data_bytes if early_enabled else 0,
+                        on_early_data=accept_early if early_enabled else None,
                     ), timeout=self.config.handshake_timeout_seconds,
                 )
-                # This line is unreachable before the client's authenticated
-                # Finished has been verified by server_handshake.
-                upstream_reader, upstream_writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.config.upstream.host, self.config.upstream.port),
-                    timeout=self.config.connect_timeout_seconds,
-                )
-                self._upstream_writers.add(upstream_writer)
-                await _relay(channel, upstream_reader, upstream_writer, self.config)
+                if gate.rejected:
+                    # TLS acceptance cannot be withdrawn after EE. Tell HTTP
+                    # to retry without early data; never forward rejected bytes.
+                    await channel.send(TOO_EARLY_RESPONSE)
+                    clean_end = True
+                    return
+                # Normal traffic opens the backend only after Client Finished.
+                # An explicitly admitted early request may already be running.
+                await open_upstream()
+                await _relay(channel, upstream_reader, upstream_writer, self.config,
+                             initial_upload_bytes=early_upload_bytes)
                 clean_end = True
         except asyncio.CancelledError:
             raise

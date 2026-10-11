@@ -9,7 +9,9 @@ channel. The `httpps` scheme and experimental TCP default are not registrations.
 
 The client must be configured with a trusted CA independently of the server and
 must know the expected DNS identity. Certificate path, hostname, server proof and
-Finished checks all have to pass before application data is sent. Receiving a
+Finished checks all have to pass for a new full-handshake identity. Explicit
+0-RTT instead uses a ticket from a previously authenticated connection and
+revalidates its retained certificate under the current client policy. Receiving a
 certificate or successfully decrypting a record alone does not establish trust.
 There is no skip-verification switch and no fallback after authentication failure.
 
@@ -19,9 +21,14 @@ authenticate relative to its private state while allowing that client to simulat
 the proof offline. It does not promise non-transferability against a cooperating
 online witness or prevent separately signed application receipts.
 
-Client Finished is key confirmation, not client identity. This proxy adds no
-login, client-certificate authorization or HTTP authentication. Its plaintext
-backend is restricted to loopback but remains trusted. Local administrators,
+Client Finished alone is key confirmation, not client identity. The forwarding
+CLI adds no login, client-certificate authorization or HTTP authentication. An
+optional low-level API supports initial/PHA client MAC authentication, but only
+with an application-supplied validator for client trust, identity, authorization,
+validity, key usage and revocation. Extracting a public key is not validation.
+The API reports identity only after both the client MAC and Finished verify;
+the application must still decide which operations that identity may perform.
+The plaintext backend is restricted to loopback but remains trusted. Local administrators,
 malware, debuggers and a compromised backend can observe application plaintext.
 
 ## Restricted certificate policy
@@ -40,7 +47,41 @@ only for controlled short-lived experiments with an agreed out-of-band trust
 replacement process, not a deployment requiring fresh revocation status.
 
 This restricted policy and Python secret handling mean the project does not
-claim complete conformance to every draft-01 implementation requirement.
+claim complete implementation of every core or optional TLS 2.0 facility.
+
+## Early data and session state
+
+Early data is replayable and not forward-secret against compromise of its PSK.
+Only explicitly audited bodyless GET/HEAD routes may reach an early-data-aware
+backend before Client Finished; the proxy inserts `Early-Data: 1`. Ordinary
+traffic and non-allowlisted routes do not acquire early authorization simply
+because the client offers it. Atomic early-use admission is local to one shared
+listener store, not a promise of global exactly-once HTTP execution. A backend
+can still return HTTP 425 when it cannot safely process a request early.
+
+Ticket/replay state is never serialized by this implementation. Restarting loses
+both and rejects old early data. Multi-process/shared-ticket deployments require
+a shared atomic replay service, or must leave early data disabled. Client caches
+are scoped to origin, trust policy and the configured client credential or
+anonymous identity; ticket-bearing connections revalidate saved certificates.
+Server-side client authorization is rechecked after a valid binder and before
+early-use admission. New client authentication cannot retroactively authorize
+early data. Completing PHA does not promote a previously issued anonymous ticket
+to the newly authenticated identity. Cache eviction must never recreate early-use
+permission.
+
+Ticket retention has both an entry limit and a default 16 MiB accounted-byte
+budget, including cached client chains and per-object allowances. This bounds
+cache retention, not total process memory. An oversized ticket is omitted without
+rejecting the established connection. Applications embedding the API can choose
+another `TicketStore(max_bytes=...)` resource budget.
+
+PHA requires a prior client offer, unique request contexts and fresh independent
+verifier keys. Pending authentication state is bounded and consumed on completion,
+closure or cancellation. A cancelled receive stream cannot be reused to resume
+partially processed authentication. The application must keep reading to complete
+PHA and enforce its own idle/lifetime deadlines; no certificate prompt or
+authorization UI is supplied by this API.
 
 ## Keys and process memory
 
@@ -70,6 +111,11 @@ backpressure reduce resource misuse but do not establish denial-of-service
 resistance. The client/server share much of the same code, so matching results
 do not replace independent interoperability testing. Test coverage is finite;
 formal analysis, systematic fuzzing and independent assessment remain future work.
+
+The implemented cipher profile is AES-128-GCM/SHA-256. Raw public keys, delegated
+credentials, external PSKs, certificate compression, exported authenticators,
+PAKE/POK and other optional profiles are not implemented or advertised. Initial
+and PHA client MAC support does not imply support for those separate features.
 
 ## Reporting
 

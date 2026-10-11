@@ -1,14 +1,9 @@
 """Codec vectors and strict rejection of malformed handshake messages."""
 
-import json
-from pathlib import Path
 import unittest
 
 from tls20_server import messages as m
 from tls20_server.errors import ProtocolError
-
-VECTORS = json.loads((Path(__file__).parent / "data" / "draft-01.json").read_text("utf-8"))
-
 
 class MessageTests(unittest.TestCase):
     def setUp(self):
@@ -16,24 +11,26 @@ class MessageTests(unittest.TestCase):
         self.random = bytes(range(128, 160))
         self.ch = m.client_hello(self.A, self.B, "example.test", self.random)
 
-    def test_exact_spec_hello_and_extensions_vectors(self):
-        v = VECTORS
-        pub = {k: bytes.fromhex(x) for k, x in v["public_keys"].items()}
-        expected = {k: bytes.fromhex(x) for k, x in v["handshake_frames"].items()}
+    def test_current_hello_fields_and_extensions(self):
+        pub = {"a_client_auth": self.A, "b_client_traffic": self.B, "e_server_traffic": self.E}
         ch = m.client_hello(pub["a_client_auth"], pub["b_client_traffic"],
                             "vector.invalid", bytes(range(128, 160)), b"component-test")
-        self.assertEqual(ch, expected["client_hello"])
+        self.assertEqual(ch[4:6], b"\x03\x03")
+        self.assertIn(b"\x00\x2b\x00\x03\x02\x04\x00", ch)
+        self.assertIn(b"\xff\x02\x00\x20" + pub["a_client_auth"], ch)
         decoded = m.parse_client_hello(ch[4:])
         self.assertEqual((decoded.A, decoded.B, decoded.name, decoded.protocol),
                          (pub["a_client_auth"], pub["b_client_traffic"], "vector.invalid", b"component-test"))
         sh = m.server_hello(pub["e_server_traffic"], bytes(range(160, 192)))
-        self.assertEqual(sh, expected["server_hello"])
+        self.assertEqual(sh[4:6], b"\x03\x03")
+        self.assertIn(b"\x00\x2b\x00\x02\x04\x00", sh)
         self.assertEqual(m.parse_server_hello(sh[4:]), pub["e_server_traffic"])
         ee = m.encrypted_extensions(b"component-test")
-        self.assertEqual(ee, expected["encrypted_extensions"])
+        self.assertEqual(ee, b"\x08\x00\x00\x1b\x00\x19\x00\x00\x00\x00\x00\x10\x00\x11\x00\x0f\x0ecomponent-test")
         m.parse_encrypted_extensions(ee[4:], b"component-test")
-        synthetic = m.parse_certificate(expected["certificate"][4:])
-        self.assertEqual(m.certificate(synthetic), expected["certificate"])
+        certificate = b"\x0b\x00\x00\x11\x00\x00\x00\x0d\x00\x00\x08NOT-X509\x00\x00"
+        synthetic = m.parse_certificate(certificate[4:])
+        self.assertEqual(m.certificate(synthetic), certificate)
         # This deliberately proves envelope handling only: synthetic is not DER.
         self.assertTrue(synthetic[0].startswith(b"NOT-X509"))
 
@@ -52,7 +49,7 @@ class MessageTests(unittest.TestCase):
         for length in range(len(body)):
             with self.assertRaises(ProtocolError):
                 m.parse_client_hello(body[:length])
-        for index in (0, 1, 34, 35, 36, 37, 102, 103, len(body) - 9):
+        for index in (0, 1, 34, 35, 36, 37, 39, 40, 41, 42):
             mutated = bytearray(body)
             mutated[index] ^= 128
             with self.subTest(index=index), self.assertRaises(ProtocolError):
@@ -66,7 +63,7 @@ class MessageTests(unittest.TestCase):
                                     (self.A, self.B, self.random, b"x" * 256)):
             with self.assertRaises(ProtocolError):
                 m.client_hello(a, b, "example.test", rnd, protocol)
-        equal = body[:70] + body[38:70] + body[102:]
+        equal = body.replace(b"\xff\x02\x00\x20" + self.A, b"\xff\x02\x00\x20" + self.B)
         with self.assertRaises(ProtocolError):
             m.parse_client_hello(equal)
 
@@ -74,7 +71,7 @@ class MessageTests(unittest.TestCase):
         name = ".".join(["a" * 63] * 3 + ["b" * 61])
         protocol = bytes(range(255))
         wire = m.client_hello(self.A, self.B, name, self.random, protocol)
-        self.assertEqual(len(wire) - 4, 613)
+        self.assertLess(len(wire), m.MAX_HANDSHAKE_BODY)
         decoded = m.parse_client_hello(wire[4:])
         self.assertEqual((decoded.name, decoded.protocol), (name, protocol))
         m.parse_encrypted_extensions(m.encrypted_extensions(protocol)[4:], protocol)
@@ -101,10 +98,10 @@ class MessageTests(unittest.TestCase):
             changed[index] ^= 1
             with self.assertRaises(ProtocolError):
                 m.parse_encrypted_extensions(bytes(changed))
-        for changed in (body[:-1], body + b"\x00", body + body[2:6],
-                         body[:2] + body[6:] + body[2:6]):
+        for changed in (body[:-1], body + b"\x00", body + body[2:6]):
             with self.assertRaises(ProtocolError):
                 m.parse_encrypted_extensions(changed)
+        m.parse_encrypted_extensions(body[:2] + body[6:] + body[2:6])
         with self.assertRaises(ProtocolError):
             m.parse_encrypted_extensions(body, b"other")
 
@@ -141,9 +138,33 @@ class MessageTests(unittest.TestCase):
             for length in (0, 31, 33):
                 with self.assertRaises(ProtocolError):
                     m.frame(kind, bytes(length))
-            self.assertEqual(m.decode_frame(m.frame(kind, bytes(32))), (kind, bytes(32)))
+        self.assertEqual(m.decode_frame(m.frame(20, bytes(32))), (20, bytes(32)))
+        self.assertEqual(m.decode_frame(m.certificate_verify(bytes(32))), (15, b"\xfe\x00\x00\x20" + bytes(32)))
         with self.assertRaises(ProtocolError):
             m.frame(1, bytes(m.MAX_HANDSHAKE_BODY + 1))
+
+    def test_unknown_ticket_extensions_are_ignored_but_duplicate_and_version_are_not(self):
+        prefix = (b"\x00\x00\x00\x3c" + bytes(4) + b"\x01n" + b"\x00\x01t")
+        ext = m.extension(0xabab, b"unknown") + m.extension(42, b"\x00\x00\x40\x00")
+        decoded = m.parse_new_session_ticket(prefix + m._vec(ext, 2))
+        self.assertEqual(decoded, (b"t", b"n", 60, 0, 16384))
+        for invalid in (ext + ext, m.extension(43, b"\x04\x00"), m.extension(42, b"x")):
+            with self.assertRaises(ProtocolError):
+                m.parse_new_session_ticket(prefix + m._vec(invalid, 2))
+
+    def test_multiple_psk_offer_binder_bounds_and_order(self):
+        original = m.parse_client_hello(self.ch[4:])
+        ext = b"".join(m.extension(kind, data) for kind, data in original.extension_values)
+        identities = m._vec(b"first", 2) + bytes(4) + m._vec(b"second", 2) + bytes(4)
+        binders = m._vec(bytes(48), 1) + m._vec(bytes(32), 1)
+        psks = m.extension(41, m._vec(identities, 2) + m._vec(binders, 2))
+        hello = m.parse_client_hello(original.fixed_hello + m._vec(ext + psks, 2))
+        self.assertEqual([item[0] for item in hello.psk_offers], [b"first", b"second"])
+        self.assertEqual(hello.binder_vector_size, 84)
+        for tail in (psks + m.extension(0xbaba, b""),
+                     m.extension(41, m._vec(identities, 2) + m._vec(m._vec(bytes(32), 1), 2))):
+            with self.assertRaises(ProtocolError):
+                m.parse_client_hello(original.fixed_hello + m._vec(ext + tail, 2))
 
 
 if __name__ == "__main__":

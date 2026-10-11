@@ -64,6 +64,7 @@ class CLITests(unittest.TestCase):
                          {"fullchain.pem", "server.key", "ca.pem", "server.toml"})
         config = (self.directory / "server.toml").read_text("utf-8")
         self.assertIn('server_name = "localhost"', config)
+        self.assertIn('listen = "127.0.0.1:343"', config)
         result = self.run_cli("check-config", "--config", self.directory / "server.toml")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no listener opened", result.stdout)

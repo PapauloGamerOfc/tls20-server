@@ -67,7 +67,7 @@ class ServerTransportTests(unittest.IsolatedAsyncioTestCase):
         self.received = bytearray()
         self.channels = []
 
-        async def fake_handshake(reader, writer, credentials, server_name, timeout=10):
+        async def fake_handshake(reader, writer, credentials, server_name, timeout=10, **options):
             marker = await reader.readexactly(1)
             if marker != b"A":
                 raise ValueError("Test authentication failed")

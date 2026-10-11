@@ -9,10 +9,12 @@ import sys
 from . import __version__
 from .client import fetch
 from .config import load_config
+from .constants import DEFAULT_PORT
 from .errors import ConfigurationError, ProtocolError
 from .lab import create_lab
 from .pki import load_credentials, load_trust_roots
 from .server import start_server
+from .tickets import TicketCache
 
 
 def parser():
@@ -33,6 +35,10 @@ def parser():
     client.add_argument("--connect-host", help="transport destination override; certificate identity still comes from the URL")
     client.add_argument("--timeout", type=float, default=60)
     client.add_argument("--max-response-bytes", type=int, default=16777216)
+    client.add_argument("--repeat", type=int, default=1,
+                        help="repeat GET on fresh connections, sharing an in-memory session cache")
+    client.add_argument("--early-data", action="store_true",
+                        help="opt into replayable 0-RTT GET after the first authenticated connection")
     return result
 
 
@@ -47,6 +53,17 @@ async def serve(config):
         await running.close()
 
 
+async def fetch_repeated(args, roots):
+    if not 1 <= args.repeat <= 1000:
+        raise ConfigurationError("--repeat must be between 1 and 1000")
+    cache = TicketCache()
+    for _ in range(args.repeat):
+        await fetch(args.url, roots, revocation_policy=args.revocation_policy,
+                    output=sys.stdout.buffer, connect_host=args.connect_host,
+                    timeout=args.timeout, max_response_bytes=args.max_response_bytes,
+                    ticket_cache=cache, use_early_data=args.early_data)
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -55,7 +72,7 @@ def main(argv=None):
             create_lab(args.directory, args.name)
             # The generator refuses existing directories. This file is new too.
             config = ("# Local experimental setup; the CA is not installed in the OS.\n"
-                      'listen = "127.0.0.1:1021"\nupstream = "127.0.0.1:8080"\n'
+                      f'listen = "127.0.0.1:{DEFAULT_PORT}"\nupstream = "127.0.0.1:8080"\n'
                       f'server_name = "{args.name}"\n'
                       'certificate_chain = "fullchain.pem"\nprivate_key = "server.key"\n')
             with (args.directory / "server.toml").open("x", encoding="utf-8", newline="\n") as stream:
@@ -70,9 +87,7 @@ def main(argv=None):
             asyncio.run(serve(load_config(args.config)))
         elif args.command == "get":
             roots = load_trust_roots(args.ca)
-            asyncio.run(fetch(args.url, roots, revocation_policy=args.revocation_policy,
-                              output=sys.stdout.buffer, connect_host=args.connect_host,
-                              timeout=args.timeout, max_response_bytes=args.max_response_bytes))
+            asyncio.run(fetch_repeated(args, roots))
         return 0
     except KeyboardInterrupt:
         return 130

@@ -1,6 +1,6 @@
-# Local-only by default. To expose the prototype deliberately, use 0.0.0.0:1021
+# Local-only by default. To expose the prototype deliberately, use 0.0.0.0:343
 # and configure your firewall. This is an experimental port, not an assignment.
-listen = "127.0.0.1:1021"
+listen = "127.0.0.1:343"
 upstream = "127.0.0.1:8080"
 server_name = "localhost"
 certificate_chain = "lab/fullchain.pem"
@@ -12,3 +12,16 @@ connect_timeout_seconds = 5
 idle_timeout_seconds = 60
 max_connection_seconds = 3600
 max_bytes_per_direction = 16777216
+
+# Resumption saves the certificate flight. Tickets/replay state stay in memory;
+# restarting the listener forces a new full handshake.
+session_tickets = true
+ticket_lifetime_seconds = 86400
+ticket_capacity = 4096
+
+# 0-RTT is replayable. Enable only after configuring the backend to understand
+# Early-Data: 1 / HTTP 425 and auditing these exact routes for replay safety.
+# A GET method alone is NOT evidence that a route is safe to replay.
+upstream_early_data_aware = false
+early_data_paths = [] # Example, after auditing: ["/", "/static/index.html"]
+max_early_data_bytes = 16384

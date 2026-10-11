@@ -60,7 +60,7 @@ class Credentials:
 
 
 def validate_server_name(name: str) -> str:
-    """Accept already-normalized draft-01 DNS A-labels, not IP literals."""
+    """Accept normalized DNS A-labels in this implementation's lab profile."""
     if not isinstance(name, str) or name != name.lower():
         raise ProtocolError("server name must be lowercase ASCII DNS")
     try:
@@ -82,7 +82,7 @@ def validate_server_name(name: str) -> str:
         ipaddress.ip_address(name)
     except ValueError:
         return name
-    raise ProtocolError("IP-literal identities are outside draft-01")
+    raise ProtocolError("IP-literal identities are outside this implementation's lab profile")
 
 
 def _element(data: bytes, offset: int = 0) -> tuple[int, bytes, int, bytes]:

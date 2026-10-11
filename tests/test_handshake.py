@@ -6,6 +6,7 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from tls20_server import crypto as c, messages as m
 from tls20_server.client import fetch, parse_url
@@ -19,9 +20,11 @@ from tls20_server.server import start_server
 
 class URLTests(unittest.TestCase):
     def test_url_and_default(self):
-        self.assertEqual(parse_url("httpps://localhost/"), ("localhost", 1021, "/"))
+        self.assertEqual(parse_url("httpps://localhost/"), ("localhost", 343, "/"))
         self.assertEqual(parse_url("httpps://example.com:343/a?b=2"), ("example.com", 343, "/a?b=2"))
-        self.assertEqual(parse_url("httpps://LOCALHOST/café"), ("localhost", 1021, "/caf%C3%A9"))
+        self.assertEqual(parse_url("httpps://LOCALHOST/café"), ("localhost", 343, "/caf%C3%A9"))
+        self.assertEqual(parse_url("httpps://example.com:8443/a"), ("example.com", 8443, "/a"))
+        self.assertEqual(parse_url("httpps://example.com:1021/"), ("example.com", 1021, "/"))
 
     def test_invalid_urls(self):
         for url in ("https://localhost/", "http://localhost/", "httpps://127.0.0.1/",
@@ -116,6 +119,33 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
                               for output in outputs))
         self.assertEqual(self.backend_connections, 8)
         self.assertTrue(all(output.getvalue() == outputs[0].getvalue() for output in outputs))
+
+    async def test_default_port_and_http_host_through_real_handshake(self):
+        actual_port = await self.proxy()
+        open_connection = asyncio.open_connection
+        for url, requested_port, authority in (
+            ("httpps://localhost/", 343, "localhost"),
+            ("httpps://localhost:343/", 343, "localhost"),
+            ("httpps://localhost:8443/", 8443, "localhost:8443"),
+        ):
+            with self.subTest(url=url):
+                calls = []
+
+                async def route_test_port(host, port, **kwargs):
+                    # Keep real crypto and sockets, without binding a privileged
+                    # port in tests. The proxy's backend connections are intact.
+                    if port == requested_port:
+                        calls.append((host, port))
+                        port = actual_port
+                    return await open_connection(host, port, **kwargs)
+
+                output = io.BytesIO()
+                with patch("tls20_server.client.asyncio.open_connection", side_effect=route_test_port):
+                    await fetch(url, self.roots, revocation_policy="lab-offline",
+                                connect_host="127.0.0.1", output=output)
+                self.assertEqual(calls, [("127.0.0.1", requested_port)])
+                self.assertTrue(output.getvalue().startswith(b"HTTP/1.1 200 OK\r\n"))
+                self.assertIn(f"\r\nHost: {authority}\r\n".encode(), self.backend_requests[-1])
 
     async def test_plaintext_and_standard_tls_never_open_backend(self):
         port = await self.proxy(handshake_timeout_seconds=0.15)

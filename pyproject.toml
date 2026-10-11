@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tls20-server"
 version = "0.1.0"
-description = "Experimental HTTPPS server and offline-PKI test client for independent TLS 2.0 draft-01"
+description = "Experimental HTTPPS server and offline-PKI test client for independent TLS 2.0"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

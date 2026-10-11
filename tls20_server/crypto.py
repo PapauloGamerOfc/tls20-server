@@ -1,4 +1,4 @@
-"""Draft-01 primitives adapted from tls20-spec's MIT component implementation.
+"""TLS 2.0 SHA-256/AES-128-GCM primitives and RFC-shaped key schedule.
 
 Copyright (c) 2026 TLS 2.0 specification contributors. See LICENSE and
 https://github.com/PapauloGamerOfc/tls20-spec for the original component tests.
@@ -14,13 +14,14 @@ import hmac
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .errors import ProtocolError
 
-PREFACE = b"TLS20-EXPERIMENT-01\r\n"
-LABEL_PREFIX = b"tls20 draft01 "
-PROOF_CONTEXT = b"TLS20 server authentication\x00"
+PREFACE = b"TLS20-EXPERIMENT\r\n"
+LABEL_PREFIX = b"tls20 "
+PROOF_CONTEXT = b" " * 64 + b"TLS 2.0, server CertificateVerify\x00"
 ZERO32 = bytes(32)
 MAX_CONTENT = 1 << 14
 MAX_RECORDS = 1 << 20
@@ -66,7 +67,7 @@ def label_info(label: str, context: bytes, length: int) -> bytes:
 
 def label_expand(secret: bytes, label: str, context: bytes, length: int) -> bytes:
     if len(secret) != 32:
-        raise ProtocolError("draft-01 secrets must have length 32")
+        raise ProtocolError("SHA-256 secrets must have length 32")
     return expand(secret, label_info(label, context, length), length)
 
 
@@ -90,9 +91,68 @@ def dh(private: X25519PrivateKey, public: bytes) -> bytes:
     return shared
 
 
+def traffic_key(group: int):
+    if group == 0x001d:
+        private = X25519PrivateKey.generate()
+        return private, public_bytes(private)
+    if group == 0x0017:
+        private = ec.generate_private_key(ec.SECP256R1())
+        return private, private.public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    raise ProtocolError("unsupported traffic group")
+
+
+def traffic_dh(private, group: int, public: bytes) -> bytes:
+    if group == 0x001d:
+        return dh(private, public)
+    if group == 0x0017 and len(public) == 65 and public[0] == 4:
+        try:
+            peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), public)
+            return private.exchange(ec.ECDH(), peer)
+        except (ValueError, TypeError) as exc:
+            raise ProtocolError("invalid P-256 traffic share") from exc
+    raise ProtocolError("invalid traffic group or share")
+
+
 def server_proof(auth_root: bytes, transcript: bytes) -> bytes:
     thash = digest(transcript)
-    return mac(label_expand(auth_root, "server proof", thash, 32), PROOF_CONTEXT + thash)
+    return mac(label_expand(auth_root, "server mac", b"", 32), PROOF_CONTEXT + thash)
+
+
+def derive_secret(secret: bytes, label: str, transcript: bytes) -> bytes:
+    return label_expand(secret, label, digest(transcript), 32)
+
+
+def handshake_secret(shared: bytes, psk: bytes = ZERO32) -> bytes:
+    early = extract(ZERO32, psk)
+    return extract(derive_secret(early, "derived", b""), shared)
+
+
+def master_secret(handshake: bytes) -> bytes:
+    return extract(derive_secret(handshake, "derived", b""), ZERO32)
+
+
+def authentication_root(handshake: bytes, shared: bytes, transcript: bytes) -> bytes:
+    return extract(label_expand(handshake, "auth salt", digest(transcript), 32), shared)
+
+
+def binder(psk: bytes, truncated_transcript: bytes) -> bytes:
+    key = derive_secret(extract(ZERO32, psk), "res binder", b"")
+    return finished(key, truncated_transcript)
+
+
+def exporter(secret: bytes, label: str, context: bytes, length: int) -> bytes:
+    intermediate = derive_secret(secret, label, b"")
+    return label_expand(intermediate, "exporter", digest(context), length)
+
+
+def client_proof(exporter_secret: bytes, private: X25519PrivateKey, peer: bytes,
+                 transcript: bytes) -> bytes:
+    thash = digest(transcript)
+    salt = exporter(exporter_secret, "EXPORTER-TLS20-Client-Auth", thash, 32)
+    root = extract(salt, dh(private, peer))
+    key = label_expand(root, "client mac", b"", 32)
+    return mac(key, b" " * 64 + b"TLS 2.0, client CertificateVerify\x00" + thash)
 
 
 def verify_proof(auth_root: bytes, transcript: bytes, proof: bytes) -> bool:
@@ -120,7 +180,7 @@ def nonce(iv: bytes, sequence: int) -> bytes:
 
 def validate_inner(content: bytes, inner_type: int) -> None:
     if inner_type not in INNER_TYPES:
-        raise ProtocolError("invalid inner type; padding is unsupported")
+        raise ProtocolError("invalid inner type")
     if inner_type == 22 and not content:
         raise ProtocolError("empty handshake record")
     if inner_type == 21 and len(content) != 2:
@@ -164,11 +224,13 @@ class RecordState:
         self.sequence += 1
         self.content_bytes += content_length
 
-    def seal(self, content: bytes, inner_type: int) -> bytes:
+    def seal(self, content: bytes, inner_type: int, padding: int = 0) -> bytes:
         try:
             self._ready("seal", len(content))
             validate_inner(content, inner_type)
-            plaintext = content + bytes((inner_type,))
+            if not isinstance(padding, int) or not 0 <= padding <= 16385 - len(content) - 1:
+                raise ProtocolError("record padding length")
+            plaintext = content + bytes((inner_type,)) + bytes(padding)
             header = b"\x17\x03\x03" + (len(plaintext) + 16).to_bytes(2, "big")
             result = header + self._cipher.encrypt(nonce(self.iv, self.sequence), plaintext, header)
             self._advance(len(content))
@@ -184,11 +246,19 @@ class RecordState:
             ciphertext_length = int.from_bytes(record[3:5], "big")
             if ciphertext_length != len(record) - 5:
                 raise ProtocolError("encrypted record length mismatch")
-            self._ready("open", ciphertext_length - 17)
+            if not 17 <= ciphertext_length <= 16640:
+                raise ProtocolError("encrypted record size")
+            self._ready("open", 0)
             plaintext = self._cipher.decrypt(nonce(self.iv, self.sequence), record[5:], record[:5])
+            if len(plaintext) > MAX_CONTENT + 1:
+                raise ProtocolError("padded plaintext exceeds record limit")
             if not plaintext:
                 raise ProtocolError("missing inner type")
-            content, inner_type = plaintext[:-1], plaintext[-1]
+            stripped = plaintext.rstrip(b"\x00")
+            if not stripped:
+                raise ProtocolError("missing inner type")
+            content, inner_type = stripped[:-1], stripped[-1]
+            self._ready("open", len(content))
             validate_inner(content, inner_type)
             self._advance(len(content))
             return content, inner_type
@@ -197,3 +267,22 @@ class RecordState:
             if isinstance(exc, InvalidTag):
                 raise ProtocolError("record authentication failed") from exc
             raise
+
+    def try_open(self, record: bytes) -> tuple[bytes, int] | None:
+        """Probe an epoch transition; failed AEAD trial never mutates this state."""
+        trial = RecordState(self.secret, self.operation)
+        trial.sequence, trial.content_bytes = self.sequence, self.content_bytes
+        try:
+            result = trial.open(record)
+        except ProtocolError:
+            return None
+        self.sequence, self.content_bytes = trial.sequence, trial.content_bytes
+        return result
+
+    def update(self) -> None:
+        if self.failed:
+            raise ProtocolError("record state is closed")
+        self.secret = label_expand(self.secret, "traffic upd", b"", 32)
+        self.sequence = self.content_bytes = 0
+        self.key, self.iv = key_iv(self.secret)
+        self._cipher = AESGCM(self.key)
