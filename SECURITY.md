@@ -7,8 +7,8 @@ channel. The `httpps` scheme and experimental TCP default are not registrations.
 
 ## Trust boundary
 
-The client must be configured with a trusted CA independently of the server and
-must know the expected DNS identity. Certificate path, hostname, server proof and
+The default client must have a trusted CA configured independently of the server and
+must know the expected service identity. Certificate path, hostname, server proof and
 Finished checks all have to pass for a new full-handshake identity. Explicit
 0-RTT instead uses a ticket from a previously authenticated connection and
 revalidates its retained certificate under the current client policy. Receiving a
@@ -22,8 +22,9 @@ the proof offline. It does not promise non-transferability against a cooperating
 online witness or prevent separately signed application receipts.
 
 Client Finished alone is key confirmation, not client identity. The forwarding
-CLI adds no login, client-certificate authorization or HTTP authentication. An
-optional low-level API supports initial/PHA client MAC authentication, but only
+CLI adds no login or client identity by default. Explicit profiles can require
+initial client MAC authentication and separately provisioned authorization. An
+optional low-level API additionally supports dynamic PHA, but only
 with an application-supplied validator for client trust, identity, authorization,
 validity, key usage and revocation. Extracting a public key is not validation.
 The API reports identity only after both the client MAC and Finished verify;
@@ -31,20 +32,22 @@ the application must still decide which operations that identity may perform.
 The plaintext backend is restricted to loopback but remains trusted. Local administrators,
 malware, debuggers and a compromised backend can observe application plaintext.
 
-## Restricted certificate policy
+## Explicit certificate and evidence policies
 
-The client validates an explicitly ordered path to an explicit local trust root,
-not an arbitrary public Web PKI graph. Supported signatures are Ed25519 and
-P-256/SHA-256. RSA is not implemented. Unknown critical extensions fail closed;
-name constraints and certificate-policy extensions are rejected rather than
-partially processed, even when noncritical. This deliberately rejects some
-otherwise valid certificates instead of silently ignoring restrictions.
+The library's explicit-root OpenSSL validator supports RSA-PKCS1/PSS, ECDSA,
+Ed25519/Ed448 signatures, name constraints and role-specific identity checks.
+Offline delegation grants and their algorithm offers are separate from online
+MAC authentication. RPKs require an explicit current identity binding, never an
+unverified public key received from a peer. Optional OCSP, CT and DNSSEC/DANE
+policies authenticate evidence under independently configured roots/logs; parsing
+an SCT, staple or DNS packet is not trust. No certificate-supplied URL is fetched.
 
-The only revocation policy implemented is the explicit `lab-offline` policy.
-It performs no CRL or OCSP checking, so a revoked-but-unexpired lab certificate
-can still be accepted. It fetches no certificate-supplied URL. This is suitable
-only for controlled short-lived experiments with an agreed out-of-band trust
-replacement process, not a deployment requiring fresh revocation status.
+The diagnostic client's explicit `lab-offline` mode remains restricted to its
+laboratory chain policy. It performs no CRL or OCSP checking: a revoked but
+unexpired lab certificate can be accepted. The broader library's `offline` mode
+also does not by itself establish current revocation status; configure evidence
+requirements when freshness is needed. Neither mode is an automatic public-WebPKI
+trust-store or revocation-service implementation.
 
 This restricted policy and Python secret handling mean the project does not
 claim complete implementation of every core or optional TLS 2.0 facility.
@@ -94,8 +97,11 @@ controls; Windows ACLs are inherited and must be appropriate for the destination
 The Python runtime and cryptographic provider may retain copies of immutable
 secret bytes. This implementation **does not guarantee secure erasure**, locked
 memory, exclusion from swap/crash dumps, or whole-program side-channel resistance.
-References becoming unreachable is not physical erasure. No connection secret
-or application plaintext is intentionally logged. Do not enable a debugger or
+References becoming unreachable is not physical erasure. The production build
+intentionally logs no connection secret or application plaintext. A separately
+named test-diagnostics build can write specifically authorized traffic/exporter
+roots to a protected new file; no environment variable activates it. Treat that
+output as sensitive decryption material. Do not enable a debugger or
 collect process dumps if their exposure would be unacceptable.
 
 ## Resource limits and operational precautions
@@ -112,10 +118,19 @@ resistance. The client/server share much of the same code, so matching results
 do not replace independent interoperability testing. Test coverage is finite;
 formal analysis, systematic fuzzing and independent assessment remain future work.
 
-The implemented cipher profile is AES-128-GCM/SHA-256. Raw public keys, delegated
-credentials, external PSKs, certificate compression, exported authenticators,
-PAKE/POK and other optional profiles are not implemented or advertised. Initial
-and PHA client MAC support does not imply support for those separate features.
+The five baseline AEAD suites are implemented. Integrity-only suites require
+explicit opt-in on both endpoints and are excluded from normal HTTPPS. Never
+describe those channels as encrypted. Application authenticators authorize
+additional identities separately and do not change the connection's initial
+identity. See the maintained [implementation matrix](docs/implementation.md#coverage-boundaries)
+for supported profiles and provider limitations. Native PAKE is distinct from
+ordinary PSK provisioning and counts attempts under bounded account/global limits.
+Mixed credential/PWD offers are an explicit pre-authentication policy choice;
+failure in the selected mode never triggers a second mode or a new connection.
+Password verifiers are password-equivalent secrets. ITS authorization requires
+the explicit PSID/SSP/service binding, trust and revocation inventory, trusted
+time offset, native path/grant verification, and online MAC/Finished; parsing
+COER or possessing an ITS pseudonym alone is not permission to serve a web origin.
 
 ## Reporting
 

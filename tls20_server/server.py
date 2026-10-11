@@ -120,9 +120,10 @@ async def _relay(channel: Any, reader: asyncio.StreamReader, writer: asyncio.Str
 class RunningServer:
     """Own the listener and all accepted connection tasks."""
 
-    def __init__(self, config: Config, credentials: Any):
+    def __init__(self, config: Config, credentials: Any, profile=None):
         self.config = config
         self.credentials = credentials
+        self.profile = profile
         # Tickets and replay reservations are confined to this listener's
         # lifetime. Restarting or replacing its credentials invalidates them;
         # no reusable ticket keys are silently restored without replay state.
@@ -152,6 +153,8 @@ class RunningServer:
             _abort_writer(writer)
             self._writers.discard(writer)
             self._tasks.discard(done)
+            if self._closing and not self._tasks and self.profile is not None:
+                self.profile.close()
 
         task.add_done_callback(finished)
 
@@ -193,13 +196,22 @@ class RunningServer:
             early_upload_bytes += len(request)
         try:
             async with asyncio.timeout(self.config.max_connection_seconds):
+                handshake = (self.profile.server_handshake if self.profile is not None else
+                    lambda reader, writer, **options: server_handshake(
+                        reader, writer, self.credentials, self.config.server_name, **options))
                 channel = await asyncio.wait_for(
-                    server_handshake(
-                        reader, writer, self.credentials, self.config.server_name,
+                    handshake(
+                        reader, writer,
                         timeout=self.config.handshake_timeout_seconds,
                         ticket_store=self.ticket_store,
                         max_early_data=self.config.max_early_data_bytes if early_enabled else 0,
                         on_early_data=accept_early if early_enabled else None,
+                        cipher_suites=self.config.cipher_suites,
+                        application_protocols=(self.config.upstream_protocol.encode("ascii"),),
+                        record_size_limit=self.config.record_size_limit,
+                        certificate_compression=self.config.certificate_compression,
+                        heartbeat_mode=self.config.heartbeat_mode or None,
+                        ticket_count_limit=self.config.ticket_count_limit,
                     ), timeout=self.config.handshake_timeout_seconds,
                 )
                 if gate.rejected:
@@ -268,6 +280,8 @@ class RunningServer:
             for task in tuple(self._tasks):
                 if not task.done():
                     task.cancel()
+            if self.profile is not None and not any(not task.done() for task in self._tasks):
+                self.profile.close()
 
     async def __aenter__(self) -> RunningServer:
         return self
@@ -278,13 +292,24 @@ class RunningServer:
 
 async def start_server(config: Config, credentials: Any = None) -> RunningServer:
     """Validate local credentials before opening a TCP listening socket."""
-    if credentials is None:
-        credentials = load_credentials(
-            config.certificate_chain, config.private_key, config.server_name
+    profile = None
+    if config.profile_file is not None:
+        if credentials is not None:
+            raise ValueError("Use configured profile credentials or API credentials, not both")
+        from .profiles import load_profile
+        profile = load_profile(config.profile_file, role="server", service=config.server_name,
+                               port=config.listen.port, protocol=config.upstream_protocol.encode("ascii"))
+        credentials = profile.credentials
+    elif credentials is None:
+        credentials = load_credentials(config.certificate_chain, config.private_key, config.server_name)
+    try:
+        running = RunningServer(config, credentials, profile)
+        running.server = await asyncio.start_server(
+            running._accept, config.listen.host, config.listen.port,
+            limit=65536, backlog=min(config.max_connections, 128),
         )
-    running = RunningServer(config, credentials)
-    running.server = await asyncio.start_server(
-        running._accept, config.listen.host, config.listen.port,
-        limit=65536, backlog=min(config.max_connections, 128),
-    )
-    return running
+        return running
+    except BaseException:
+        if profile is not None:
+            profile.close()
+        raise

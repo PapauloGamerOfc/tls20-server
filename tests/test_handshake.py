@@ -25,9 +25,12 @@ class URLTests(unittest.TestCase):
         self.assertEqual(parse_url("httpps://LOCALHOST/café"), ("localhost", 343, "/caf%C3%A9"))
         self.assertEqual(parse_url("httpps://example.com:8443/a"), ("example.com", 8443, "/a"))
         self.assertEqual(parse_url("httpps://example.com:1021/"), ("example.com", 1021, "/"))
+        self.assertEqual(parse_url("httpps://127.0.0.1/"), ("127.0.0.1", 343, "/"))
+        self.assertEqual(parse_url("httpps://[2001:0DB8:0:0:0:0:0:1]:8443/a"), ("2001:db8::1", 8443, "/a"))
 
     def test_invalid_urls(self):
-        for url in ("https://localhost/", "http://localhost/", "httpps://127.0.0.1/",
+        for url in ("https://localhost/", "http://localhost/", "httpps://127.0.00.1/",
+                    "httpps://[fe80::1%25eth0]/", "httpps://[::1]trailer/",
                     "httpps://user@localhost/", "httpps://localhost:0/", "httpps://localhost:65536/",
                     "httpps://localhost/#fragment", "httpps://localhost/\r\nX:1", "httpps://localhost./"):
             with self.subTest(url=url), self.assertRaises(ConfigurationError):
@@ -120,6 +123,13 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend_connections, 8)
         self.assertTrue(all(output.getvalue() == outputs[0].getvalue() for output in outputs))
 
+    async def test_fetch_explicit_general_pkix_policy(self):
+        port = await self.proxy()
+        output = io.BytesIO()
+        await fetch(f"httpps://localhost:{port}/", self.roots,
+                    revocation_policy="offline", connect_host="127.0.0.1", output=output)
+        self.assertTrue(output.getvalue().startswith(b"HTTP/1.1 200 OK\r\n"))
+
     async def test_default_port_and_http_host_through_real_handshake(self):
         actual_port = await self.proxy()
         open_connection = asyncio.open_connection
@@ -198,7 +208,9 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             reader, writer = await self.connect(port)
             writer.write(c.PREFACE + b"\x16\x03\x03" + len(hello).to_bytes(2, "big") + hello)
             await writer.drain()
-            self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
+            alert = await asyncio.wait_for(reader.read(), 1)
+            self.assertEqual(alert[:6], b"\x15\x03\x03\x00\x02\x02")
+            self.assertEqual(len(alert), 7)
         self.assertEqual(self.backend_connections, 0)
 
     async def test_server_does_not_connect_before_client_finished(self):

@@ -27,11 +27,17 @@ def parser():
     lab = commands.add_parser("lab-init", help="create fresh, isolated test credentials; never installs a CA")
     lab.add_argument("--directory", type=Path, required=True)
     lab.add_argument("--name", default="localhost")
+    password = commands.add_parser("password-record", help="create one salted password verifier from private UTF-8 files")
+    password.add_argument("--username-file", type=Path, required=True)
+    password.add_argument("--password-file", type=Path, required=True)
+    password.add_argument("--output", type=Path, required=True)
     client = commands.add_parser("get", help="print the raw HTTP response from an HTTPPS endpoint")
     client.add_argument("url")
-    client.add_argument("--ca", type=Path, required=True)
-    client.add_argument("--revocation-policy", choices=["lab-offline"], required=True,
-                        help="acknowledge lab-only offline certificates without revocation checking")
+    trust = client.add_mutually_exclusive_group(required=True)
+    trust.add_argument("--ca", type=Path)
+    trust.add_argument("--profile", type=Path, help="explicit role/service-bound client profile TOML")
+    client.add_argument("--revocation-policy", choices=["lab-offline", "offline"],
+                        help="explicit offline trust: restricted lab chain or general PKIX; neither checks revocation")
     client.add_argument("--connect-host", help="transport destination override; certificate identity still comes from the URL")
     client.add_argument("--timeout", type=float, default=60)
     client.add_argument("--max-response-bytes", type=int, default=16777216)
@@ -53,7 +59,7 @@ async def serve(config):
         await running.close()
 
 
-async def fetch_repeated(args, roots):
+async def fetch_repeated(args, roots, profile=None):
     if not 1 <= args.repeat <= 1000:
         raise ConfigurationError("--repeat must be between 1 and 1000")
     cache = TicketCache()
@@ -61,11 +67,16 @@ async def fetch_repeated(args, roots):
         await fetch(args.url, roots, revocation_policy=args.revocation_policy,
                     output=sys.stdout.buffer, connect_host=args.connect_host,
                     timeout=args.timeout, max_response_bytes=args.max_response_bytes,
-                    ticket_cache=cache, use_early_data=args.early_data)
+                    ticket_cache=cache, use_early_data=args.early_data, profile=profile)
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    if args.command == "get" and args.ca is not None and args.revocation_policy is None:
+        argument_parser.error("--revocation-policy is required with --ca")
+    if args.command == "get" and args.profile is not None and args.revocation_policy is not None:
+        argument_parser.error("--profile specifies its own revocation policy")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
         if args.command == "lab-init":
@@ -81,13 +92,33 @@ def main(argv=None):
             print("Trust ca.pem explicitly in the test client. Do not deploy these as a public PKI.")
         elif args.command == "check-config":
             config = load_config(args.config)
-            load_credentials(config.certificate_chain, config.private_key, config.server_name)
+            if config.profile_file is None:
+                load_credentials(config.certificate_chain, config.private_key, config.server_name)
+            else:
+                from .profiles import load_profile
+                profile = load_profile(config.profile_file, role="server", service=config.server_name,
+                    port=config.listen.port, protocol=config.upstream_protocol.encode("ascii"))
+                profile.close()
             print("Configuration and server credentials validated; no listener opened.")
         elif args.command == "serve":
             asyncio.run(serve(load_config(args.config)))
+        elif args.command == "password-record":
+            from .profiles import create_password_record
+            create_password_record(args.username_file, args.password_file, args.output)
+            print("Created one salted password record; protect its file as a secret.")
         elif args.command == "get":
-            roots = load_trust_roots(args.ca)
-            asyncio.run(fetch_repeated(args, roots))
+            if args.profile is not None:
+                from .client import parse_url
+                from .profiles import load_profile
+                name, port, _ = parse_url(args.url)
+                profile = load_profile(args.profile, role="client", service=name, port=port)
+                try:
+                    asyncio.run(fetch_repeated(args, profile.roots, profile))
+                finally:
+                    profile.close()
+            else:
+                roots = load_trust_roots(args.ca, general_pkix=args.revocation_policy == "offline")
+                asyncio.run(fetch_repeated(args, roots))
         return 0
     except KeyboardInterrupt:
         return 130

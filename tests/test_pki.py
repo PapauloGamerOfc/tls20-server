@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 import base64
+import ipaddress
 import os
 from pathlib import Path
 import tempfile
@@ -14,7 +15,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from tls20_server.errors import ConfigurationError, ProtocolError
 from tls20_server.lab import create_lab, generate_lab_credentials
-from tls20_server.pki import _children, _element, _parse_der, load_credentials, load_trust_roots, validate_chain, validate_server_name
+from tls20_server.pki import _children, _element, _parse_der, load_credentials, load_trust_roots, validate_chain, validate_server_name, validate_service_identity
 
 
 def der(cert):
@@ -78,6 +79,34 @@ class CertificateTests(unittest.TestCase):
         expected = self.key.public_key().public_bytes_raw()
         self.assertEqual(self.validate().public_bytes_raw(), expected)
         self.assertEqual(self.validate(chain=[der(self.leaf), der(self.root)]).public_bytes_raw(), expected)
+
+    def test_ip_reference_uses_only_ip_san_and_never_sni(self):
+        for address in ("127.0.0.1", "2001:db8::1"):
+            with self.subTest(address=address):
+                cert = issue(self.key, self.ca_key, self.name, self.ca_name, hostname=None,
+                    extra=[(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(address))]), False)])
+                self.assertEqual(self.validate(leaf=cert, name=address).public_bytes_raw(), self.key.public_key().public_bytes_raw())
+                with self.assertRaises(ProtocolError):
+                    validate_server_name(address)
+                self.assertEqual(validate_service_identity(address), address)
+                wrong_type = issue(self.key, self.ca_key, self.name, self.ca_name, hostname=address)
+                with self.assertRaises(ProtocolError):
+                    self.validate(leaf=wrong_type, name=address)
+        for address in ("127.000.0.1", "[::1]", "fe80::1%eth0", "2001:0db8::1", "2001:DB8::1"):
+            with self.subTest(address=address), self.assertRaises(ProtocolError):
+                validate_service_identity(address)
+
+    def test_generic_local_loader_accepts_ip_address_san(self):
+        leaf = issue(self.key, self.ca_key, self.name, self.ca_name, hostname=None,
+            extra=[(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("::1"))]), False)])
+        with tempfile.TemporaryDirectory() as temporary:
+            chain_path, key_path = Path(temporary) / "chain.pem", Path(temporary) / "key.pem"
+            chain_path.write_bytes(leaf.public_bytes(serialization.Encoding.PEM) + self.root.public_bytes(serialization.Encoding.PEM))
+            key_path.write_bytes(self.key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            key_path.chmod(0o600)
+            self.assertEqual(load_credentials(chain_path, key_path, "::1").chain_der, [der(leaf), der(self.root)])
+            with self.assertRaises((ConfigurationError, ProtocolError)):
+                load_credentials(chain_path, key_path, "::2")
 
     def test_real_p256_issuer(self):
         ca_key = ec.generate_private_key(ec.SECP256R1())

@@ -1,0 +1,262 @@
+"""MAC-based exported authenticators: direction, trust, replay and lifetimes."""
+
+import asyncio
+import hashlib
+import hmac
+import unittest
+from types import SimpleNamespace
+
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import x25519
+
+from tls20_server import crypto as c, messages as m
+from tls20_server.application_auth import (
+    AuthenticatorManager, AuthorizedIdentity, credential_validator, parse_request,
+)
+from tls20_server.errors import ProtocolError
+from tls20_server.lab import generate_lab_credentials
+
+
+def endpoint(role, root, private, peer, suite=0x1301):
+    offers = ((50, m._vec(b"\x08\x07\x04\x03", 2)),)
+    return SimpleNamespace(
+        role=role, cipher_suite=suite, closed=False, handshake_completed=True, native_provider=None,
+        enable_authenticators=True, auth_share_secret=private, peer_auth_share=peer,
+        local_capabilities=offers, peer_capabilities=offers,
+        exporter=lambda label, context=b"", length=32: c.exporter(
+            root, label, context, length, c.suite(suite).hash_name),
+    )
+
+
+class AuthenticatorTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.credentials, self.root_cert = generate_lab_credentials("localhost")
+        self.secret = bytes(range(32))
+        self.share = x25519.X25519PrivateKey.generate()
+        self.client_channel = endpoint("client", self.secret, self.share, b"")
+        self.server_channel = endpoint("server", self.secret, None, c.public_bytes(self.share))
+        self.client = AuthenticatorManager(self.client_channel)
+        self.server = AuthenticatorManager(self.server_channel)
+        self.validations = 0
+
+    def policy(self, certificate, request):
+        self.validations += 1
+        if certificate.chain != tuple(self.credentials.chain_der):
+            raise ProtocolError("unapproved additional identity")
+        # The production caller must validate chain, status, role and scope.
+        # This test deliberately pins the complete exact freshly minted chain.
+        public = x509.load_der_x509_certificate(certificate.chain[0]).public_key()
+        return AuthorizedIdentity(public, "authorized test identity")
+
+    async def test_production_credential_adapter_requires_path_name_and_scope(self):
+        from dataclasses import replace
+        from tls20_server.credential_profiles import CredentialPolicy
+        policy = CredentialPolicy(trust_roots=(self.root_cert,), peer_name="localhost",
+                                  revocation_policy="offline")
+        for selected, permitted, succeeds in (
+                (policy, True, True), (policy, False, False),
+                (replace(policy, peer_name="other.example"), True, False),
+                (replace(policy, trust_roots=()), True, False)):
+            request = self.client.request()
+            response = self.server.authenticate(self.credentials, request=request)
+            validator = credential_validator(selected, role="server", authorize=lambda identity: permitted)
+            if succeeds:
+                result = await self.client.validate(response, validator)
+                self.assertEqual(result.identity, "localhost")
+            else:
+                with self.assertRaises(ProtocolError):
+                    await self.client.validate(response, validator)
+
+    async def test_spontaneous_adapter_uses_current_offers(self):
+        from tls20_server.credential_profiles import CredentialPolicy
+        policy = CredentialPolicy(trust_roots=(self.root_cert,), peer_name="localhost",
+                                  revocation_policy="offline")
+        validator = credential_validator(policy, role="server", authorize=lambda identity: True,
+                                        spontaneous_offers=self.client_channel.local_capabilities)
+        response = self.server.authenticate(self.credentials)
+        self.assertTrue((await self.client.validate(response, validator)).authenticated)
+        response = self.server.authenticate(self.credentials)
+        without_offers = credential_validator(policy, role="server", authorize=lambda identity: True)
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, without_offers)
+
+    async def test_requested_server_identity_and_context_consumption(self):
+        request = self.client.request(context=b"server identity")
+        parsed = parse_request(request)
+        self.assertEqual(parsed.role, "server")
+        self.assertIn(0xff02, dict(parsed.extensions))
+        response = self.server.authenticate(self.credentials, request=request)
+        result = await self.client.validate(response, self.policy)
+        self.assertTrue(result.authenticated)
+        self.assertEqual(result.identity, "authorized test identity")
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, self.policy)
+        self.assertEqual(self.validations, 1)
+
+    async def test_requested_client_identity_and_directional_exporters(self):
+        request = self.server.request(context=b"client identity")
+        parsed = parse_request(request)
+        self.assertEqual(parsed.role, "client")
+        self.assertIn(0xff03, dict(parsed.extensions))
+        response = self.client.authenticate(self.credentials, request=request)
+        self.assertTrue((await self.server.validate(response, self.policy)).authenticated)
+        with self.assertRaises(ProtocolError):
+            self.server.authenticate(self.credentials, request=request)
+
+    async def test_finished_independent_literal_oracle(self):
+        request = self.client.request(context=b"oracle")
+        response = self.server.authenticate(self.credentials, request=request)
+        certificate_length = 4 + int.from_bytes(response[1:4], "big")
+        cert = response[:certificate_length]
+        cv = response[certificate_length:certificate_length + 40]
+        finished = response[certificate_length + 40:]
+        context = c.exporter(self.secret, "EXPORTER-server authenticator handshake context", b"", 32)
+        key = c.exporter(self.secret, "EXPORTER-server authenticator finished key", b"", 32)
+        self.assertEqual(finished, b"\x14\x00\x00\x20" + hmac.digest(key, hashlib.sha256(context + request + cert + cv).digest(), "sha256"))
+        self.assertTrue((await self.client.validate(response, self.policy)).authenticated)
+
+    async def test_authenticated_refusal_is_not_identity(self):
+        request = self.client.request(context=b"refuse")
+        response = self.server.authenticate(request=request)
+        self.assertEqual(response[:4], b"\x14\x00\x00\x20")
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, self.policy)
+        result = await self.client.validate(response, self.policy, request=request)
+        self.assertFalse(result.authenticated)
+        self.assertIsNone(result.identity)
+        self.assertEqual(self.validations, 0)
+
+    async def test_refusal_rejects_tampered_finished(self):
+        request = self.client.request()
+        response = self.server.authenticate(request=request)
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response[:-1] + bytes((response[-1] ^ 1,)), self.policy, request=request)
+        self.assertFalse(self.client._pending)
+
+    async def test_spontaneous_server_requires_explicit_retained_verifier(self):
+        response = self.server.authenticate(self.credentials, context=b"spontaneous")
+        self.assertTrue((await self.client.validate(response, self.policy)).authenticated)
+        response = self.server.authenticate(self.credentials, context=b"no capability")
+        self.client_channel.auth_share_secret = None
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, self.policy)
+        with self.assertRaises(ProtocolError):
+            self.client.authenticate(self.credentials)
+
+    async def test_request_keys_are_independent(self):
+        first, second = self.client.request(), self.client.request()
+        a, b = parse_request(first), parse_request(second)
+        self.assertNotEqual(a.verifier_share, b.verifier_share)
+        self.assertNotEqual(a.verifier_share, c.public_bytes(self.share))
+        response_b = self.server.authenticate(self.credentials, request=second)
+        response_a = self.server.authenticate(self.credentials, request=first)
+        self.assertTrue((await self.client.validate(response_b, self.policy)).authenticated)
+        self.assertTrue((await self.client.validate(response_a, self.policy)).authenticated)
+
+    async def test_cross_connection_transplant_fails(self):
+        request = self.client.request()
+        self.server_channel.exporter = endpoint("server", b"x" * 32, None, b"").exporter
+        response = self.server.authenticate(self.credentials, request=request)
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, self.policy)
+
+    async def test_no_accepting_exporter_only_forgery(self):
+        request = self.client.request()
+        response = bytearray(self.server.authenticate(self.credentials, request=request))
+        offset = 4 + int.from_bytes(response[1:4], "big")
+        response[offset + 8] ^= 1
+        context, key = self.server._keys("server")
+        response[-32:] = hmac.digest(key, hashlib.sha256(context + request + response[:-36]).digest(), "sha256")
+        with self.assertRaisesRegex(ProtocolError, "MAC failed"):
+            await self.client.validate(bytes(response), self.policy)
+
+    async def test_policy_must_authorize_effective_x25519_key(self):
+        request = self.client.request()
+        response = self.server.authenticate(self.credentials, request=request)
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, lambda *_: True)
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, self.policy)
+
+    async def test_sha384_mac_and_finished_lengths(self):
+        self.client_channel = endpoint("client", b"a" * 48, self.share, b"", 0x1302)
+        self.server_channel = endpoint("server", b"a" * 48, None, c.public_bytes(self.share), 0x1302)
+        client, server = AuthenticatorManager(self.client_channel), AuthenticatorManager(self.server_channel)
+        request = client.request()
+        response = server.authenticate(self.credentials, request=request)
+        self.assertEqual(response[-52:-48], b"\x14\x00\x00\x30")
+        self.assertTrue((await client.validate(response, self.policy)).authenticated)
+
+    async def test_sm3_uses_negotiated_hash_not_secret_length(self):
+        for selected in (0x00c6, 0x00c7):
+            with self.subTest(suite=selected):
+                client_channel = endpoint("client", self.secret, self.share, b"", selected)
+                server_channel = endpoint("server", self.secret, None, c.public_bytes(self.share), selected)
+                client, server = AuthenticatorManager(client_channel), AuthenticatorManager(server_channel)
+                request = client.request(context=b"SM3")
+                response = server.authenticate(self.credentials, request=request)
+                context, key = server._keys("server")
+                transcript = context + request + response[:-36]
+                # Independent Finished oracle: SM3 and SHA-256 both have 32-byte
+                # outputs, so accidentally inferring the algorithm from length
+                # would make both peers agree on the wrong wire protocol.
+                from cryptography.hazmat.primitives import hashes, hmac as native_hmac
+                independent_hash=hashes.Hash(hashes.SM3()); independent_hash.update(transcript)
+                independent_mac=native_hmac.HMAC(key,hashes.SM3()); independent_mac.update(independent_hash.finalize())
+                expected = independent_mac.finalize()
+                self.assertEqual(response[-32:], expected)
+                self.assertNotEqual(expected, hmac.digest(key, hashlib.sha256(transcript).digest(), "sha256"))
+                self.assertTrue((await client.validate(response, self.policy)).authenticated)
+                refusal_request = client.request(context=b"SM3 refusal")
+                refusal = server.authenticate(request=refusal_request)
+                self.assertFalse((await client.validate(refusal, self.policy, request=refusal_request)).authenticated)
+
+    async def test_close_during_async_authorization_cannot_return_identity(self):
+        request = self.client.request()
+        response = self.server.authenticate(self.credentials, request=request)
+        async def policy(*args):
+            self.client.close()
+            await asyncio.sleep(0)
+            return self.policy(*args)
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, policy)
+
+    async def test_context_shared_across_both_directions_and_cancel(self):
+        request = self.client.request(context=b"same")
+        collision = AuthenticatorManager(self.server_channel).request(context=b"same")
+        with self.assertRaises(ProtocolError):
+            self.client.authenticate(self.credentials, request=collision)
+        self.client.cancel(request)
+        self.assertFalse(self.client._pending)
+        with self.assertRaises(ProtocolError):
+            self.client.request(context=b"same")
+
+    async def test_limits_do_not_evict_consumed_contexts(self):
+        client = AuthenticatorManager(self.client_channel, max_contexts=1)
+        request = client.request(context=b"one")
+        client.cancel(request)
+        with self.assertRaises(ProtocolError):
+            client.request(context=b"two")
+
+    async def test_gate_before_finished_and_after_close(self):
+        self.client_channel.handshake_completed = False
+        with self.assertRaises(ProtocolError):
+            self.client.request()
+        self.client_channel.handshake_completed = True
+        self.client_channel.closed = True
+        with self.assertRaises(ProtocolError):
+            self.client.request()
+
+    async def test_invalid_requests_and_unsolicited_extensions(self):
+        for extensions in (((13, b"\0\2\x08\x07"),), ((0xff03, b"x" * 32),),
+                           ((34, b"\0\2\xfe\0"),), ((50, b"\0\2\x08\x07"),)):
+            with self.subTest(extensions=extensions), self.assertRaises(ProtocolError):
+                self.client.request(extra_extensions=extensions)
+        request = self.client.request()
+        with self.assertRaises(ProtocolError):
+            self.server.authenticate(self.credentials, request=request,
+                                     entry_extensions=[((5, b"unrequested"),)] * len(self.credentials.chain_der))
+
+
+if __name__ == "__main__":
+    unittest.main()

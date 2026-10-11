@@ -40,9 +40,42 @@ jobs:
       - name: Check local documentation links
         run: python tools/check_docs.py
 
+  native-profiles:
+    name: Native profiles / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Select tested Rust toolchain for the optional ITS helper
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --no-self-update
+          rustup override set 1.98.0
+      - name: Build pinned permissive providers and production PAKE helper
+        run: python tools/build_native_dependencies.py --output build/providers --with-gost --with-its --jobs 2
+      - name: Native profile, interoperability and independent vector tests
+        run: python tools/test_native_dependencies.py --manifest build/providers/providers.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: native-profile-build-log-${{ matrix.os }}
+          path: build/providers/build.log
+          retention-days: 7
+
   package:
     name: Build and verify Python packages
-    needs: test
+    needs: [test, native-profiles]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

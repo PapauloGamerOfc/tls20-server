@@ -8,6 +8,7 @@ Multi-process deployments must share an atomic replay store or disable 0-RTT.
 from collections import OrderedDict
 from dataclasses import dataclass, field
 import os
+import math
 import threading
 import time
 
@@ -29,9 +30,22 @@ class SessionTicket:
     certificate_chain: list[bytes] = field(default_factory=list)
     client_certificate_chain: list[bytes] = field(default_factory=list)
     _storage_size: int = 0
+    cipher_suite: int = 0x1301
+    certificate_type: int = 0
+    certificate_extensions: tuple = ()
+    client_certificate_type: int = 0
+    client_certificate_extensions: tuple = ()
+    record_size_limit: int = 16385
+    external_psk_identity: bytes = b""
+    pake_identity: bytes = b""
+    # Original wall-clock credential deadline. Revalidating cached DNSSEC
+    # evidence must not restart its TTL for every resumption/new ticket.
+    credential_expires_at: float | None = None
 
     def expired(self, now=None):
-        return (time.monotonic() if now is None else now) - self.issued >= self.lifetime
+        return ((time.monotonic() if now is None else now) - self.issued >= self.lifetime
+                or self.credential_expires_at is not None and
+                (not math.isfinite(self.credential_expires_at) or time.time() >= self.credential_expires_at))
 
     def obfuscated_age(self):
         return (int((time.monotonic() - self.issued) * 1000) + self.age_add) % (1 << 32)
@@ -51,16 +65,20 @@ class TicketStore:
         _, ticket = self._tickets.popitem(last=False)
         self._bytes -= ticket._storage_size
 
-    def issue(self, secret, name, protocol, max_early_data=0, context=b"", client_certificate_chain=None):
+    def issue(self, secret, name, protocol, max_early_data=0, context=b"", client_certificate_chain=None,
+              *, cipher_suite=0x1301, client_certificate_type=0, client_certificate_extensions=(),
+              external_psk_identity=b"", pake_identity=b"", native_provider=None):
         nonce, identity = os.urandom(8), os.urandom(32)
         age_add = int.from_bytes(os.urandom(4), "big")
-        psk = c.label_expand(secret, "resumption", nonce, 32)
+        selected = c.suite(cipher_suite)
+        psk = c.label_expand(secret, "resumption", nonce, selected.hash_length, c.hash_context(selected.hash_name,native_provider))
         message = m.new_session_ticket(identity, nonce, self.lifetime, age_add, max_early_data)
         chain = list(client_certificate_chain or [])
         # Count retained variable bytes plus a conservative per-object allowance.
         # This is a local cache resource policy, never a limit on TLS credentials.
         size = (512 + len(identity) + len(psk) + len(name.encode("utf-8"))
-                + len(protocol) + len(context) + sum(64 + len(der) for der in chain))
+                + len(protocol) + len(context) + len(external_psk_identity) + len(pake_identity) + sum(64 + len(der) for der in chain)
+                + sum(64 + len(value) for entry in client_certificate_extensions for _, value in entry))
         if size > self.max_bytes:
             return None  # Complete the valid handshake without issuing a ticket.
         with self._lock:
@@ -74,7 +92,11 @@ class TicketStore:
                 self._evict_oldest()
             ticket = SessionTicket(identity, psk, name, protocol, now, self.lifetime,
                                    age_add, max_early_data, context=context,
-                                   client_certificate_chain=chain, _storage_size=size)
+                                   client_certificate_chain=chain, _storage_size=size, cipher_suite=cipher_suite)
+            ticket.client_certificate_type = client_certificate_type
+            ticket.client_certificate_extensions = tuple(client_certificate_extensions)
+            ticket.external_psk_identity = external_psk_identity
+            ticket.pake_identity = pake_identity
             self._tickets[identity] = ticket
             self._bytes += size
         return message

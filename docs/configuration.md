@@ -9,9 +9,16 @@ opening a listener. It does not test backend availability.
 | --- | --- | --- |
 | `listen` | `127.0.0.1:343` | Literal local IPv4/IPv6 address and TCP port |
 | `upstream` | `127.0.0.1:8080` | Fixed literal loopback HTTP endpoint |
-| `server_name` | `localhost` | One exact expected lowercase ASCII DNS identity |
+| `upstream_protocol` | `"http/1.1"` | Select `h2` only for a cleartext HTTP/2 prior-knowledge backend; no HTTP version translation |
+| `cipher_suites` | `[0x1301, 0x1302, 0x1303, 0x1304, 0x1305]` | Ordered permitted AES-GCM, ChaCha20-Poly1305 and AES-CCM/CCM8 suites; integrity-only is not HTTPPS |
+| `record_size_limit` | `16385` | Negotiated receive limit (64..16385), including inner type and padding; enforced only if offered |
+| `certificate_compression` | `[1, 2, 3]` | Permitted zlib, Brotli and Zstandard codecs; empty list disables negotiation |
+| `heartbeat_mode` | `0` | Off (0), permit peer probes (1), or negotiate while disallowing peer probes (2); no periodic timer |
+| `ticket_count_limit` | `1` | Per-handshake issuance budget (0..255); client ticket requests are bounded hints |
+| `server_name` | `localhost` | One exact lowercase ASCII DNS identity or canonical IP reference identity |
 | `certificate_chain` | `fullchain.pem` | Leaf-first certificate PEM bundle |
 | `private_key` | `server.key` | Matching unencrypted PKCS#8 X25519 key |
+| `profile_file` | unset | Optional strict role/service/port-bound authentication and cryptographic profile; see [profiles](profiles.md) |
 | `max_connections` | `128` | Maximum accepted active or handshaking sessions |
 | `handshake_timeout_seconds` | `10` | Positive finite absolute handshake deadline; local policy, not a wire-protocol limit |
 | `connect_timeout_seconds` | `5` | HTTP backend connection deadline |
@@ -28,8 +35,10 @@ opening a listener. It does not test backend availability.
 Relative paths resolve against the TOML file's directory. IPv6 endpoints require
 brackets, for example `[::1]:343`. DNS names are not accepted as listener or
 backend addresses. Remote backends are intentionally unsupported in this alpha:
-plaintext application traffic stays on the same host. The `server_name` remains
-a DNS identity even when TCP uses an IP address.
+plaintext application traffic stays on the same host. A DNS `server_name` is
+authenticated as a DNS SAN even when TCP routes to an IP address. A literal IP
+reference requires a matching `iPAddress` SAN; it is never sent as DNS SNI and
+an IP-looking `dNSName` cannot authorize it. IPv6 HTTP authorities use brackets.
 
 The server does not become an open forward proxy. It always forwards to the
 single configured backend, never to a client-selected Host, URL or CONNECT
@@ -54,6 +63,12 @@ exactly one `Early-Data: 1` header and forwards the request **before Client
 Finished**, after validating the PSK binder and atomically reserving early use.
 The route allowlist is an application policy, not a new TLS protocol restriction.
 A safe method name does not make a route safe to repeat.
+
+The current route-aware early-data gate requires `upstream_protocol = "http/1.1"`.
+With `h2`, normal authenticated multiplexed HTTP/2 is relayed unchanged, but
+`early_data_paths` must remain empty: an HTTP/1 parser cannot authorize HTTP/2
+frames. The low-level channel accepts application-specific early-data policies;
+that API does not automatically authorize early HTTP/2 requests.
 
 TLS-level early rejection is distinguished from an HTTP-policy refusal after
 TLS acceptance. The latter returns `425 Too Early` on the authenticated channel
@@ -85,10 +100,21 @@ grant a dedicated service only the privileges it needs.
 
 ## Credentials
 
-The certificate file accepts one through eight PEM certificates. The leaf must
-have an X25519 SPKI, critical `basicConstraints: CA=false`, critical keyAgreement-
-only key usage, serverAuth EKU and a matching DNS SAN. Certificates may be signed
-by Ed25519 or P-256/SHA-256 issuers. No Common Name fallback is used.
+The settings below describe the simple default certificate path. Optional
+[profiles](profiles.md) expose the implemented RPK/delegation, PSK, PAKE, native
+national algorithms, evidence, client authorization and ITS policies through
+the same CLI. A profile does not relax the fixed backend, early-data gate or
+connection quotas. It is executable/trust configuration and must not be supplied
+by an untrusted remote peer.
+
+The general credential loader accepts up to 64 PEM certificates. The default leaf
+has an X25519 SPKI, compatible non-CA/keyAgreement usage, appropriate serverAuth
+EKU constraints and a matching DNS or IP SAN. The separate generated lab profile
+uses stricter critical usage and path constraints. Certificates may use the
+supported RSA, ECDSA or EdDSA issuer signatures, with provider-backed consistency
+checks including name constraints. No Common Name fallback is used. The final
+supplied issuer is only a local consistency anchor for loading the operator's
+own incomplete chain; it is never installed as a remote client's trust root.
 
 The client receives its trust root separately using `--ca`; a root sent in the
 handshake never creates trust. The root certificate is normally omitted from

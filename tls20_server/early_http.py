@@ -35,7 +35,8 @@ class EarlyRequestGate:
 
     def __init__(self, paths: tuple[str, ...], hostname: str, port: int, limit: int):
         self.paths = frozenset(path.encode("ascii") for path in paths)
-        self.authorities = {hostname.encode("ascii"), f"{hostname}:{port}".encode("ascii")}
+        host_field = f"[{hostname}]" if ":" in hostname else hostname
+        self.authorities = {host_field.encode("ascii"), f"{host_field}:{port}".encode("ascii")}
         self.limit = limit
         self.buffer = bytearray()
         self.seen = False

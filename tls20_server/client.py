@@ -1,12 +1,13 @@
 """HTTPPS test client; no automatic fallback, redirects, or insecure mode."""
 
 import asyncio
+import ipaddress
 from urllib.parse import quote, urlsplit
 
 from .constants import DEFAULT_PORT
 from .errors import ConfigurationError, ProtocolError
 from .handshake import client_handshake
-from .messages import validate_name
+from .messages import validate_service_identity
 
 
 class _EarlyResponseStatus:
@@ -53,7 +54,11 @@ def parse_url(url):
         if parsed.fragment or any(ord(char) < 33 or ord(char) == 127 for char in url):
             raise ValueError("URL contains a fragment, whitespace or control characters")
         hostname = parsed.hostname.encode("idna").decode("ascii").lower()
-        validate_name(hostname)
+        try:
+            hostname = str(ipaddress.ip_address(hostname))
+        except ValueError:
+            pass
+        validate_service_identity(hostname)
         port = DEFAULT_PORT if parsed.port is None else parsed.port
         if not 1 <= port <= 65535:
             raise ValueError("invalid port")
@@ -67,29 +72,37 @@ def parse_url(url):
 
 async def fetch(url, trust_roots, *, revocation_policy, output, connect_host=None,
                 timeout=60, max_response_bytes=16777216, ticket_cache=None,
-                use_early_data=False):
+                use_early_data=False, profile=None):
     hostname, port, path = parse_url(url)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3600:
         raise ConfigurationError("client timeout must be between 0 and 3600 seconds")
     if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int) or not 1 <= max_response_bytes <= 1073741824:
         raise ConfigurationError("invalid response limit")
-    if revocation_policy != "lab-offline":
-        raise ConfigurationError("the explicit lab-offline revocation policy is required")
+    if profile is not None and (profile.role != "client" or profile.service != hostname or profile.port != port
+                                or profile.protocol != b"http/1.1"):
+        raise ConfigurationError("Client profile does not match this HTTPPS URL and protocol")
+    if profile is None and revocation_policy not in ("lab-offline", "offline"):
+        raise ConfigurationError("an explicit lab-offline or offline PKIX policy is required")
+    if profile is not None and use_early_data and "pinning_cache" in profile.options:
+        raise ConfigurationError("Pinning requires fresh authentication; omit --early-data for this profile")
     channel = None
     writer = None
     total = 0
     retry_without_early = False
     response_status = _EarlyResponseStatus()
     deadline = asyncio.get_running_loop().time() + timeout
-    authority = hostname if port == DEFAULT_PORT else f"{hostname}:{port}"
+    host_field = f"[{hostname}]" if ":" in hostname else hostname
+    authority = host_field if port == DEFAULT_PORT else f"{host_field}:{port}"
     request = (f"GET {path} HTTP/1.1\r\nHost: {authority}\r\n"
                "Connection: close\r\nUser-Agent: httpps-test-client/0.1\r\n\r\n").encode("ascii")
     try:
         async with asyncio.timeout(timeout):
             reader, writer = await asyncio.open_connection(connect_host or hostname, port, limit=32768)
-            channel = await client_handshake(reader, writer, hostname, trust_roots,
-                                             revocation_policy=revocation_policy,
-                                             timeout=min(10, timeout),
+            handshake = (profile.client_handshake if profile is not None else
+                         lambda reader, writer, **options: client_handshake(reader, writer, hostname,
+                             trust_roots, revocation_policy=revocation_policy, **options))
+            channel = await handshake(reader, writer,
+                                             timeout=timeout,
                                              ticket_cache=ticket_cache,
                                              cache_context=f"{hostname}:{port}".encode("ascii"),
                                              early_data=request if use_early_data else b"")
@@ -139,4 +152,4 @@ async def fetch(url, trust_roots, *, revocation_policy, output, connect_host=Non
         return await fetch(url, trust_roots, revocation_policy=revocation_policy,
                            output=output, connect_host=connect_host, timeout=remaining,
                            max_response_bytes=max_response_bytes, ticket_cache=ticket_cache,
-                           use_early_data=False)
+                           use_early_data=False, profile=profile)

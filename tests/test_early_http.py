@@ -21,6 +21,15 @@ class EarlyHTTPTests(unittest.TestCase):
         result = self.gate().feed(b"HEAD / HTTP/1.1\r\nHost: localhost\r\nEarly-Data: 1\r\n\r\n")
         self.assertEqual(result.count(b"Early-Data:"), 1)
 
+    def test_ipv6_authority_uses_brackets_and_exact_port(self):
+        for host in (b"[::1]", b"[::1]:343"):
+            gate = EarlyRequestGate(("/",), "::1", 343, 16384)
+            self.assertIsNotNone(gate.feed(b"GET / HTTP/1.1\r\nHost: " + host + b"\r\n\r\n"))
+        for host in (b"::1", b"::1:343", b"[::1]:443", b"[::2]"):
+            gate = EarlyRequestGate(("/",), "::1", 343, 16384)
+            self.assertIsNone(gate.feed(b"GET / HTTP/1.1\r\nHost: " + host + b"\r\n\r\n"))
+            self.assertTrue(gate.rejected)
+
     def test_non_replay_safe_or_ambiguous_requests_are_never_returned(self):
         requests = [
             b"POST / HTTP/1.1\r\nHost: localhost\r\n\r\n",

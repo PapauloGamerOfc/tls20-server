@@ -1,7 +1,7 @@
 # TLS 2.0 Server
 
 An experimental HTTPPS termination proxy and test client for the independent
-[TLS 2.0 specification](https://github.com/PapauloGamerOfc/tls20-spec/blob/0c9c8bf0914697d521050554e545a167fa8fc345/SPECIFICATION.md).
+[TLS 2.0 specification](https://github.com/PapauloGamerOfc/tls20-spec/blob/dee31da9826e10bd590f58acc0f9f46143505fd1/SPECIFICATION.md).
 The server loads an X25519 leaf certificate chain and its matching private key,
 authenticates a new encrypted channel, and relays its HTTP bytes to a configured
 local HTTP server. It does not redirect the client to an unencrypted URL.
@@ -15,18 +15,34 @@ to HTTPS or HTTP.
 ## What is included
 
 - Server authentication using a certified static X25519 key and a per-client MAC.
-- Independent ephemeral X25519 or P-256 traffic keys, HKDF-SHA-256 and AES-128-GCM records.
+- Independent traffic keys, negotiated SHA-256/SHA-384 schedules and all five
+  baseline AES-GCM, ChaCha20-Poly1305 and AES-CCM/CCM8 suites.
 - A configurable TCP listener and a fixed, loopback-only HTTP backend.
 - Real X.509 laboratory certificates, explicit client trust and hostname checks.
 - Connection, handshake, idle, lifetime and traffic limits; bounded buffering.
 - A terminal test client, local credential generator and loopback integration tests.
 - In-memory session tickets, resumed handshakes, exporters and traffic-key updates.
 - Opt-in 0-RTT HTTP processing with atomic replay admission and explicit replay-safe routes.
-- Optional initial/PHA client MAC authentication through the low-level Python API,
-  requiring an explicit application trust/authorization callback; not enabled by the CLI.
+- Optional initial/PHA client MAC authentication with explicit trust and application
+  authorization; initial authentication is configurable, dynamic PHA uses the API.
+- HTTP/2 relay to a prior-knowledge HTTP/2 backend, with connection multiplexing.
+- Configurable profiles for raw keys, delegated credentials, external/imported
+  PSKs, native PAKE, explicit mixed credential/PWD selection, certificate
+  compression/cache, evidence and POK bootstrap.
+- Opt-in application authenticators above ordinary or password-established
+  channels, without replacing the original connection identity.
+- Explicit optional providers for SM2/SM3/SM4, GOST/TLSTREE/MGM and provisioned
+  ITS-X25519 grants; no native library is automatically discovered or trusted.
+- Negotiated record limits, heartbeat, ticket requests and external signaling
+  bindings, with loopback tests of real records rather than parsers alone.
 
-The certificate validator accepts a deliberately restricted lab PKI, not general
-public-PKI paths. Python cannot guarantee secret erasure. See
+The library has an explicit-root OpenSSL PKIX policy and optional current OCSP,
+CT and DNSSEC/DANE evidence validation. The simple diagnostic CLI requires a
+deliberate `offline` or restricted `lab-offline` choice; neither checks current
+revocation. `get --profile` can instead require independently configured current
+evidence. No path imports peer-supplied trust roots.
+An available API is not automatic certificate enrollment or a browser identity UI.
+Python cannot guarantee secret erasure. See
 [security and limitations](SECURITY.md) before running an experiment.
 
 ## Install
@@ -118,9 +134,10 @@ the handshake; HTTP 425 causes one retry without early data. There is no retry
 after certificate or authentication failure. This test client does not persist
 session secrets to disk. See [configuration](docs/configuration.md) for limits.
 
-The [implementation guide](docs/implementation.md) documents the optional
-client-authentication API, ticket identity isolation, and remaining unimplemented
-profiles. No client-certificate UI or CLI option is implied by the API support.
+The [profile guide](docs/profiles.md) documents opt-in file-backed authentication,
+native providers and trust/evidence policies. The [implementation guide](docs/implementation.md)
+documents dynamic APIs, ticket identity isolation and precise coverage boundaries.
+An API or configuration option does not create a browser credential-selection UI.
 
 ## Supply your own credentials
 
@@ -163,6 +180,7 @@ packages, not standalone native executables or installers.
 ## Further documentation
 
 - [Configuration](docs/configuration.md)
+- [Authentication and cryptographic profiles](docs/profiles.md)
 - [Protocol implementation and compatibility](docs/implementation.md)
 - [Security model and limitations](SECURITY.md)
 - [Contribution guide](CONTRIBUTING.md)

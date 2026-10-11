@@ -215,7 +215,7 @@ class CryptoTests(unittest.TestCase):
             c.RecordState(secret, "both")
         self.assertNotIn(secret.hex(), repr(c.RecordState(secret, "seal")))
 
-    def test_receiver_quotas_before_content_delivery(self):
+    def test_receiver_accepts_peer_rekey_policy_but_enforces_wire_limits(self):
         secret = bytes(32)
         key, iv = c.key_iv(secret)
         for sequence, content_bytes, content in (
@@ -227,11 +227,19 @@ class CryptoTests(unittest.TestCase):
             plaintext = content + b"\x17"
             header = b"\x17\x03\x03" + (len(plaintext) + 16).to_bytes(2, "big")
             wire = header + AESGCM(key).encrypt(c.nonce(iv, sequence), plaintext, header)
-            with self.assertRaises(ProtocolError):
-                receiver.open(wire)
-            self.assertTrue(receiver.failed)
-            self.assertEqual(receiver.sequence, sequence)
-            self.assertEqual(receiver.content_bytes, content_bytes)
+            if len(content) > c.MAX_CONTENT:
+                with self.assertRaises(ProtocolError):
+                    receiver.open(wire)
+                self.assertTrue(receiver.failed)
+                self.assertEqual(receiver.sequence, sequence)
+                self.assertEqual(receiver.content_bytes, content_bytes)
+            else:
+                self.assertEqual(receiver.open(wire), (content, 23))
+                self.assertEqual(receiver.sequence, sequence + 1)
+        receiver = c.RecordState(secret, "open")
+        receiver.sequence = 1 << 64
+        with self.assertRaises(ProtocolError):
+            receiver.open(c.RecordState(secret, "seal").seal(b"x", 23))
 
     def test_rfc7748_high_bit_input_decoding(self):
         # RFC 7748 accepts the high bit masked in the final X25519 input byte.

@@ -93,8 +93,8 @@ class ClientAuthTests(unittest.IsolatedAsyncioTestCase):
         async def record_frame(wire, frame, state=None):
             frames.append(frame)
             return await send_frame(wire, frame, state)
-        def record_proof(root, private, peer, transcript):
-            actual = client_proof(root, private, peer, transcript)
+        def record_proof(root, private, peer, transcript, hash_name=None):
+            actual = client_proof(root, private, peer, transcript, hash_name)
             self.assertEqual(actual, proof_oracle(root, private, peer, transcript))
             proofs.append((root, transcript))
             return actual
@@ -102,7 +102,7 @@ class ClientAuthTests(unittest.IsolatedAsyncioTestCase):
             client = await self.connect(client_credentials=self.client_credentials, post_handshake_auth=True)
             server = self.channels[-1]
             flight = [frame for frame in frames if frame[0] != 4]
-            self.assertEqual([frame[0] for frame in flight], [1, 2, 8, 13, 11, 15, 20, 11, 15, 20])
+            self.assertEqual([frame[0] for frame in flight], [1, 2, 8, 13, 11, 15, 20, 25, 15, 20])
             prefix = b"TLS20-EXPERIMENT\r\n" + b"".join(flight[:8])
             self.assertEqual(proofs, [(client.exporter_secret, prefix)] * 2)
             self.assertEqual(client.handshake_transcript, b"TLS20-EXPERIMENT\r\n" + b"".join(flight))
@@ -113,7 +113,7 @@ class ClientAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await asyncio.wait_for(client.recv(), 2), b"drive authentication")
             await asyncio.wait_for(future, 2)
             flight = [frame for frame in frames if frame[0] != 24]
-            self.assertEqual([frame[0] for frame in flight], [13, 11, 15, 20])
+            self.assertEqual([frame[0] for frame in flight], [13, 25, 15, 20])
             prefix = client.handshake_transcript + b"".join(flight[:2])
             self.assertEqual(proofs, [(client.exporter_secret, prefix)] * 2)
 
@@ -127,8 +127,8 @@ class ClientAuthTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bad_client_mac_never_establishes_identity(self):
         original = c.client_proof
-        def damaged(secret, private, peer, transcript):
-            value = original(secret, private, peer, transcript)
+        def damaged(secret, private, peer, transcript, hash_name=None):
+            value = original(secret, private, peer, transcript, hash_name)
             return bytes((value[0] ^ 1,)) + value[1:] if private is self.client_credentials.private_key else value
         with patch.object(c, "client_proof", damaged), self.assertRaises((ProtocolError, OSError, AssertionError)):
             await self.connect(client_credentials=self.client_credentials)

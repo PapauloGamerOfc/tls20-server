@@ -42,7 +42,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         for arguments in (("--help",), ("serve", "--help"),
                           ("check-config", "--help"), ("lab-init", "--help"),
-                          ("get", "--help")):
+                          ("get", "--help"), ("password-record", "--help")):
             with self.subTest(arguments=arguments):
                 result = self.run_cli(*arguments)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -93,7 +93,7 @@ class CLITests(unittest.TestCase):
         self.assertFalse(absent.exists())
 
     def test_invalid_lab_names_leave_no_directory(self):
-        for name in ("bad name", "UPPERCASE.example", "127.0.0.1", "*.example", "name."):
+        for name in ("bad name", "UPPERCASE.example", "127.00.0.1", "*.example", "name."):
             with self.subTest(name=name):
                 result = self.run_cli("lab-init", "--directory", self.directory, "--name", name)
                 self.assertEqual(result.returncode, 1)
@@ -113,11 +113,46 @@ class CLITests(unittest.TestCase):
 
     def test_invalid_url_with_explicit_policy_fails_without_network(self):
         self.init_lab()
-        result = self.run_cli("get", "https://localhost/", "--ca", self.directory / "ca.pem",
-                              "--revocation-policy", "lab-offline")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("invalid HTTPPS URL", result.stderr)
-        self.assertEqual(result.stdout, "")
+        for policy in ("lab-offline", "offline"):
+            result = self.run_cli("get", "https://localhost/", "--ca", self.directory / "ca.pem",
+                                  "--revocation-policy", policy)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("invalid HTTPPS URL", result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_salted_password_record_is_private_and_never_printed_or_overwritten(self):
+        self.directory.mkdir()
+        username=self.directory/"username.txt";password=self.directory/"password.txt";output=self.directory/"accounts.toml"
+        username.write_text("alice",encoding="utf-8");password.write_text("private fixture password",encoding="utf-8")
+        username.chmod(0o600);password.chmod(0o600)
+        arguments=("password-record","--username-file",username,"--password-file",password,"--output",output)
+        result=self.run_cli(*arguments)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertNotIn("private fixture password",result.stdout+result.stderr)
+        self.assertNotIn("base_hex",result.stdout+result.stderr)
+        import tomllib
+        record=tomllib.loads(output.read_text("utf-8"))["accounts"][0]
+        self.assertEqual(len(bytes.fromhex(record["base_hex"])),32)
+        self.assertEqual(len(bytes.fromhex(record["salt_hex"])),32)
+        before=output.read_bytes()
+        result=self.run_cli(*arguments)
+        self.assertEqual(result.returncode,1)
+        self.assertEqual(output.read_bytes(),before)
+
+    def test_profile_validation_is_available_to_cli_without_opening_listener(self):
+        self.init_lab()
+        profile=self.directory/"profile.toml"
+        profile.write_text('role="server"\nservice="localhost"\n[credential]\n'
+                           'chain="fullchain.pem"\nprivate_key="server.key"',encoding="utf-8")
+        configuration=self.directory/"server.toml"
+        configuration.write_text(configuration.read_text("utf-8")+'\nprofile_file="profile.toml"\n',encoding="utf-8")
+        result=self.run_cli("check-config","--config",configuration)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn("no listener opened",result.stdout)
+        profile.write_text('role="client"\nservice="localhost"\n[trust]\nroots="ca.pem"',encoding="utf-8")
+        result=self.run_cli("get","https://localhost/","--profile",profile)
+        self.assertEqual(result.returncode,1)
+        self.assertIn("invalid HTTPPS URL",result.stderr)
 
 
 if __name__ == "__main__":

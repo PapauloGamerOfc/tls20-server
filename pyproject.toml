@@ -9,7 +9,13 @@ description = "Experimental HTTPPS server and offline-PKI test client for indepe
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["cryptography==50.0.2"]
+dependencies = [
+    "cryptography==50.0.2", "pyOpenSSL==26.4.0", "dnspython==2.8.0",
+    "Brotli==1.2.0", "zstandard==0.25.0", "precis-i18n==1.1.2",
+]
+
+[project.optional-dependencies]
+test = ["h2==4.4.1"]
 
 [project.scripts]
 tls20-server = "tls20_server.__main__:main"
@@ -20,3 +26,6 @@ Specification = "https://github.com/PapauloGamerOfc/tls20-spec"
 
 [tool.setuptools.packages.find]
 include = ["tls20_server*"]
+
+[tool.setuptools.data-files]
+"share/tls20-server/native" = ["native/pake.c", "native/CMakeLists.txt", "LICENSE"]

@@ -2,4 +2,8 @@ include LICENSE README.md SECURITY.md CONTRIBUTING.md server.example.toml requir
 recursive-include docs *.md
 recursive-include tests *.py
 recursive-include tools *.py
+recursive-include tools/getdns_msvc *.h
+recursive-include native *.c CMakeLists.txt
+recursive-include native/its *.rs *.toml Cargo.lock *.md *.txt *.py LICENSE* LICENCE* COPYING*
+prune native/its/target
 prune .github

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import ipaddress
 import os
 from pathlib import Path
 
@@ -12,16 +13,20 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from .errors import ConfigurationError, ProtocolError
-from .pki import Credentials, validate_server_name
+from .pki import Credentials, validate_service_identity
 
 
 def generate_lab_credentials(server_name: str) -> tuple[Credentials, x509.Certificate]:
     """Create fresh in-memory lab material; CA private key is never serialized."""
     try:
-        validate_server_name(server_name)
+        validate_service_identity(server_name)
     except ProtocolError as exc:
         raise ConfigurationError(str(exc)) from exc
     now = datetime.now(timezone.utc)
+    try:
+        alternative_name = x509.IPAddress(ipaddress.ip_address(server_name))
+    except ValueError:
+        alternative_name = x509.DNSName(server_name)
     ca_key = ed25519.Ed25519PrivateKey.generate()
     server_key = x25519.X25519PrivateKey.generate()
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "TLS20 local experimental CA")])
@@ -39,7 +44,7 @@ def generate_lab_credentials(server_name: str) -> tuple[Credentials, x509.Certif
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
             .add_extension(x509.KeyUsage(False, False, False, False, True, False, False, False, False), critical=True)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
-            .add_extension(x509.SubjectAlternativeName([x509.DNSName(server_name)]), critical=False)
+            .add_extension(x509.SubjectAlternativeName([alternative_name]), critical=False)
             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
             .sign(ca_key, algorithm=None))
     return Credentials([leaf.public_bytes(serialization.Encoding.DER)], server_key), ca

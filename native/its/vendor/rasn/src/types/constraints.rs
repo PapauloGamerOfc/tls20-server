@@ -1,0 +1,1510 @@
+//! Constraints of values on a given type.
+
+use super::IntegerType;
+use num_bigint::BigInt;
+
+/// A marker trait with validation methods for types that have ASN.1 inner subtype constraints.
+pub trait InnerSubtypeConstraint: Sized {
+    /// Validates the inner subtype constraints and returns the type on success.
+    /// Does not attempt to decode internal ASN.1 `CONTAINING` constraints as a marked type. See `validate_and_decode_containing` for CONTAINING validation.
+    fn validate_components(self) -> Result<Self, crate::error::InnerSubtypeConstraintError> {
+        self.validate_and_decode_containing(None)
+    }
+
+    /// Validates the inner subtype constraints and attempts to decode internal ASN.1 `CONTAINING` constraints as a marked type.
+    /// Usually this means that some field has `OPAQUE` data, and we need to decode it further as a specific type, as defined in the inner subtype constraint.
+    /// Manual implementation of this function is required for all types that have inner subtype constraints.
+    /// # Arguments
+    /// * `decode_containing_with` - the codec to validate and decode the containing data with when ASN.1 type definiton has `CONTAINING`.
+    fn validate_and_decode_containing(
+        self,
+        decode_containing_with: Option<crate::Codec>,
+    ) -> Result<Self, crate::error::InnerSubtypeConstraintError>;
+}
+
+/// A set of constraints for a given type on what kinds of values are allowed.
+/// Used in certain codecs to optimise encoding and decoding values.
+///
+/// The effective constraint is typically the intersection or union among other constraints.
+/// As a result, we can store one constraint of each kind, updated with the latest constraint.
+///
+/// TODO architecture needs a re-design - multiple constraints with same type are allowed forming on non-contiguous set of values.
+/// We can't currently present this.
+/// For example, value constraint can have multiple single values, or a range of values which do not overlap, and are effective at the same time.
+/// This is challenging to implement in compile-time, and we may need to use runtime checks.
+/// E.g effective constraint can have up to infinite single value constraints, and overall constraint value is not continuous.
+#[derive(Debug, Copy, Clone)]
+#[non_exhaustive]
+pub struct Constraints {
+    value: Option<Extensible<Value>>,
+    size: Option<Extensible<Size>>,
+    permitted_alphabet: Option<Extensible<PermittedAlphabet>>,
+    extensible: bool,
+}
+
+impl Constraints {
+    /// Empty constraints.
+    pub const NONE: Self = Self {
+        value: None,
+        size: None,
+        permitted_alphabet: None,
+        extensible: false,
+    };
+
+    /// Creates a new set of constraints from a given slice.
+    #[must_use]
+    pub const fn new(constraints: &[Constraint]) -> Self {
+        let mut value: Option<Extensible<Value>> = None;
+        let mut size: Option<Extensible<Size>> = None;
+        let mut permitted_alphabet: Option<Extensible<PermittedAlphabet>> = None;
+        let mut extensible = false;
+        let mut i = 0;
+        while i < constraints.len() {
+            match constraints[i] {
+                Constraint::Value(v) => {
+                    value = match value {
+                        Some(value) => Some(value.intersect(&v)),
+                        None => Some(v),
+                    };
+                }
+                Constraint::Size(s) => {
+                    size = if let Some(size) = size {
+                        Some(size.intersect(&s))
+                    } else {
+                        Some(s)
+                    };
+                }
+                Constraint::PermittedAlphabet(p) => {
+                    permitted_alphabet = if let Some(perm) = permitted_alphabet {
+                        Some(perm.intersect(&p))
+                    } else {
+                        Some(p)
+                    };
+                }
+                Constraint::Extensible => {
+                    extensible = true;
+                }
+            }
+            i += 1;
+        }
+        Self {
+            value,
+            size,
+            permitted_alphabet,
+            extensible,
+        }
+    }
+
+    /// A const variant of the default function.
+    #[must_use]
+    pub const fn default() -> Self {
+        Self::NONE
+    }
+
+    /// Creates an intersection of two constraint sets.
+    #[must_use]
+    pub const fn intersect(&self, rhs: Constraints) -> Self {
+        let value = match (self.value, rhs.value) {
+            (Some(value), Some(rhs_value)) => Some(value.intersect(&rhs_value)),
+            (Some(value), None) => Some(value),
+            (None, Some(rhs_value)) => Some(rhs_value),
+            (None, None) => None,
+        };
+        let size = match (self.size, rhs.size) {
+            (Some(size), Some(rhs_size)) => Some(size.intersect(&rhs_size)),
+            (Some(size), None) => Some(size),
+            (None, Some(rhs_size)) => Some(rhs_size),
+            (None, None) => None,
+        };
+        let permitted_alphabet = match (self.permitted_alphabet, rhs.permitted_alphabet) {
+            (Some(perm), Some(rhs_perm)) => Some(perm.intersect(&rhs_perm)),
+            (Some(perm), None) => Some(perm),
+            (None, Some(rhs_perm)) => Some(rhs_perm),
+            (None, None) => None,
+        };
+        let extensible = self.extensible || rhs.extensible;
+
+        Self {
+            value,
+            size,
+            permitted_alphabet,
+            extensible,
+        }
+    }
+
+    /// Returns the effective size constraint, if available.
+    #[must_use]
+    pub const fn size(&self) -> Option<&Extensible<Size>> {
+        self.size.as_ref()
+    }
+
+    /// Returns the effective permitted alphabet constraint, if available.
+    #[must_use]
+    pub const fn permitted_alphabet(&self) -> Option<&Extensible<PermittedAlphabet>> {
+        self.permitted_alphabet.as_ref()
+    }
+
+    /// Returns whether any of the constraints are extensible.
+    #[must_use]
+    pub const fn extensible(&self) -> bool {
+        if self.extensible {
+            return true;
+        }
+        if let Some(value) = &self.value
+            && value.extensible.is_some()
+        {
+            return true;
+        }
+        if let Some(size) = &self.size
+            && size.extensible.is_some()
+        {
+            return true;
+        }
+        if let Some(permitted_alphabet) = &self.permitted_alphabet
+            && permitted_alphabet.extensible.is_some()
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Returns the value constraint from the set, if available.
+    #[must_use]
+    pub const fn value(&self) -> Option<&Extensible<Value>> {
+        self.value.as_ref()
+    }
+}
+
+/// The set of possible constraints a given value can have.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Constraint {
+    /// A set of possible values which the type can be.
+    Value(Extensible<Value>),
+    /// The amount of possible values the type can have.
+    Size(Extensible<Size>),
+    /// The set of possible characters the type can have.
+    PermittedAlphabet(Extensible<PermittedAlphabet>),
+    /// The value itself is extensible, only valid for constructed types,
+    /// choices, or enumerated values.
+    Extensible,
+}
+
+/// The discriminant of [Constraint] values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(missing_docs)]
+pub enum ConstraintDiscriminant {
+    Value,
+    Size,
+    PermittedAlphabet,
+    Extensible,
+}
+impl ConstraintDiscriminant {
+    /// Constant equality check.
+    #[must_use]
+    pub const fn eq(&self, other: &ConstraintDiscriminant) -> bool {
+        *self as isize == *other as isize
+    }
+}
+
+impl Constraint {
+    /// Returns the discriminant of the value.
+    #[must_use]
+    pub const fn kind(&self) -> ConstraintDiscriminant {
+        match self {
+            Self::Value(_) => ConstraintDiscriminant::Value,
+            Self::Size(_) => ConstraintDiscriminant::Size,
+            Self::PermittedAlphabet(_) => ConstraintDiscriminant::PermittedAlphabet,
+            Self::Extensible => ConstraintDiscriminant::Extensible,
+        }
+    }
+    /// Returns the discriminant as an `isize` integer.
+    #[must_use]
+    pub const fn variant_as_isize(&self) -> isize {
+        match self {
+            Self::Value(_) => 0,
+            Self::Size(_) => 1,
+            Self::PermittedAlphabet(_) => 2,
+            Self::Extensible => 3,
+        }
+    }
+
+    /// Returns the value constraint, if set.
+    #[must_use]
+    pub const fn as_value(&self) -> Option<&Extensible<Value>> {
+        match self {
+            Self::Value(integer) => Some(integer),
+            _ => None,
+        }
+    }
+
+    /// Returns the permitted alphabet constraint, if set.
+    #[must_use]
+    pub const fn as_permitted_alphabet(&self) -> Option<&Extensible<PermittedAlphabet>> {
+        match self {
+            Self::PermittedAlphabet(alphabet) => Some(alphabet),
+            _ => None,
+        }
+    }
+
+    /// Returns the size constraint, if set.
+    #[must_use]
+    pub const fn to_size(&self) -> Option<&Extensible<Size>> {
+        match self {
+            Self::Size(size) => Some(size),
+            _ => None,
+        }
+    }
+
+    /// Returns the value constraint, if set.
+    #[must_use]
+    pub const fn to_value(&self) -> Option<&Extensible<Value>> {
+        match self {
+            Self::Value(integer) => Some(integer),
+            _ => None,
+        }
+    }
+
+    /// Returns whether the type is extensible.
+    #[must_use]
+    pub const fn is_extensible(&self) -> bool {
+        match self {
+            Self::Value(value) => value.extensible.is_some(),
+            Self::Size(size) => size.extensible.is_some(),
+            Self::PermittedAlphabet(alphabet) => alphabet.extensible.is_some(),
+            Self::Extensible => true,
+        }
+    }
+}
+
+/// A wrapper around [Constraint] covering whether the constraint is "extensible".
+///
+/// Extensible means that it can have values outside of its constraints, and what possible
+/// constraints thosevalues in the extended set can have, if any.
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
+pub struct Extensible<T: 'static> {
+    /// The underlying constraint type.
+    pub constraint: T,
+    /// Whether the constraint is extensible, and if it is, a list of extensible
+    /// constraints.
+    /// Extensibility means that the allowed constraint values can change, not type of the constraint itself.
+    pub extensible: Option<&'static [T]>,
+}
+
+impl<T> Extensible<T> {
+    /// Creates a new wrapper around a given constraint, by default this means
+    /// that the underlying constraint is not extensible.
+    pub const fn new(constraint: T) -> Self {
+        Self {
+            constraint,
+            extensible: None,
+        }
+    }
+
+    /// Creates a new extensible constraint with a given set of constraints
+    /// on the extended values.
+    pub const fn new_extensible(constraint: T, constraints: &'static [T]) -> Self {
+        Self {
+            constraint,
+            extensible: Some(constraints),
+        }
+    }
+
+    /// Sets the constraint to be extensible with no constraints on extended
+    /// values.
+    #[must_use]
+    pub const fn set_extensible(self, extensible: bool) -> Self {
+        let extensible = if extensible {
+            let empty: &[T] = &[];
+            Some(empty)
+        } else {
+            None
+        };
+
+        self.extensible_with_constraints(extensible)
+    }
+
+    /// Sets the constraint to either not be extended or extensible with a set
+    /// of constraints.
+    #[must_use]
+    pub const fn extensible_with_constraints(mut self, constraints: Option<&'static [T]>) -> Self {
+        self.extensible = constraints;
+        self
+    }
+}
+
+macro_rules! impl_extensible {
+    ($($type:ty),+) => {
+        $(
+            impl Extensible<$type> {
+                /// Intersects two extensible constraints.
+                #[must_use] pub const fn intersect(&self, other: &Self) -> Self {
+                    // All lost in our use case? https://stackoverflow.com/questions/33524834/whats-the-result-set-operation-of-extensible-constraints-in-asn-1
+                    // ASN.1 treats serially applied constraints differently from nested extensible constraints?
+                    // We currently support only serially applied constraints.
+                    let extensible = match (self.extensible, other.extensible) {
+                        (Some(a), Some(_)) => Some(a),
+                        (Some(_), None) => None,
+                        (None, Some(_)) => None,
+                        (None, None) => None,
+                    };
+                    let constraint = self.constraint.intersect(&other.constraint);
+                    match extensible {
+                        Some(ext_ref) => Self::new_extensible(constraint, ext_ref),
+                        None => Self::new(constraint),
+                    }
+                }
+            }
+            impl From<$type> for Extensible<$type> {
+                fn from(value: $type) -> Self {
+                    Self {
+                        constraint: value,
+                        extensible: None,
+                    }
+                }
+            }
+        )+
+    };
+}
+impl_extensible!(Value, Size, PermittedAlphabet);
+
+/// A single or range of numeric values a type can be.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Value {
+    /// Bound of the value
+    pub(crate) value: Bounded<i128>,
+    /// Sign of the bound, used for numeric values
+    pub(crate) signed: bool,
+    /// Range of the bound in bytes, used for numeric values
+    pub(crate) range: Option<u8>,
+}
+
+impl Value {
+    /// Creates a new value constraint from a given bound.
+    #[must_use]
+    pub const fn new(value: Bounded<i128>) -> Self {
+        let (signed, range) = value.range_in_bytes();
+        Self {
+            value,
+            signed,
+            range,
+        }
+    }
+    /// Gets the sign of the value constraint.
+    #[must_use]
+    pub const fn get_sign(&self) -> bool {
+        self.signed
+    }
+    /// Gets the range of the value constraint.
+    #[must_use]
+    pub const fn get_range(&self) -> Option<u8> {
+        self.range
+    }
+    /// Intersect between two `Value` constraints
+    #[must_use]
+    pub const fn intersect(&self, other: &Self) -> Self {
+        let value = match self.value.intersect(other.value) {
+            Some(value) => value,
+            // if the intersection is empty, return impossible range
+            None => Bounded::Range {
+                start: Some(1),
+                end: Some(-1),
+            },
+        };
+        let (signed, range) = value.range_in_bytes();
+        Self {
+            value,
+            signed,
+            range,
+        }
+    }
+}
+
+impl core::ops::Deref for Value {
+    type Target = Bounded<i128>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+macro_rules! from_primitives {
+    ($($int:ty),+ $(,)?) => {
+        $(
+            impl From<Bounded<$int>> for Value {
+                fn from(bounded: Bounded<$int>) -> Self {
+                    Self::new(match bounded {
+                        Bounded::Range { start, end } => Bounded::Range {
+                            start: start.map(From::from),
+                            end: end.map(From::from),
+                        },
+                        Bounded::Single(value) => Bounded::Single(value.into()),
+                        Bounded::None => Bounded::None,
+                    })
+                }
+            }
+        )+
+    }
+}
+
+from_primitives! {
+    u8, u16, u32, u64,
+    i8, i16, i32, i64, i128,
+}
+
+impl TryFrom<Bounded<usize>> for Value {
+    type Error = <i128 as TryFrom<usize>>::Error;
+
+    fn try_from(bounded: Bounded<usize>) -> Result<Self, Self::Error> {
+        Ok(Self::new(match bounded {
+            Bounded::Range { start, end } => Bounded::Range {
+                start: start.map(TryFrom::try_from).transpose()?,
+                end: end.map(TryFrom::try_from).transpose()?,
+            },
+            Bounded::Single(value) => Bounded::Single(value.try_into()?),
+            Bounded::None => Bounded::None,
+        }))
+    }
+}
+
+/// A single or range of length values a type can have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Size(pub(crate) Bounded<usize>);
+
+impl Size {
+    /// Creates a varying range constraint.
+    #[must_use]
+    pub const fn new(range: Bounded<usize>) -> Self {
+        Self(range)
+    }
+
+    /// Creates a fixed size constraint.
+    #[must_use]
+    pub const fn fixed(length: usize) -> Self {
+        Self(Bounded::Single(length))
+    }
+
+    /// Returns whether the size is fixed.
+    #[must_use]
+    pub const fn is_fixed(&self) -> bool {
+        matches!(self.0, Bounded::Single(_))
+    }
+    /// Returns whether the size has a varying range.
+    #[must_use]
+    pub const fn is_range(&self) -> bool {
+        matches!(self.0, Bounded::Range { .. })
+    }
+    /// Intersect between two `Size` constraints
+    #[must_use]
+    pub const fn intersect(&self, other: &Self) -> Self {
+        match self.0.intersect(other.0) {
+            Some(value) => Self(value),
+            // if the intersection is empty, return a zero size
+            None => Self(Bounded::Single(0)),
+        }
+    }
+}
+
+impl core::ops::Deref for Size {
+    type Target = Bounded<usize>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Size {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// A range of alphabet characters a type can have.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PermittedAlphabet(&'static [u32]);
+
+impl PermittedAlphabet {
+    /// Creates a new constraint from a given range.
+    #[must_use]
+    pub const fn new(range: &'static [u32]) -> Self {
+        Self(range)
+    }
+
+    /// Returns the range of allowed possible values.
+    #[must_use]
+    pub const fn as_inner(&self) -> &'static [u32] {
+        self.0
+    }
+    /// Intersect between two `PermittedAlphabet` constraints.
+    ///
+    /// TODO not currently possible to intersect
+    /// because new instance requires a static lifetime,
+    /// so we just override for now.
+    #[must_use]
+    pub const fn intersect(&self, other: &Self) -> Self {
+        Self(other.0)
+    }
+}
+
+impl core::ops::Deref for PermittedAlphabet {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+/// A set of potential bounded values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Bounded<T> {
+    /// No bounds on a given type.
+    #[default]
+    None,
+    /// A single value is permitted for a given type.
+    Single(T),
+    /// the range of values permitted for a given type.
+    Range {
+        /// The lower bound of the range, if any.
+        start: Option<T>,
+        /// The upper bound of the range, if any.
+        end: Option<T>,
+    },
+}
+
+impl<T> Bounded<T> {
+    /// Calculates the the amount of bytes that are required to represent unsigned integer `value`.
+    /// Particularly useful for OER codec
+    const fn unsigned_octet_size_by_range(value: u128) -> Option<u8> {
+        match value {
+            x if x <= u8::MAX as u128 => Some(1),
+            x if x <= u16::MAX as u128 => Some(2),
+            x if x <= u32::MAX as u128 => Some(4),
+            x if x <= u64::MAX as u128 => Some(8),
+            _ => None,
+        }
+    }
+    /// Calculates the the amount of bytes that are required to represent signed integer `value`.
+    /// Particularly useful for OER codec
+    const fn signed_octet_size_by_range(value: i128) -> Option<u8> {
+        match value {
+            x if x >= i8::MIN as i128 && x <= i8::MAX as i128 => Some(1),
+            x if x >= i16::MIN as i128 && x <= i16::MAX as i128 => Some(2),
+            x if x >= i32::MIN as i128 && x <= i32::MAX as i128 => Some(4),
+            x if x >= i64::MIN as i128 && x <= i64::MAX as i128 => Some(8),
+            _ => None,
+        }
+    }
+    /// Creates a bounded range that starts from value and has no end.
+    pub const fn start_from(value: T) -> Self {
+        Self::Range {
+            start: Some(value),
+            end: None,
+        }
+    }
+
+    /// Creates a bounded range that ends at value and has no defined start.
+    pub const fn up_to(value: T) -> Self {
+        Self::Range {
+            start: None,
+            end: Some(value),
+        }
+    }
+
+    /// Creates new bound from a single value.
+    pub const fn single_value(value: T) -> Self {
+        Self::Single(value)
+    }
+
+    /// Returns the lower bound of a given range, if any.
+    pub const fn as_start(&self) -> Option<&T> {
+        match &self {
+            Self::Range { start, .. } => start.as_ref(),
+            Self::Single(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns the upper bound of a given range, if any.
+    pub const fn as_end(&self) -> Option<&T> {
+        match &self {
+            Self::Range { end, .. } => end.as_ref(),
+            Self::Single(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns the bounds of a given range, if any.
+    pub const fn start_and_end(&self) -> (Option<&T>, Option<&T>) {
+        match &self {
+            Self::Range { start, end } => (start.as_ref(), end.as_ref()),
+            Self::Single(value) => (Some(value), Some(value)),
+            _ => (None, None),
+        }
+    }
+}
+
+impl<T: Copy + IntegerType> Bounded<T> {
+    /// Assuming T is an integer, returns the minimum possible bound, or zero
+    /// if not present.
+    pub const fn minimum(&self) -> T {
+        match self.as_start() {
+            Some(value) => *value,
+            None => T::ZERO,
+        }
+    }
+}
+
+macro_rules! impl_bounded_range {
+    ($($type:ty),+) => {
+        $(
+            impl Bounded<$type> {
+                /// Returns the number representing the difference between the lower and upper bound.
+                pub const fn range(&self) -> Option<$type> {
+                    match self {
+                        Self::Single(_) => Some(1),
+                        Self::Range {
+                            start: Some(start),
+                            end: Some(end),
+                        } => Some(end.wrapping_sub(*start).saturating_add(1)),
+                        _ => None,
+                    }
+                }
+                /// Returns the effective value which is either the number, or the positive
+                /// offset of that number from the start of the value range. `Either::Left`
+                /// represents the positive offset, and `Either::Right` represents
+                /// the number.
+                pub const fn effective_value(&self, value: $type) -> either::Either<$type, $type> {
+                    match self {
+                        Self::Range {
+                            start: Some(start), ..
+                        } => {
+                            debug_assert!(value >= *start);
+                            either::Left(value - *start)
+                        }
+                        _ => either::Right(value),
+                    }
+                }
+                /// Intersect the values of two bounded ranges.
+                ///
+                /// # Returns
+                ///
+                /// Returns the intersection of two bounded ranges, if any.
+                /// If the values do not intersect, returns `None`.
+                ///
+                /// ## Intersection Matrix
+                ///
+                /// | First \ Second | None | Single | Range(s,e) | Range(s,-) | Range(-,e) | Range(-,-) |
+                /// |----------------|------|--------|------------|------------|------------|------------|
+                /// | None           | ✓    | ✓      | ✓          | ✓          | ✓          | ✓          |
+                /// | Single         | ✓    | ✓      | ✓          | ✓          | ✓          | ✓          |
+                /// | Range(s,e)     | ✓    | ✓      | ✓          | ✓          | ✓          | ✓          |
+                /// | Range(s,-)     | ✓    | ✓      | ✓          | ✓          | ✓          | ✓          |
+                /// | Range(-,e)     | ✓    | ✓      | ✓          | ✓          | ✓          | ✓          |
+                /// | Range(-,-)     | ✓    | ✓      | ✓          | ✓          | ✓          | ✓          |
+                pub const fn intersect(&self, other: Self) -> Option<Self> {
+                    match self {
+                        Self::None => Some(other),
+                        Self::Single(a) => match other {
+                            Self::None => Some(Self::Single(*a)),
+                            Self::Single(b) => if *a == b { Some(Self::Single(*a)) } else { None },
+                            Self::Range { start, end } => {
+                                let within_start = if let Some(s) = start.as_ref() {
+                                    *a >= *s
+                                } else {
+                                    true
+                                };
+                                let within_end = if let Some(e) = end.as_ref() {
+                                    *a <= *e
+                                } else {
+                                    true
+                                };
+                                if within_start && within_end {
+                                    Some(Self::Single(*a))
+                                } else {
+                                    None
+                                }
+                            },
+                        },
+                        Self::Range { start: self_start, end: self_end } => match other {
+                            Self::None => Some(*self),
+
+                            Self::Single(b) => {
+                                let within_start = match self_start.as_ref() {
+                                    Some(s) => b >= *s,
+                                    None => true,
+                                };
+                                let within_end = match self_end.as_ref() {
+                                    Some(e) => b <= *e,
+                                    None => true,
+                                };
+                                if within_start && within_end {
+                                    Some(Self::Single(b))
+                                } else {
+                                    None
+                                }
+                            },
+
+                            Self::Range { start: other_start, end: other_end } => {
+                                // Determine the effective start bound (maximum of the two starts)
+                                let new_start = match (self_start, other_start) {
+                                    (None, None) => None,
+                                    (Some(a), None) => Some(*a),
+                                    (None, Some(b)) => Some(b),
+                                    (Some(a), Some(b)) => Some(max(*a as i128, b as i128) as $type),
+                                };
+
+                                // Determine the effective end bound (minimum of the two ends)
+                                let new_end = match (self_end, other_end) {
+                                    (None, None) => None,
+                                    (Some(a), None) => Some(*a),
+                                    (None, Some(b)) => Some(b),
+                                    (Some(a), Some(b)) => Some(min(*a as i128, b as i128) as $type),
+                                };
+
+                                match (new_start, new_end) {
+                                    (Some(start), Some(end)) => {
+                                        if start <= end {
+                                            Some(Self::Range { start: Some(start), end: Some(end) })
+                                        } else {
+                                            // No intersection
+                                           None
+                                        }
+                                    },
+                                    _ => Some(Self::Range { start: new_start, end: new_end }),
+                                }
+                            },
+                        },
+                    }
+                }
+            }
+        )+
+    };
+}
+impl_bounded_range!(i128, usize);
+
+impl From<Value> for Constraint {
+    fn from(size: Value) -> Self {
+        Self::Value(size.into())
+    }
+}
+
+impl From<Extensible<Value>> for Constraint {
+    fn from(size: Extensible<Value>) -> Self {
+        Self::Value(size)
+    }
+}
+
+impl From<Size> for Constraint {
+    fn from(size: Size) -> Self {
+        Self::Size(size.into())
+    }
+}
+
+impl From<Extensible<Size>> for Constraint {
+    fn from(size: Extensible<Size>) -> Self {
+        Self::Size(size)
+    }
+}
+
+impl From<PermittedAlphabet> for Constraint {
+    fn from(size: PermittedAlphabet) -> Self {
+        Self::PermittedAlphabet(size.into())
+    }
+}
+
+impl From<Extensible<PermittedAlphabet>> for Constraint {
+    fn from(size: Extensible<PermittedAlphabet>) -> Self {
+        Self::PermittedAlphabet(size)
+    }
+}
+const fn max(a: i128, b: i128) -> i128 {
+    [a, b][(a < b) as usize]
+}
+
+const fn max_unsigned(a: u128, b: u128) -> u128 {
+    [a, b][(a < b) as usize]
+}
+const fn min(a: i128, b: i128) -> i128 {
+    [a, b][(a > b) as usize]
+}
+
+impl Bounded<i128> {
+    /// Returns the sign and the range in bytes of the constraint.
+    #[must_use]
+    pub const fn range_in_bytes(&self) -> (bool, Option<u8>) {
+        match self {
+            Self::Single(value) => {
+                let is_signed = *value < 0;
+                let octet_size = if is_signed {
+                    Self::signed_octet_size_by_range(*value)
+                } else {
+                    Self::unsigned_octet_size_by_range(*value as u128)
+                };
+                (is_signed, octet_size)
+            }
+            Self::Range {
+                start: Some(start),
+                end: Some(end),
+            } => {
+                let is_signed = *start < 0;
+                let (octets_start, octets_end) = if is_signed {
+                    (
+                        Self::signed_octet_size_by_range(*start),
+                        Self::signed_octet_size_by_range(*end),
+                    )
+                } else {
+                    (
+                        Self::unsigned_octet_size_by_range(*start as u128),
+                        Self::unsigned_octet_size_by_range(*end as u128),
+                    )
+                };
+
+                let octets = match (octets_start, octets_end) {
+                    (Some(start), Some(end)) => {
+                        Some(max_unsigned(start as u128, end as u128) as u8)
+                    }
+                    (_, None) | (None, _) => None,
+                };
+
+                (is_signed, octets)
+            }
+            Self::Range {
+                start: Some(start),
+                end: None,
+            } => (*start < 0, None),
+            Self::Range { start: None, .. } | Self::None => (true, None),
+        }
+    }
+    /// Returns `true` if the given element is within the bounds of the constraint.
+    /// Constraint type is `i128` here, so we can make checks based on that.
+    #[inline(always)]
+    pub fn in_bound<I: IntegerType>(&self, element: &I) -> bool {
+        match &self {
+            Self::Range { start, end } => {
+                start.as_ref().is_none_or(|&start| {
+                    if let Some(e) = element.to_i128() {
+                        e >= start
+                    } else if let Some(e) = element.to_bigint() {
+                        e >= BigInt::from(start)
+                    } else {
+                        false
+                    }
+                }) && end.as_ref().is_none_or(|&end| {
+                    if let Some(e) = element.to_i128() {
+                        e <= end
+                    } else if let Some(e) = element.to_bigint() {
+                        e <= BigInt::from(end)
+                    } else {
+                        false
+                    }
+                })
+            }
+            Self::Single(value) => {
+                if let Some(e) = element.to_i128() {
+                    e == *value
+                } else {
+                    false
+                }
+            }
+            Self::None => true,
+        }
+    }
+}
+
+impl<T: PartialEq + PartialOrd> Bounded<T> {
+    /// Creates a new range from `start` to `end`.
+    ///
+    /// # Panics
+    /// When `start > end`.
+    pub fn new(start: T, end: T) -> Self {
+        debug_assert!(start <= end);
+        Self::const_new(start, end)
+    }
+
+    /// Const compatible range constructor.
+    ///
+    /// # Safety
+    /// Requires `start <= end` otherwise functions will return incorrect results..
+    /// In general you should prefer [`Self::new`] which has debug assertions
+    /// to ensure this.
+    pub const fn const_new(start: T, end: T) -> Self {
+        Self::Range {
+            start: Some(start),
+            end: Some(end),
+        }
+    }
+
+    /// Returns whether a given element is contained within a bound.
+    pub fn contains(&self, element: &T) -> bool {
+        match &self {
+            Self::Single(value) => value == element,
+            Self::Range { start, end } => {
+                start.as_ref().is_none_or(|start| element >= start)
+                    && end.as_ref().is_none_or(|end| element <= end)
+            }
+            Self::None => true,
+        }
+    }
+
+    /// Returns whether a given element is contained within a bound, returning
+    /// an error if not.
+    pub fn contains_or<E>(&self, element: &T, error: E) -> Result<(), E> {
+        self.contains_or_else(element, || error)
+    }
+
+    /// Returns whether a given element is contained within a bound, returning
+    /// an error if not.
+    pub fn contains_or_else<E>(&self, element: &T, error: impl FnOnce() -> E) -> Result<(), E> {
+        if self.contains(element) {
+            Ok(())
+        } else {
+            Err((error)())
+        }
+    }
+}
+
+impl<T: core::fmt::Display> core::fmt::Display for Bounded<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Self::Range { start, end } => match (start.as_ref(), end.as_ref()) {
+                (Some(start), Some(end)) => write!(f, "{start}..{end}"),
+                (Some(start), None) => write!(f, "{start}.."),
+                (None, Some(end)) => write!(f, "..{end}"),
+                (None, None) => write!(f, ".."),
+            },
+            Self::Single(value) => value.fmt(f),
+            Self::None => write!(f, ".."),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range() {
+        let constraints = Bounded::new(0, 255usize);
+        assert_eq!(256, constraints.range().unwrap());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_bounded_intersections() {
+        // None intersections
+        let none = Bounded::<i128>::None;
+        let single = Bounded::<i128>::Single(5);
+        let range_both = Bounded::<i128>::Range {
+            start: Some(1),
+            end: Some(10),
+        };
+        let range_start = Bounded::<i128>::Range {
+            start: Some(1),
+            end: None,
+        };
+        let range_end = Bounded::<i128>::Range {
+            start: None,
+            end: Some(10),
+        };
+        let range_none = Bounded::<i128>::Range {
+            start: None,
+            end: None,
+        };
+
+        // None ∩ X cases
+        assert_eq!(none.intersect(none), Some(none));
+        assert_eq!(none.intersect(single), Some(single));
+        assert_eq!(none.intersect(range_both), Some(range_both));
+        assert_eq!(none.intersect(range_start), Some(range_start));
+        assert_eq!(none.intersect(range_end), Some(range_end));
+        assert_eq!(none.intersect(range_none), Some(range_none));
+
+        // Single ∩ X cases
+        assert_eq!(single.intersect(none), Some(single));
+        assert_eq!(single.intersect(single), Some(single));
+        assert_eq!(single.intersect(Bounded::<i128>::Single(6)), None);
+
+        // Single in range
+        assert_eq!(
+            single.intersect(Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(10)
+            }),
+            Some(single)
+        );
+        // Single below range
+        assert_eq!(
+            single.intersect(Bounded::<i128>::Range {
+                start: Some(6),
+                end: Some(10)
+            }),
+            None
+        );
+        // Single above range
+        assert_eq!(
+            single.intersect(Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(4)
+            }),
+            None
+        );
+
+        // Single ∩ Range(s,-)
+        assert_eq!(
+            single.intersect(Bounded::<i128>::Range {
+                start: Some(1),
+                end: None
+            }),
+            Some(single)
+        );
+        assert_eq!(
+            single.intersect(Bounded::<i128>::Range {
+                start: Some(6),
+                end: None
+            }),
+            None
+        );
+
+        // Single ∩ Range(-,e)
+        assert_eq!(
+            single.intersect(Bounded::<i128>::Range {
+                start: None,
+                end: Some(10)
+            }),
+            Some(single)
+        );
+        assert_eq!(
+            single.intersect(Bounded::<i128>::Range {
+                start: None,
+                end: Some(4)
+            }),
+            None
+        );
+
+        // Single ∩ Range(-,-)
+        assert_eq!(single.intersect(range_none), Some(single));
+
+        // Range(s,e) ∩ X cases
+        assert_eq!(range_both.intersect(none), Some(range_both));
+
+        // Range(s,e) ∩ Single
+        assert_eq!(
+            range_both.intersect(Bounded::<i128>::Single(5)),
+            Some(Bounded::<i128>::Single(5))
+        );
+        assert_eq!(range_both.intersect(Bounded::<i128>::Single(0)), None);
+        assert_eq!(range_both.intersect(Bounded::<i128>::Single(11)), None);
+
+        // Range(s,e) ∩ Range(s,e) - overlapping cases
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(10)
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: Some(5),
+                end: Some(15)
+            }),
+            Some(Bounded::<i128>::Range {
+                start: Some(5),
+                end: Some(10)
+            })
+        );
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(10)
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: Some(0),
+                end: Some(5)
+            }),
+            Some(Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(5)
+            })
+        );
+
+        // Range(s,e) ∩ Range(s,e) - non-overlapping
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(5)
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: Some(6),
+                end: Some(10)
+            }),
+            None
+        );
+
+        // Range(s,e) ∩ Range(s,-)
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(10)
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: Some(5),
+                end: None
+            }),
+            Some(Bounded::<i128>::Range {
+                start: Some(5),
+                end: Some(10)
+            })
+        );
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(10)
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: Some(11),
+                end: None
+            }),
+            None
+        );
+
+        // Range(s,e) ∩ Range(-,e)
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(10)
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: None,
+                end: Some(5)
+            }),
+            Some(Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(5)
+            })
+        );
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(6),
+                end: Some(10)
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: None,
+                end: Some(5)
+            }),
+            None
+        );
+
+        // Range(s,e) ∩ Range(-,-)
+        assert_eq!(range_both.intersect(range_none), Some(range_both));
+
+        // Range(s,-) ∩ X cases
+        assert_eq!(range_start.intersect(none), Some(range_start));
+
+        // Range(s,-) ∩ Single
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: None
+            }
+            .intersect(Bounded::<i128>::Single(5)),
+            Some(Bounded::<i128>::Single(5))
+        );
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(6),
+                end: None
+            }
+            .intersect(Bounded::<i128>::Single(5)),
+            None
+        );
+
+        // Range(s,-) ∩ Range(s,-)
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: None
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: Some(5),
+                end: None
+            }),
+            Some(Bounded::<i128>::Range {
+                start: Some(5),
+                end: None
+            })
+        );
+
+        // Range(s,-) ∩ Range(-,e)
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: Some(1),
+                end: None
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: None,
+                end: Some(10)
+            }),
+            Some(Bounded::<i128>::Range {
+                start: Some(1),
+                end: Some(10)
+            })
+        );
+
+        // Range(s,-) ∩ Range(-,-)
+        assert_eq!(range_start.intersect(range_none), Some(range_start));
+
+        // Range(-,e) ∩ X cases
+        assert_eq!(range_end.intersect(none), Some(range_end));
+
+        // Range(-,e) ∩ Single
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: None,
+                end: Some(10)
+            }
+            .intersect(Bounded::<i128>::Single(5)),
+            Some(Bounded::<i128>::Single(5))
+        );
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: None,
+                end: Some(5)
+            }
+            .intersect(Bounded::<i128>::Single(10)),
+            None
+        );
+
+        // Range(-,e) ∩ Range(-,e)
+        assert_eq!(
+            Bounded::<i128>::Range {
+                start: None,
+                end: Some(10)
+            }
+            .intersect(Bounded::<i128>::Range {
+                start: None,
+                end: Some(5)
+            }),
+            Some(Bounded::<i128>::Range {
+                start: None,
+                end: Some(5)
+            })
+        );
+
+        // Range(-,-) ∩ X cases
+        assert_eq!(range_none.intersect(none), Some(range_none));
+        assert_eq!(range_none.intersect(single), Some(single));
+        assert_eq!(range_none.intersect(range_both), Some(range_both));
+        assert_eq!(range_none.intersect(range_start), Some(range_start));
+        assert_eq!(range_none.intersect(range_end), Some(range_end));
+        assert_eq!(range_none.intersect(range_none), Some(range_none));
+
+        // Add couple tests for usize type just in case
+        let u_single = Bounded::<usize>::Single(5);
+        let u_range = Bounded::<usize>::Range {
+            start: Some(1),
+            end: Some(10),
+        };
+
+        assert_eq!(
+            u_range.intersect(Bounded::<usize>::Range {
+                start: Some(5),
+                end: Some(15),
+            }),
+            Some(Bounded::<usize>::Range {
+                start: Some(5),
+                end: Some(10),
+            })
+        );
+
+        assert_eq!(
+            Bounded::<usize>::Range {
+                start: Some(1),
+                end: Some(5)
+            }
+            .intersect(Bounded::<usize>::Range {
+                start: Some(6),
+                end: Some(10)
+            }),
+            None
+        );
+
+        assert_eq!(u_range.intersect(u_single), Some(u_single));
+    }
+    #[test]
+    fn range_in_bytes_none() {
+        let bounded = Bounded::<i128>::None;
+        assert_eq!(bounded.range_in_bytes(), (true, None));
+    }
+    #[test]
+    fn range_in_bytes_range() {
+        let bounded = Bounded::<i128>::Range {
+            start: Some(0i128),
+            end: Some(0i128),
+        };
+        assert_eq!(bounded.range_in_bytes(), (false, Some(1u8)));
+
+        let bounded = Bounded::<i128>::Range {
+            start: Some(-1i128),
+            end: Some(-1i128),
+        };
+        assert_eq!(bounded.range_in_bytes(), (true, Some(1u8)));
+
+        let boundary_test_values = [
+            (
+                i8::MIN as i128,
+                i8::MAX as i128,
+                (true, Some(1u8)),
+                (true, Some(2u8)),
+                (true, Some(2u8)),
+                "i8 range",
+            ),
+            (
+                i16::MIN as i128,
+                i16::MAX as i128,
+                (true, Some(2u8)),
+                (true, Some(4u8)),
+                (true, Some(4u8)),
+                "i16 range",
+            ),
+            (
+                i32::MIN as i128,
+                i32::MAX as i128,
+                (true, Some(4u8)),
+                (true, Some(8u8)),
+                (true, Some(8u8)),
+                "i32 range",
+            ),
+            (
+                i64::MIN as i128,
+                i64::MAX as i128,
+                (true, Some(8u8)),
+                (true, None),
+                (true, None),
+                "i64 range",
+            ),
+            (
+                u8::MIN as i128,
+                u8::MAX as i128,
+                (false, Some(1u8)),
+                (true, Some(2u8)),
+                (false, Some(2u8)),
+                "u8 range",
+            ),
+            (
+                u16::MIN as i128,
+                u16::MAX as i128,
+                (false, Some(2u8)),
+                (true, Some(4u8)),
+                (false, Some(4u8)),
+                "u16 range",
+            ),
+            (
+                u32::MIN as i128,
+                u32::MAX as i128,
+                (false, Some(4u8)),
+                (true, Some(8u8)),
+                (false, Some(8u8)),
+                "u32 range",
+            ),
+            (
+                u64::MIN as i128,
+                u64::MAX as i128,
+                (false, Some(8u8)),
+                (true, None),
+                (false, None),
+                "u64 range",
+            ),
+        ];
+
+        for (lower, upper, expected, expected_one_down, expected_one_up, name) in
+            boundary_test_values.into_iter()
+        {
+            // test regular case
+            let bounded = Bounded::<i128>::Range {
+                start: Some(lower),
+                end: Some(upper),
+            };
+            assert_eq!(bounded.range_in_bytes(), expected, "testing {}", name);
+
+            // test with lower bound decreased by 1 ("one down")
+            let bounded = Bounded::<i128>::Range {
+                start: Some(lower - 1),
+                end: Some(upper),
+            };
+            assert_eq!(
+                bounded.range_in_bytes(),
+                expected_one_down,
+                "testing {}, one down",
+                name
+            );
+
+            // test with upper bound increased by 1 ("one up")
+            let bounded = Bounded::<i128>::Range {
+                start: Some(lower),
+                end: Some(upper + 1),
+            };
+            assert_eq!(
+                bounded.range_in_bytes(),
+                expected_one_up,
+                "testing {}, one up",
+                name
+            );
+        }
+    }
+    #[test]
+    fn range_in_bytes_range_with_none() {
+        let test_values = [
+            (None, None, true),
+            (Some(-1i128), None, true),
+            (Some(0i128), None, false),
+            (Some(1i128), None, false),
+            (None, Some(-1i128), true),
+            (None, Some(0i128), true),
+            (None, Some(1i128), true),
+        ];
+
+        for (lower, upper, expected_signedness) in test_values.into_iter() {
+            let bounded = Bounded::<i128>::Range {
+                start: lower,
+                end: upper,
+            };
+            assert_eq!(
+                bounded.range_in_bytes(),
+                (expected_signedness, None),
+                "testing lower={:?} upper={:?}",
+                lower,
+                upper
+            );
+        }
+    }
+    #[test]
+    fn range_in_bytes_single() {
+        let test_values = [
+            (-1i128, (true, Some(1u8))),
+            (0i128, (false, Some(1u8))),
+            (1i128, (false, Some(1u8))),
+            (i8::MIN as i128, (true, Some(1u8))),
+            (i8::MAX as i128, (false, Some(1u8))),
+            (u8::MAX as i128, (false, Some(1u8))),
+            ((i8::MIN as i128) - 1, (true, Some(2u8))),
+            ((u8::MAX as i128) + 1, (false, Some(2u8))),
+            (i16::MIN as i128, (true, Some(2u8))),
+            (i16::MAX as i128, (false, Some(2u8))),
+            (u16::MAX as i128, (false, Some(2u8))),
+            ((i16::MIN as i128) - 1, (true, Some(4u8))),
+            ((u16::MAX as i128) + 1, (false, Some(4u8))),
+            (i32::MIN as i128, (true, Some(4u8))),
+            (i32::MAX as i128, (false, Some(4u8))),
+            (u32::MAX as i128, (false, Some(4u8))),
+            ((i32::MIN as i128) - 1, (true, Some(8u8))),
+            ((u32::MAX as i128) + 1, (false, Some(8u8))),
+            (i64::MIN as i128, (true, Some(8u8))),
+            (i64::MAX as i128, (false, Some(8u8))),
+            (u64::MAX as i128, (false, Some(8u8))),
+            ((i64::MIN as i128) - 1, (true, None)),
+            ((u64::MAX as i128) + 1, (false, None)),
+        ];
+
+        for (value, expected) in test_values.into_iter() {
+            let bounded = Bounded::<i128>::Single(value);
+            assert_eq!(bounded.range_in_bytes(), expected, "testing {}", value);
+        }
+    }
+}

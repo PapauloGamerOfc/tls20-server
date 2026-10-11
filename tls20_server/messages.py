@@ -7,13 +7,18 @@ import ipaddress
 import re
 
 from .errors import ProtocolError
+from . import crypto as c
+from .credential_selection import parse_certificate_authorities, parse_oid_filters
+from .status_request import parse_status_request
 
-HANDSHAKE_TYPES = frozenset((1, 2, 4, 5, 8, 11, 13, 15, 20, 24))
+HANDSHAKE_TYPES = frozenset((1, 2, 4, 5, 8, 11, 13, 15, 20, 24, 25, 252, 253))
 MAX_HANDSHAKE_BODY = 1 << 18
 HTTP_PROTOCOL = b"http/1.1"
 PARAMETERS = b"\x13\x01\x00\x1d"
 VERSION = b"\x04\x00"
-CERT_ALGORITHMS = (0x0807, 0x0403)
+CERT_ALGORITHMS = (0x0807, 0x0808, 0x0403, 0x0503, 0x0603,
+                   0x0401, 0x0501, 0x0601, 0x0804, 0x0805, 0x0806, 0x0809, 0x080a, 0x080b,
+                   0x081a, 0x081b, 0x081c)
 HRR_RANDOM = bytes.fromhex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
 
 
@@ -44,6 +49,32 @@ def validate_name(name: str) -> str:
     if len(name.split(".")) == 4 and all(part.isdigit() for part in name.split(".")):
         raise ProtocolError("IP identities are not supported")
     return name
+
+
+def validate_service_identity(name: str) -> str:
+    """Validate a canonical reference identity, separately from DNS-only SNI.
+
+    IP references are authenticated by iPAddress SANs or explicit RPK/PSK
+    provisioning. They are never encoded as an SNI host_name or DNSName SAN.
+    Brackets and interface scope IDs belong to URLs/routing, not certificates.
+    """
+    if not isinstance(name, str) or "%" in name:
+        raise ProtocolError("invalid service identity")
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return validate_name(name)
+    if str(address) != name:
+        raise ProtocolError("IP service identity must be canonical")
+    return name
+
+
+def is_ip_identity(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
 
 
 def _vec(data: bytes, width: int) -> bytes:
@@ -79,9 +110,10 @@ class _Reader:
 def frame(kind: int, body: bytes) -> bytes:
     if kind not in HANDSHAKE_TYPES or len(body) > MAX_HANDSHAKE_BODY:
         raise ProtocolError("invalid handshake type or length")
-    if kind == 20 and len(body) != 32:
-        raise ProtocolError("Finished body must have length 32")
-    if kind == 15 and (len(body) != 36 or body[:4] not in (b"\xfe\x00\x00\x20", b"\xfe\x01\x00\x20")):
+    if kind == 20 and len(body) not in (32, 48):
+        raise ProtocolError("Finished body must have the negotiated hash length")
+    if kind == 15 and (len(body) not in (36, 52) or body[:2] not in (b"\xfe\x00", b"\xfe\x01")
+                       or int.from_bytes(body[2:4], "big") != len(body) - 4):
         raise ProtocolError("MAC envelope")
     if kind == 5 and body:
         raise ProtocolError("EndOfEarlyData must be empty")
@@ -118,6 +150,9 @@ class ClientHello:
     psk_offers: tuple = ()
     binder_vector_size: int = 0
     share_groups: tuple[int, ...] = ()
+    cipher_suites: tuple[int, ...] = (0x1301,)
+    psk_modes: tuple[int, ...] = ()
+    protocols: tuple[bytes, ...] = ()
 
 
 def extension(kind: int, data: bytes) -> bytes:
@@ -145,42 +180,79 @@ def _u16_list(data: bytes) -> tuple[int, ...]:
     return tuple(int.from_bytes(value[i:i + 2], "big") for i in range(0, len(value), 2))
 
 
+def pwd_share_valid(group, share):
+    if group in c.ffdhe.SIZES:
+        width=c.ffdhe.SIZES[group]
+        length=int.from_bytes(share[width:width+2],"big")
+        return bool(1<=length<=width and len(share)==width+2+length)
+    width = {23: 32, 24: 48, 25: 66}.get(group)
+    return bool(width and len(share) >= 2 * width + 2
+                and 1 <= share[2 * width] <= width
+                and len(share) == 2 * width + 1 + share[2 * width])
+
+
 def client_hello(A: bytes, B: bytes, name: str, random: bytes,
                  protocol: bytes = HTTP_PROTOCOL, *, identity: bytes = b"",
                  age: int = 0, binder: bytes = b"", early_data: bool = False,
                  group: int = 0x001d, empty_share: bool = False, cookie: bytes = b"",
-                 session_id: bytes = b"", post_handshake_auth: bool = False) -> bytes:
-    validate_name(name)
-    _protocol(protocol)
-    if (len(A) != 32 or len(B) != (65 if group == 0x0017 else 32)
-            or group not in (0x001d, 0x0017) or len(random) != 32 or A == B or len(session_id) > 32):
+                 session_id: bytes = b"", post_handshake_auth: bool = False,
+                 cipher_suites: tuple[int, ...] = (0x1301,),
+                 supported_groups: tuple[int, ...] = (29, 23, 24, 25, 30, 31, 32, 33, 4588, 4587, 4589, 256, 257, 258, 259, 260),
+                 psk_modes: tuple[int, ...] = (1,), psk_offers=(), combined_psk=False,
+                 extra_extensions=(), certificate_algorithms=CERT_ALGORITHMS,
+                 password_authenticated=False) -> bytes:
+    if name:
+        validate_name(name)
+    protocols = (protocol,) if isinstance(protocol, bytes) else tuple(protocol)
+    for value in protocols:
+        _protocol(value)
+    valid_share = pwd_share_valid(group, B) if password_authenticated else len(B) == c.GROUP_LENGTHS.get(group)
+    if ((A and len(A) != 32) or (group and (not empty_share and not valid_share
+            or group not in supported_groups)) or (not group and B) or len(random) != 32
+            or (A and A == c.traffic_auth_component(group, B)) or len(session_id) > 32
+            or not cipher_suites or not psk_modes):
         raise ProtocolError("invalid client shares or random")
-    ext = extension(0, _vec(b"\x00" + _vec(name.encode("ascii"), 2), 2))
+    ext = extension(0, _vec(b"\x00" + _vec(name.encode("ascii"), 2), 2)) if name else b""
     ext += extension(43, b"\x02" + VERSION)
-    ext += extension(10, b"\x00\x04\x00\x1d\x00\x17")
-    ext += extension(51, _vec(b"" if empty_share else group.to_bytes(2, "big") + _vec(B, 2), 2))
-    ext += extension(50, _vec(b"".join(x.to_bytes(2, "big") for x in CERT_ALGORITHMS), 2))
-    ext += extension(0xff02, A)
-    ext += extension(16, _vec(_vec(protocol, 1), 2))
-    ext += extension(45, b"\x01\x01")  # psk_dhe_ke, also requests future tickets.
+    if group:
+        ext += extension(10, _vec(b"".join(x.to_bytes(2, "big") for x in supported_groups), 2))
+        ext += extension(51, _vec(b"" if empty_share else group.to_bytes(2, "big") + _vec(B, 2), 2))
+    if certificate_algorithms:
+        ext += extension(50, _vec(b"".join(x.to_bytes(2, "big") for x in certificate_algorithms), 2))
+    if A:
+        ext += extension(0xff02, A)
+    if protocols:
+        ext += extension(16, _vec(b"".join(_vec(value, 1) for value in protocols), 2))
+    ext += extension(45, _vec(bytes(psk_modes), 1))
     if post_handshake_auth:
         ext += extension(49, b"")
     if cookie:
         ext += extension(44, _vec(cookie, 2))
+    offers = tuple(psk_offers) if psk_offers else ((identity, age, binder),) if identity else ()
+    if combined_psk:
+        if not offers or not A or not group or early_data:
+            raise ProtocolError("combined PSK requires credentials and DHE, without early data")
+        ext += extension(33, b"")
+    for kind, data in extra_extensions:
+        ext += extension(kind, data)
     if early_data:
-        if not identity:
+        if not offers:
             raise ProtocolError("early data requires a PSK")
         ext += extension(42, b"")
-    if identity:
-        if len(binder) != 32 or not 0 <= age < 1 << 32:
-            raise ProtocolError("invalid PSK binder or age")
-        ext += extension(41, _vec(_vec(identity, 2) + age.to_bytes(4, "big"), 2)
-                         + _vec(_vec(binder, 1), 2))
-    return frame(1, b"\x03\x03" + random + _vec(session_id, 1) + b"\x00\x02\x13\x01"
+    if offers:
+        if any(not ident or len(proof) not in (32, 48) or not 0 <= obfuscated < 1 << 32
+               for ident, obfuscated, proof in offers):
+            raise ProtocolError("invalid PSK identity, binder or age")
+        ext += extension(41, _vec(b"".join(_vec(ident, 2) + obfuscated.to_bytes(4, "big")
+                             for ident, obfuscated, _ in offers), 2)
+                         + _vec(b"".join(_vec(proof, 1) for _, _, proof in offers), 2))
+    extensions(ext)  # Duplicate/forbidden extensions are never emitted.
+    return frame(1, b"\x03\x03" + random + _vec(session_id, 1)
+                 + _vec(b"".join(x.to_bytes(2, "big") for x in cipher_suites), 2)
                  + b"\x01\x00" + _vec(ext, 2))
 
 
-def parse_client_hello(body: bytes) -> ClientHello:
+def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticated=None) -> ClientHello:
     r = _Reader(body)
     if r.take(2) != b"\x03\x03":
         raise ProtocolError("invalid ClientHello legacy version")
@@ -189,16 +261,25 @@ def parse_client_hello(body: bytes) -> ClientHello:
     if len(sid) > 32:
         raise ProtocolError("legacy session id length")
     suites = r.vector(2)
-    if not suites or len(suites) % 2 or b"\x13\x01" not in [suites[i:i+2] for i in range(0, len(suites), 2)]:
+    if not suites or len(suites) % 2:
+        raise ProtocolError("invalid cipher suite offer")
+    cipher_suites = tuple(int.from_bytes(suites[i:i+2], "big") for i in range(0, len(suites), 2))
+    if not any(value in c.CIPHER_SUITES for value in cipher_suites):
         raise ProtocolError("no supported cipher suite")
     if r.vector(1) != b"\x00":
         raise ProtocolError("invalid legacy compression")
     fixed_hello = body[:r.position]
     ext = extensions(r.vector(2))
     r.end()
+    if 5 in ext:
+        parse_status_request(ext[5])
+    if 47 in ext:
+        parse_certificate_authorities(ext[47])
+    if 48 in ext:
+        raise ProtocolError("oid_filters is only permitted in CertificateRequest", alert=47)
     if 0xff03 in ext or 49 in ext and ext[49]:
         raise ProtocolError("wrong-role auth share or malformed post_handshake_auth")
-    for required in (0, 43, 10, 51, 16):
+    for required in (43,):
         if required not in ext:
             raise ProtocolError("missing required ClientHello extension")
     vr = _Reader(ext[43]); versions = vr.vector(1); vr.end()
@@ -206,10 +287,25 @@ def parse_client_hello(body: bytes) -> ClientHello:
         raise ProtocolError("invalid supported_versions")
     if VERSION not in [versions[i:i+2] for i in range(0, len(versions), 2)]:
         raise ProtocolError("unsupported protocol version")
-    groups = _u16_list(ext[10])
-    if not set(groups) & {0x001d, 0x0017}:
+    groups = _u16_list(ext[10]) if 10 in ext else ()
+    if groups and not set(groups) & c.GROUP_LENGTHS.keys():
         raise ProtocolError("no supported traffic group")
-    sr = _Reader(ext[51]); shares = _Reader(sr.vector(2)); sr.end()
+    sr = _Reader(ext.get(51, b"\x00\x00")); shares = _Reader(sr.vector(2)); sr.end()
+    names = {29, 30} & set(ext)
+    pwd_suites = [c.suite(value) for value in cipher_suites if value in c.CIPHER_SUITES
+                  and c.suite(value).password_authenticated]
+    if names:
+        if len(names) != 1 or not pwd_suites or 51 not in ext:
+            raise ProtocolError("invalid password authentication offer", alert=47)
+        nr = _Reader(ext[next(iter(names))]); username = nr.vector(1); nr.end()
+        if not username:
+            raise ProtocolError("empty password account identity", alert=47)
+    if password_authenticated is None:
+        pwd_only = all(value in c.CIPHER_SUITES and c.suite(value).password_authenticated
+                       for value in cipher_suites)
+        password_authenticated = bool(names and pwd_only and len({value.hash_name for value in pwd_suites}) == 1)
+        if names and shares.data and not password_authenticated:
+            raise ProtocolError("mixed PWD hashes or modes require empty initial key shares", alert=47)
     seen, shares_by_group = set(), {}
     while shares.position < len(shares.data):
         group = int.from_bytes(shares.take(2), "big")
@@ -219,44 +315,53 @@ def parse_client_hello(body: bytes) -> ClientHello:
         seen.add(group)
         if group not in groups:
             raise ProtocolError("key share not in supported_groups")
-        if group in (0x001d, 0x0017):
-            if len(share) != (32 if group == 0x001d else 65):
+        if group in c.GROUP_LENGTHS:
+            if not (pwd_share_valid(group, share) if password_authenticated else len(share) == c.GROUP_LENGTHS[group]):
                 raise ProtocolError("traffic share length")
             shares_by_group[group] = share
-    group = next((value for value in (0x001d, 0x0017) if value in shares_by_group),
-                 next(value for value in (0x001d, 0x0017) if value in groups))
+    preference = (29, 23, 24, 25, 30, 31, 32, 33, 41, 34,35,36,37,38,39,40,4588,4587,4589,256,257,258,259,260)
+    if enabled_groups is not None:
+        preference = tuple(value for value in preference if value in enabled_groups)
+    group = next((value for value in preference if value in shares_by_group),
+                 next((value for value in preference if value in groups), 0))
     B = shares_by_group.get(group, b"")
     A = ext.get(0xff02, b"")
-    if (A and len(A) != 32) or (B and A == B):
+    if (A and len(A) != 32) or (A and B and A == c.traffic_auth_component(group, B)):
         raise ProtocolError("invalid independent key shares")
-    nr = _Reader(ext[0]); names = _Reader(nr.vector(2)); nr.end()
-    if names.take(1) != b"\x00":
-        raise ProtocolError("unsupported name type")
-    try:
-        name = names.vector(2).decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ProtocolError("non-ASCII server name") from exc
-    validate_name(name)
-    names.end()
-    pr = _Reader(ext[16]); protocols = _Reader(pr.vector(2)); pr.end()
+    name = ""
+    if 0 in ext:
+        nr = _Reader(ext[0]); names = _Reader(nr.vector(2)); nr.end()
+        if names.take(1) != b"\x00":
+            raise ProtocolError("unsupported name type")
+        try:
+            name = names.vector(2).decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError("non-ASCII server name") from exc
+        validate_name(name)
+        names.end()
+    if 59 in ext and (0 not in ext or len(ext[59]) != 2 or ext[59] == b"\x00\x00"):
+        raise ProtocolError("DNSSEC chain requires DNS SNI and an exact nonzero service port", alert=50)
     offered = []
-    while protocols.position < len(protocols.data):
-        value = protocols.vector(1); _protocol(value); offered.append(value)
-    if not offered:
-        raise ProtocolError("empty ALPN offer")
-    protocol = HTTP_PROTOCOL if HTTP_PROTOCOL in offered else offered[0]
+    if 16 in ext:
+        pr = _Reader(ext[16]); protocols = _Reader(pr.vector(2)); pr.end()
+        while protocols.position < len(protocols.data):
+            value = protocols.vector(1); _protocol(value); offered.append(value)
+        if not offered:
+            raise ProtocolError("empty ALPN offer")
+    protocol = HTTP_PROTOCOL if HTTP_PROTOCOL in offered else offered[0] if offered else b""
     cert_algs = _u16_list(ext[50]) if 50 in ext else ()
     if any(value in (0xfe00, 0xfe01, 0x0420, 0x0520, 0x0620) for value in cert_algs):
         raise ProtocolError("invalid certificate signature scheme")
     identity, age, binder = b"", 0, b""
     offers, binder_size = [], 0
+    modes = b""
     if 45 in ext:
         mr = _Reader(ext[45]); modes = mr.vector(1); mr.end()
         if not modes:
             raise ProtocolError("empty PSK modes")
     if 41 in ext:
-        if list(ext)[-1] != 41 or 45 not in ext or 1 not in modes:
-            raise ProtocolError("PSK must be last and offer psk_dhe_ke")
+        if list(ext)[-1] != 41 or 45 not in ext or not set(modes) & {0, 1}:
+            raise ProtocolError("PSK must be last and offer a supported PSK mode")
         p = _Reader(ext[41]); ids = _Reader(p.vector(2)); bs = _Reader(p.vector(2)); p.end()
         identities = []
         while ids.position < len(ids.data):
@@ -277,70 +382,121 @@ def parse_client_hello(body: bytes) -> ClientHello:
         binder_size = 2 + len(bs.data)
     if 42 in ext and (ext[42] or not identity):
         raise ProtocolError("invalid early_data offer")
+    if (not identity or 0 not in modes) and (10 not in ext or 51 not in ext):
+        raise ProtocolError("DHE requires supported_groups and key_share")
+    if 33 in ext and (ext[33] or not identity or 1 not in modes or 42 in ext):
+        raise ProtocolError("invalid combined PSK offer")
     return ClientHello(name, protocol, A, B, random, sid, cert_algs,
                        identity, age, binder, 42 in ext, tuple(ext), group, groups,
-                       tuple(ext.items()), fixed_hello, tuple(offers), binder_size, tuple(seen))
+                       tuple(ext.items()), fixed_hello, tuple(offers), binder_size, tuple(seen),
+                       cipher_suites, tuple(modes), tuple(offered))
 
 
 def server_hello(E: bytes, random: bytes, *, session_id: bytes = b"", resumed: bool = False,
-                 group: int = 0x001d, retry: bool = False, selected_identity: int = 0) -> bytes:
-    if (not retry and len(E) != (65 if group == 0x0017 else 32)) or len(random) != 32:
+                 group: int = 0x001d, retry: bool = False, selected_identity: int = 0,
+                 cipher_suite: int = 0x1301, combined_psk=False, password_salt=None) -> bytes:
+    pwd = c.suite(cipher_suite).password_authenticated
+    valid_share = pwd_share_valid(group, E) if pwd else len(E) == c.SERVER_GROUP_LENGTHS.get(group)
+    if (not retry and group and not valid_share) or len(random) != 32:
         raise ProtocolError("invalid server share or random")
     if len(session_id) > 32:
         raise ProtocolError("legacy session id length")
-    ext = extension(43, VERSION) + extension(51, group.to_bytes(2, "big") + (b"" if retry else _vec(E, 2)))
+    ext = extension(43, VERSION)
+    if group:
+        ext += extension(51, group.to_bytes(2, "big") + (b"" if retry else _vec(E, 2)))
+    elif E or retry or not resumed:
+        raise ProtocolError("absent key share requires PSK-only selection")
+    if combined_psk:
+        if not resumed or not group:
+            raise ProtocolError("combined PSK requires DHE and a PSK")
+        ext += extension(33, b"")
     if resumed:
         ext += extension(41, selected_identity.to_bytes(2, "big"))
+    if password_salt is not None:
+        if not retry or not pwd or len(password_salt) != 32:
+            raise ProtocolError("password salt requires a PWD retry")
+        ext += extension(31, _vec(password_salt, 2))
     return frame(2, b"\x03\x03" + (HRR_RANDOM if retry else random)
-                 + _vec(session_id, 1) + b"\x13\x01\x00" + _vec(ext, 2))
+                 + _vec(session_id, 1) + cipher_suite.to_bytes(2, "big") + b"\x00" + _vec(ext, 2))
 
 
-def parse_server_hello(body: bytes, *, details: bool = False):
+def parse_server_hello(body: bytes, *, details: bool = False, with_suite: bool = False):
     r = _Reader(body)
     if r.take(2) != b"\x03\x03":
         raise ProtocolError("invalid ServerHello legacy version")
     random = r.take(32)
     sid = r.vector(1)
-    if len(sid) > 32 or r.take(3) != b"\x13\x01\x00":
+    cipher_suite = int.from_bytes(r.take(2), "big")
+    if len(sid) > 32 or cipher_suite not in c.CIPHER_SUITES or r.take(1) != b"\x00":
         raise ProtocolError("invalid ServerHello")
     ext = extensions(r.vector(2)); r.end()
     retry = random == HRR_RANDOM
-    if set(ext) - ({43, 51, 44} if retry else {43, 51, 41}) or ext.get(43) != VERSION:
+    pwd = c.suite(cipher_suite).password_authenticated
+    if set(ext) - ({43, 51, 44, 31} if retry and pwd else {43, 51, 44} if retry else {43, 51, 41, 33}) or ext.get(43) != VERSION:
         raise ProtocolError("unsupported ServerHello version or extension")
     group, E = 0, b""
     if 51 in ext:
         sr = _Reader(ext[51]); group = int.from_bytes(sr.take(2), "big")
         E = b"" if retry else sr.vector(2); sr.end()
-        if group not in (0x001d, 0x0017) or not retry and len(E) != (32 if group == 0x001d else 65):
+        valid_share = pwd_share_valid(group, E) if pwd else len(E) == c.SERVER_GROUP_LENGTHS.get(group)
+        if group not in c.GROUP_LENGTHS or not retry and not valid_share:
             raise ProtocolError("invalid server traffic share")
-    elif not retry or 44 not in ext:
+    elif (retry and 44 not in ext) or (not retry and 41 not in ext):
         raise ProtocolError("missing server traffic share or useful retry")
-    if 41 in ext and ext[41] != b"\x00\x00":
-        raise ProtocolError("unknown PSK selected identity")
+    if 41 in ext and len(ext[41]) != 2:
+        raise ProtocolError("invalid PSK selected identity")
+    if 33 in ext and (ext[33] or 41 not in ext or not group):
+        raise ProtocolError("invalid combined PSK selection")
+    if pwd and (41 in ext or 33 in ext):
+        raise ProtocolError("fresh PWD cannot select a PSK")
+    if 31 in ext and (len(ext[31]) != 34 or ext[31][:2] != b"\x00\x20"):
+        raise ProtocolError("invalid PWD salt")
     cookie = b""
     if 44 in ext:
         cr = _Reader(ext[44]); cookie = cr.vector(2); cr.end()
         if not cookie:
             raise ProtocolError("empty retry cookie")
-    return (E, sid, 41 in ext, group, retry, cookie) if details else E
+    result = (E, sid, 41 in ext, group, retry, cookie)
+    return result + (cipher_suite,) if with_suite else result if details else E
 
 
-def encrypted_extensions(protocol: bytes = HTTP_PROTOCOL, *, early_data: bool = False) -> bytes:
-    _protocol(protocol)
-    selection = _vec(_vec(protocol, 1), 2)
-    ext = extension(0, b"") + extension(16, selection)
+def server_hello_extensions(body):
+    r = _Reader(body)
+    r.take(34); r.vector(1); r.take(3)
+    result = extensions(r.vector(2)); r.end()
+    return result
+
+
+def encrypted_extensions(protocol: bytes = HTTP_PROTOCOL, *, early_data: bool = False, extra_extensions=(),
+                          acknowledge_name=True) -> bytes:
+    ext = extension(0, b"") if acknowledge_name else b""
+    if protocol:
+        _protocol(protocol)
+        ext += extension(16, _vec(_vec(protocol, 1), 2))
     if early_data:
         ext += extension(42, b"")
+    for kind, value in extra_extensions:
+        ext += extension(kind, value)
+    extensions(ext)
     return frame(8, _vec(ext, 2))
 
 
-def parse_encrypted_extensions(body: bytes, protocol: bytes = HTTP_PROTOCOL, *, offered_early: bool = False) -> bool:
+def parse_encrypted_extensions(body: bytes, protocol: bytes = HTTP_PROTOCOL, *, offered_early: bool = False,
+                                details=False, allowed_extensions=(), with_extensions=False,
+                                offered_name=True, require_alpn=True):
     r = _Reader(body); ext = extensions(r.vector(2)); r.end()
-    if set(ext) - {0, 16, 42} or ext.get(0) != b"" or ext.get(16) != _vec(_vec(protocol, 1), 2):
+    selected = b""
+    if 16 in ext:
+        pr = _Reader(ext[16]); chosen = _Reader(pr.vector(2)); pr.end()
+        selected = chosen.vector(1); chosen.end(); _protocol(selected)
+    offered = (protocol,) if isinstance(protocol, bytes) else tuple(protocol)
+    if (set(ext) - {0, 16, 42, *allowed_extensions}
+            or 0 in ext and (not offered_name or ext[0])
+            or selected and selected not in offered or require_alpn and not selected):
         raise ProtocolError("invalid extension structure or protocol selection")
     if 42 in ext and (not offered_early or ext[42]):
         raise ProtocolError("unsolicited early_data selection")
-    return 42 in ext
+    return (42 in ext, selected, ext) if with_extensions else (42 in ext, selected) if details else 42 in ext
 
 
 def certificate_verify(proof: bytes, *, client: bool = False) -> bytes:
@@ -348,22 +504,32 @@ def certificate_verify(proof: bytes, *, client: bool = False) -> bytes:
 
 
 def certificate_request(context: bytes, verifier_public: bytes,
-                         algorithms: tuple[int, ...] = CERT_ALGORITHMS) -> bytes:
-    if len(verifier_public) != 32 or not algorithms:
+                         algorithms: tuple[int, ...] = CERT_ALGORITHMS, *, extra_extensions=()) -> bytes:
+    if len(verifier_public) != 32:
         raise ProtocolError("invalid client verifier share or algorithm offer")
-    ext = extension(50, _vec(b"".join(x.to_bytes(2, "big") for x in algorithms), 2))
+    ext = extension(50, _vec(b"".join(x.to_bytes(2, "big") for x in algorithms), 2)) if algorithms else b""
     ext += extension(0xff03, verifier_public)
+    for kind, value in extra_extensions:
+        ext += extension(kind, value)
+    extensions(ext)
     return frame(13, _vec(context, 1) + _vec(ext, 2))
 
 
-def parse_certificate_request(body: bytes):
+def parse_certificate_request(body: bytes, *, details=False):
     r = _Reader(body); context = r.vector(1); ext = extensions(r.vector(2)); r.end()
-    if len(ext.get(0xff03, b"")) != 32 or 0xff02 in ext or 50 not in ext:
+    if 5 in ext:
+        parse_status_request(ext[5], certificate_request=True)
+    if 47 in ext:
+        parse_certificate_authorities(ext[47])
+    if 48 in ext:
+        parse_oid_filters(ext[48])
+    if len(ext.get(0xff03, b"")) != 32 or 0xff02 in ext:
         raise ProtocolError("missing or wrong client authentication extension")
-    algorithms = _u16_list(ext[50])
+    algorithms = _u16_list(ext[50]) if 50 in ext else ()
     if any(x in (0xfe00, 0xfe01, 0x0420, 0x0520, 0x0620) for x in algorithms):
         raise ProtocolError("invalid client certificate signature list")
-    return context, ext[0xff03], algorithms
+    result = context, ext[0xff03], algorithms
+    return result + (ext,) if details else result
 
 
 def new_session_ticket(identity: bytes, nonce: bytes, lifetime: int, age_add: int, max_early_data: int) -> bytes:
@@ -384,18 +550,25 @@ def parse_new_session_ticket(body: bytes):
     return identity, nonce, lifetime, age_add, maximum
 
 
-def certificate(chain_der: list[bytes], *, context: bytes = b"", allow_empty: bool = False) -> bytes:
+def certificate(chain_der: list[bytes], *, context: bytes = b"", allow_empty: bool = False,
+                 entry_extensions=()) -> bytes:
     if not (0 if allow_empty else 1) <= len(chain_der) <= 8:
         raise ProtocolError("certificate count")
     entries = []
-    for item in chain_der:
+    metadata = entry_extensions or ((),) * len(chain_der)
+    if len(metadata) != len(chain_der):
+        raise ProtocolError("certificate metadata count")
+    for item, pairs in zip(chain_der, metadata):
         if not 1 <= len(item) <= 65536:
             raise ProtocolError("certificate length")
-        entries.append(_vec(item, 3) + b"\x00\x00")
+        block = b"".join(extension(kind, value) for kind, value in pairs)
+        extensions(block)
+        entries.append(_vec(item, 3) + _vec(block, 2))
     return frame(11, _vec(context, 1) + _vec(b"".join(entries), 3))
 
 
-def parse_certificate(body: bytes, *, context: bytes = b"", allow_empty: bool = False) -> list[bytes]:
+def parse_certificate(body: bytes, *, context: bytes = b"", allow_empty: bool = False,
+                       details=False) -> list[bytes]:
     """Decode the list envelope, not DER, certificate profiles or path trust."""
     if len(body) > MAX_HANDSHAKE_BODY:
         raise ProtocolError("Certificate body too large")
@@ -404,14 +577,16 @@ def parse_certificate(body: bytes, *, context: bytes = b"", allow_empty: bool = 
         raise ProtocolError("unexpected certificate request context")
     entries = _Reader(r.vector(3))
     r.end()
-    result = []
+    result, metadata = [], []
     while entries.position < len(entries.data):
         item = entries.vector(3)
         if not 1 <= len(item) <= 65536 or len(result) >= 8:
             raise ProtocolError("certificate count or length")
-        if entries.vector(2):
+        block = entries.vector(2)
+        if block and not details:
             raise ProtocolError("certificate extensions are unsupported")
         result.append(item)
+        metadata.append(tuple(extensions(block).items()))
     if not result and not allow_empty:
         raise ProtocolError("empty certificate chain")
-    return result
+    return (result, tuple(metadata)) if details else result

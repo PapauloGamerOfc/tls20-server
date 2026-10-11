@@ -88,15 +88,49 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 self.load(value)
 
+    def test_negotiated_ciphers_and_upstream_protocol(self):
+        config = self.load('upstream_protocol="h2"\ncipher_suites=[0x1302, 0x1303]')
+        self.assertEqual(config.cipher_suites, (0x1302, 0x1303))
+        self.assertEqual(config.upstream_protocol, "h2")
+        for content in ('upstream_protocol="h3"', 'upstream_protocol=true',
+                        'cipher_suites=[]', 'cipher_suites=[true]',
+                        'cipher_suites=[0x1301, 0x1301]', 'cipher_suites=[0xc0b0]',
+                        'cipher_suites="0x1301"',
+                        'upstream_protocol="h2"\nupstream_early_data_aware=true\nearly_data_paths=["/"]'):
+            with self.subTest(content=content), self.assertRaises(ConfigError):
+                self.load(content)
+
     def test_dns_name_profile(self):
         for value in (
-            "", "Example.com", "example.com.", "*.example.com", "127.0.0.1",
+            "", "Example.com", "example.com.", "*.example.com", "127.0.00.1", "fe80::1%eth0",
+            "[::1]", "2001:0db8::1", "xn--test-9ta.invalid",
             "a..b", "-a.com", "a-.com", "a_b.com", "é.com", "a" * 64 + ".com",
             12, "a." * 127,
         ):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 Config(server_name=value)
-        self.assertEqual(Config(server_name="xn--test-9ta.invalid").server_name, "xn--test-9ta.invalid")
+        self.assertEqual(Config(server_name="xn--bcher-kva.invalid").server_name, "xn--bcher-kva.invalid")
+        self.assertEqual(Config(server_name="127.0.0.1").server_name, "127.0.0.1")
+        self.assertEqual(Config(server_name="2001:db8::1").server_name, "2001:db8::1")
+
+    def test_control_profiles_are_strict_and_explicit(self):
+        config = self.load('record_size_limit=512\nheartbeat_mode=1\n'
+                           'certificate_compression=[3,1]\nticket_count_limit=7')
+        self.assertEqual(config.record_size_limit, 512)
+        self.assertEqual(config.heartbeat_mode, 1)
+        self.assertEqual(config.certificate_compression, (3, 1))
+        self.assertEqual(config.ticket_count_limit, 7)
+        self.assertEqual(self.load('certificate_compression=[]').certificate_compression, ())
+        self.assertEqual(Config().heartbeat_mode, 0)
+        for content in ('record_size_limit=63', 'record_size_limit=16386',
+                        'record_size_limit=true', 'heartbeat_mode=true',
+                        'heartbeat_mode=3', 'heartbeat_mode=-1',
+                        'ticket_count_limit=-1', 'ticket_count_limit=256',
+                        'ticket_count_limit=true', 'certificate_compression=[1,1]',
+                        'certificate_compression=[true]', 'certificate_compression=[4]',
+                        'certificate_compression="zlib"'):
+            with self.subTest(content=content), self.assertRaises(ConfigError):
+                self.load(content)
 
     def test_invalid_toml_encoding_missing_file_and_size(self):
         for content in (b"\xff", "listen =", "listen='127.0.0.1:1'\nlisten='127.0.0.1:2'"):

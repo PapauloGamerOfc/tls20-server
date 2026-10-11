@@ -1,11 +1,12 @@
 # Protocol implementation and compatibility
 
 The implementation targets the first TLS 2.0 specification, revision
-[0c9c8bf0914697d521050554e545a167fa8fc345](https://github.com/PapauloGamerOfc/tls20-spec/tree/0c9c8bf0914697d521050554e545a167fa8fc345).
+[dee31da9826e10bd590f58acc0f9f46143505fd1](https://github.com/PapauloGamerOfc/tls20-spec/tree/dee31da9826e10bd590f58acc0f9f46143505fd1).
 The negotiated version is `0x0400`; older TLS versions and the former prototype
 wire format are not accepted. The bootstrap is `TLS20-EXPERIMENT\r\n` and the KDF
-label prefix is `tls20 `. The application protocol is the exact byte string
-`http/1.1`, describing the inner HTTP stream, not ordinary HTTPS interoperability.
+label prefix is `tls20 `. ALPN describes the inner application: the forwarding
+CLI selects `http/1.1`, or `h2` with an explicitly configured prior-knowledge
+HTTP/2 backend. This is not ordinary HTTPS interoperability.
 
 Client URLs use `httpps://hostname[:port]/path`, default TCP port 343. The
 diagnostic client makes a GET with `Connection: close` and writes raw response
@@ -19,7 +20,9 @@ follow redirects, manage cookies or install a browser protocol handler.
    messages and extensions, selecting only version `0x0400`. It rejects
    `signature_algorithms`; certificate signature preferences are separate.
 2. The fresh client authentication share is X25519. Traffic agreement is
-   independent, supporting X25519 and secp256r1/P-256. HelloRetryRequest uses
+   independent, supporting X25519/X448, NIST P-256/P-384/P-521, the three
+   TLS Brainpool groups, RFC 7919 FFDHE groups and the three RFC 10024 ML-KEM
+   hybrid groups. HelloRetryRequest uses
    the synthetic message-hash transcript, preserves the bootstrap once and
    rejects early data for that handshake.
 3. ClientHello and ServerHello are plaintext; subsequent server handshake
@@ -72,7 +75,9 @@ must also pass before `channel.authenticated_client` is populated.
 post_handshake_auth=True)` supplies an optional client chain/private key and
 advertises PHA. Both options default off. Initial client credentials are sent
 only after the server's CertificateVerify and Finished have been verified.
-There are no corresponding CLI/configuration fields or automatic credential UI.
+The [profile configuration](profiles.md) can provision initial credentials,
+authorization and the PHA capability. Triggering PHA remains an application API
+decision; no automatic credential-selection UI or HTTP identity header is added.
 
 After the handshake, `await channel.request_client_auth(required=False)` on the
 server returns a Future. The application must keep driving `channel.recv()` so
@@ -139,29 +144,99 @@ original request deadline. Authentication errors are never retried as plaintext.
 | `crypto.py` | Provider-backed key agreement, key schedule, MAC, AEAD and updates |
 | `messages.py` | Strict wire encodings, extension parsing and DNS syntax |
 | `tickets.py` | Bounded ticket, client session and early-replay state |
-| `pki.py` | Credential parsing and restricted explicit-trust lab validation |
+| `pki.py` | Provider-backed explicit-root PKIX and separate laboratory policy |
+| `credential_profiles.py`, `credential_evidence.py` | X.509, delegation, RPK and current OCSP/CT policy |
+| `dnssec_credentials.py`, `transparency.py` | Signed DNSSEC/DANE and CT evidence with explicit trust |
+| `credential_cache.py` | Bounded codecs and cached credential objects |
+| `application_auth.py` | Connection-bound application authenticators |
+| `bootstrap_credentials.py`, `psk.py` | Explicit bootstrap and external/imported PSK authorization |
+| `optional_controls.py`, `handshake_options.py` | Control, ticket and signaling negotiation |
+| `diagnostics.py` | Separately built, explicitly authorized test secret sink |
 | `handshake.py` | Reassembly, transcripts, state transitions and record channel |
 | `early_http.py` | Narrow replay-aware early HTTP request gate |
 | `config.py` | Configuration parsing and local endpoint policy |
+| `profiles.py` | Strict file-backed authentication, provider and evidence policies |
+| `pake.py`, `pake_native.py`, `pake_handshake.py` | Native EC/FFC password commitments, authorization and successor tickets |
+| `openssl_provider.py`, `gost_provider.py` | Explicit private provider contexts, national algorithms and GOST record trees |
+| `its_credentials.py`, `native/its` | Provisioned ITS service/permission/grant verification |
 | `server.py` | Admission, lifetime management and duplex forwarding |
 | `client.py` | HTTPPS URL handling and diagnostic client |
 | `lab.py` | Fresh local CA and server credential generation |
 
 ## Coverage boundaries
 
-This is not an implementation of every optional profile in the specification.
-The current application profile uses HTTP/1.1, AES-128-GCM/SHA-256 and server
-X.509 authentication, with optional initial/PHA client MAC authentication through
-the low-level API described above. Raw public keys, delegated credentials, external PSKs,
-certificate compression, exported authenticators, PAKE/POK and other optional
-profiles are not advertised or implemented. Unsupported profiles must not be
-mistaken for negotiated capabilities.
+The following inventory distinguishes negotiated protocol implementations from
+deployment policy and application interfaces. Optional mechanisms require their
+explicit policy or provider; they are not all enabled by default. The library
+and forwarding CLI have different interfaces:
 
-The Python certificate validator remains an explicit-trust, ordered-chain
-**lab-offline** profile using Ed25519/P-256 CA signatures. It is not a general
-public WebPKI verifier, revocation service or replacement for a browser's
-certificate verifier. Phromium has its own browser validation and cache policy;
-cross-repository tests must identify both actual source revisions.
+| Capability | Implemented interface and verification |
+| --- | --- |
+| Baseline suites 0x1301..0x1305 | Full handshake, resumption, early data and KeyUpdate; cross-language native peer tests |
+| External/imported and combined PSK, `psk_ke`/`psk_dhe_ke` | Explicit library provisioning, independent identity/hash selection and policy-bound tickets |
+| X.509/RPK/delegation | Current credential policy, actual proof and Finished, including client authentication |
+| Compression/cache | Negotiated certificate flights and transcript binding; zlib, Brotli, Zstandard; bounded decompression |
+| Initial/PHA client MAC | Explicit application policy; `h2` does not permit TLS PHA |
+| Application authenticators | Both directions, requested and spontaneous server identities, including opt-in after PAKE; independent application framing/authorization |
+| Channel binding | Normal exporter, stable over KeyUpdate |
+| POK bootstrap | Explicit binding/trust mode; fresh possession distinguished from ticket authority; real loopback bootstrap/resumption |
+| RSL/MFL/heartbeat/ticket requests | CH/EE plus protected records; malformed lengths, both directions and resumed counts tested |
+| External signaling | Independently verified identity hashes/session IDs; required missing/mismatched bindings fail |
+| Literal IP references | Exact `iPAddress` SAN verification without DNS SNI; full/resumed/early paths and IPv6 HTTP authority tests |
+| Integrity-only 0xc0b4/0xc0b5 | Explicit bilateral library opt-in; never normal HTTPPS or confidential resumption |
+| HTTP/2 | Fixed backend relay with multiple streams on one connection; no HTTP version translation |
+| OCSP/CT/DNSSEC | Complete OCSP request/responder/nonce matching and TLSFeature issuer constraints; provider-backed evidence validators and explicit roots/logs/policy, not trust from decoding |
+| Diagnostic secrets | Separate test wheel, explicit scoped consent, protected new file; unavailable in production wheel |
+| PAKE 0xc0b0..0xc0b3 | Native EC23/24/25 and FFC256..260 commitments, salt retry, protected usernames, Finished, authorized successor tickets and real 0-RTT; explicit mixed credential/PWD offers select one mode in HRR without authentication-failure fallback |
+| SM2/SM3/SM4 | Explicit optional public OpenSSL provider, separate hash context, both SM4 suites and role-specific certificate/grant identifiers |
+| GOST | Explicit private provider; seven groups, four MGM suites, per-record TLSTREE, native certificate/grant validation and resumed/early/KU tests |
+| ITS-X25519 grants | Explicit native COER/signature/path/PSID/SSP/service/revocation policy, initial/PHA MAC and proof-bound resumption |
+| Operational profiles | Server `profile_file`, client `get --profile`, strict schema, independent trust inventories and no automatic provider discovery |
+
+These optional profiles have real implementations and tests, not aliases for
+ordinary PSK/X.509. Native providers still require explicit compatible builds.
+The ITS validator implements its documented, explicitly provisioned P-256/P-384
+PSID/SSP grant profile, not every ITS deployment, enrollment or revocation
+transport. PAKE includes the approved TLS 2.0 clarification of expanded hunting
+output and full-entropy FFC V16 scalars; EC retains V8 scalars. These protocol
+clarifications must also be present in the communicating implementation.
+Phromium coverage must be verified independently; a Python feature does not
+imply a browser UI or every deployment policy exists.
+
+Dynamic PHA and application-authenticator requests are application APIs, not
+automatic relay behavior. Credential issuance, user account provisioning,
+distributed replay coordination and online revocation/log transports remain
+deployment responsibilities. The relay intentionally disallows integrity-only
+records and arbitrary early HTTP side effects; this is an application policy,
+not missing wire negotiation. Algorithm and ITS policy subsets are explicit
+and fail closed rather than advertising unsupported choices.
+
+`CredentialPolicy` provides a separate explicit-root OpenSSL path validator,
+RSA/EdDSA/ECDSA signatures, name constraints, role and key-usage checks.
+`CredentialEvidencePolicy` can require current OCSP/CT evidence. The separate
+`lab-offline` diagnostic mode does not check revocation. No mode silently fetches
+peer-supplied URLs, imports remote roots or replaces browser WebPKI policy.
+Cross-repository tests must identify both actual source revisions, including
+dirty worktrees during development.
+
+### Application authenticators
+
+Applications negotiate and frame `tls20-authenticator` messages themselves; no
+HTTP header is invented. `credential_validator(policy, role=..., authorize=...)`
+combines current PKIX/evidence with additional application-scope authorization.
+Only a successful `AuthenticationResult` after MAC and Finished establishes key
+possession; a policy callback is not a success notification. Additional identities
+never replace the original connection identity, and consumed contexts cannot be
+reused. An appropriate application framing can use these over `h2`; its TLS PHA
+prohibition is not a prohibition of application authenticators.
+
+### Test-only diagnostic build
+
+`python tools/build_test_wheel.py` builds a separately named diagnostic wheel
+without changing the production checkout flag. `DiagnosticSink` requires an
+absolute new file and explicit test-data/traffic authorization; exporter roots
+require separate opt-in. `SSLKEYLOGFILE` does not activate it. Treat output as
+decryption material. `tools/check_wheel.py` verifies that production remains disabled.
 
 ## Closure, resources and tests
 
@@ -175,8 +250,13 @@ Records carry at most 16 KiB of content. Epoch, message, transcript, ticket and
 connection quotas are local resource limits, not extra protocol-version
 restrictions. The absolute handshake deadline does not restart on partial input.
 The server uses bounded asyncio streams and backpressure, caps accepted tasks
-and cancels owned pumps on shutdown. Cryptographic work runs in the event loop;
-high-load throughput is not established and no volumetric DoS claim is made.
+and cancels owned pumps on shutdown. Slow native PAKE operations run off the event
+loop; cancellation joins the native operation and cleans owned state before
+releasing admission. Other provider operations may still execute synchronously.
+Large FFC groups are expensive, especially without assembly. High-load throughput
+is not established and no volumetric DoS claim is made. Native use of secure BNs,
+constant-time flags, blinding and bounded hunting does not constitute a formal
+whole-program side-channel audit of Python, providers or platform code.
 
 Tests cover full/resumed handshakes, both traffic groups, retry transcripts,
 binders, ticket replay/restart, early rejection, backend receipt before client
@@ -187,3 +267,24 @@ Client-MAC tests include independent spec-derived known answers, captured initia
 and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
+
+### Local validation: 2026-10-11
+
+The Windows native-provider suite ran twice after the final fixes: 498 tests
+per run, both successful. The two skips are Windows-specific POSIX-mode and
+symlink-privilege checks, not missing cryptographic profiles. Optional OpenSSL,
+PAKE, GOST and ITS providers were supplied explicitly; missing native coverage
+is an error in the runner. The production wheel and source archive were rebuilt
+and the wheel's CLI verified in an isolated environment outside the checkout.
+
+A repeated run exposed a native thread-lifetime defect before these results:
+executor threads retained OpenSSL resources after their private context was
+freed. Reentrant native scopes now detach resources on the executing thread,
+before context destruction. Regression tests retain workers across context
+creation/destruction, exercise failure paths and check cleanup ordering; a
+negative control with the former scope fails the new assertions. This was a
+wrapper lifetime correction, not a change to the protocol or cryptographic
+primitive. The corresponding Phromium wrapper was corrected independently.
+
+CI also builds and tests on Linux and macOS. These local Windows results do not
+claim that the new revision's remote CI has already run, nor a formal audit.

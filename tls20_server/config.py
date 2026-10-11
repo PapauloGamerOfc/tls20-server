@@ -10,6 +10,8 @@ import re
 import tomllib
 
 from .constants import DEFAULT_PORT
+from .messages import validate_service_identity
+from .errors import ProtocolError
 
 MAX_CONFIG_BYTES = 65536
 
@@ -32,9 +34,16 @@ class Endpoint:
 class Config:
     listen: Endpoint = Endpoint("127.0.0.1", DEFAULT_PORT)
     upstream: Endpoint = Endpoint("127.0.0.1", 8080)
+    upstream_protocol: str = "http/1.1"
+    cipher_suites: tuple[int, ...] = (0x1301, 0x1302, 0x1303, 0x1304, 0x1305)
+    record_size_limit: int = 16385
+    certificate_compression: tuple[int, ...] = (1, 2, 3)
+    heartbeat_mode: int = 0
+    ticket_count_limit: int = 1
     server_name: str = "localhost"
     certificate_chain: Path = Path("fullchain.pem")
     private_key: Path = Path("server.key")
+    profile_file: Path | None = None
     max_connections: int = 128
     handshake_timeout_seconds: float = 10
     connect_timeout_seconds: float = 5
@@ -54,9 +63,28 @@ class Config:
         _validate_endpoint(self.listen, loopback=False, allow_zero=True)
         _validate_endpoint(self.upstream, loopback=True)
         _validate_server_name(self.server_name)
+        if self.upstream_protocol not in ("http/1.1", "h2"):
+            raise ConfigError("upstream_protocol must be http/1.1 or h2 (prior knowledge)")
+        if (type(self.cipher_suites) is not tuple or not self.cipher_suites
+                or any(type(value) is not int or value not in range(0x1301, 0x1306)
+                       for value in self.cipher_suites)
+                or len(set(self.cipher_suites)) != len(self.cipher_suites)):
+            raise ConfigError("cipher_suites must be distinct supported TLS 2.0 suite IDs")
+        if type(self.record_size_limit) is not int or not 64 <= self.record_size_limit <= 16385:
+            raise ConfigError("record_size_limit must be an integer from 64 through 16385")
+        if (type(self.certificate_compression) is not tuple
+                or any(type(value) is not int or value not in (1, 2, 3) for value in self.certificate_compression)
+                or len(set(self.certificate_compression)) != len(self.certificate_compression)):
+            raise ConfigError("certificate_compression must contain distinct codec IDs 1, 2, 3")
+        if type(self.heartbeat_mode) is not int or self.heartbeat_mode not in (0, 1, 2):
+            raise ConfigError("heartbeat_mode must be 0 (off), 1 (allow), or 2 (deny requests)")
+        if type(self.ticket_count_limit) is not int or not 0 <= self.ticket_count_limit <= 255:
+            raise ConfigError("ticket_count_limit must fit uint8")
         for name in ("certificate_chain", "private_key"):
             if not isinstance(getattr(self, name), Path):
                 raise ConfigError(f"{name} must be a pathlib.Path")
+        if self.profile_file is not None and not isinstance(self.profile_file, Path):
+            raise ConfigError("profile_file must be a pathlib.Path")
         _positive_integer("max_connections", self.max_connections)
         _positive_integer("max_bytes_per_direction", self.max_bytes_per_direction)
         for name in (
@@ -86,6 +114,8 @@ class Config:
             raise ConfigError("early_data_paths contains duplicate paths")
         if self.early_data_paths and (not self.session_tickets or not self.upstream_early_data_aware):
             raise ConfigError("Early HTTP requires session_tickets and an explicitly early-data-aware upstream")
+        if self.early_data_paths and self.upstream_protocol != "http/1.1":
+            raise ConfigError("The route-aware early HTTP gate requires an HTTP/1.1 backend")
 
 
 def _positive_integer(name: str, value: object) -> None:
@@ -141,18 +171,10 @@ def parse_endpoint(value: object, *, loopback: bool = False) -> Endpoint:
 
 
 def _validate_server_name(value: object) -> None:
-    if not isinstance(value, str) or not 1 <= len(value) <= 253:
-        raise ConfigError("server_name must be an ASCII DNS name of 1 to 253 characters")
-    if not value.isascii() or value != value.lower():
-        raise ConfigError("server_name must be a lowercase ASCII DNS name")
-    for label in value.split("."):
-        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label):
-            raise ConfigError("server_name contains an invalid DNS label")
     try:
-        ipaddress.ip_address(value)
-    except ValueError:
-        return
-    raise ConfigError("server_name must be a DNS name, not an IP address")
+        validate_service_identity(value)
+    except ProtocolError as exc:
+        raise ConfigError("server_name must be a lowercase ASCII DNS name or canonical IP identity") from exc
 
 
 def _path(value: object, name: str, directory: Path) -> Path:
@@ -184,6 +206,11 @@ def load_config(path: str | Path) -> Config:
         # Do not repeat arbitrary user-controlled TOML keys in a log message.
         raise ConfigError("Configuration contains unsupported keys")
     defaults = Config()
+    for name in ("cipher_suites", "certificate_compression"):
+        if name in values:
+            if type(values[name]) is not list:
+                raise ConfigError(f"{name} must be an array of numeric IDs")
+            values[name] = tuple(values[name])
     if "early_data_paths" in values:
         if type(values["early_data_paths"]) is not list:
             raise ConfigError("early_data_paths must be an array of paths")
@@ -194,4 +221,6 @@ def load_config(path: str | Path) -> Config:
     )
     for name in ("certificate_chain", "private_key"):
         values[name] = _path(values.get(name, str(getattr(defaults, name))), name, config_path.parent)
+    if "profile_file" in values:
+        values["profile_file"] = _path(values["profile_file"], "profile_file", config_path.parent)
     return Config(**values)

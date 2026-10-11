@@ -2,6 +2,15 @@
 # and configure your firewall. This is an experimental port, not an assignment.
 listen = "127.0.0.1:343"
 upstream = "127.0.0.1:8080"
+# The backend must actually speak this protocol. h2 means cleartext HTTP/2
+# prior knowledge, not an HTTP/1.1 Upgrade request or a protocol translator.
+upstream_protocol = "http/1.1"
+# AES-128-GCM, AES-256-GCM/SHA-384, ChaCha20-Poly1305, AES-CCM, AES-CCM-8.
+cipher_suites = [0x1301, 0x1302, 0x1303, 0x1304, 0x1305]
+record_size_limit = 16385 # Includes inner content type and padding
+certificate_compression = [1, 2, 3] # zlib, Brotli, Zstandard; [] disables
+heartbeat_mode = 0 # 0 disabled, 1 allow peer probes, 2 deny peer probes
+ticket_count_limit = 1 # Local per-handshake limit; requested counts are hints
 server_name = "localhost"
 certificate_chain = "lab/fullchain.pem"
 private_key = "lab/server.key"

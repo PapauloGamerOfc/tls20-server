@@ -1,0 +1,298 @@
+"""Certificate selection hints and constraints (RFC 9846 sections 4.3.4/5).
+
+These helpers select local credentials; they do not establish trust, authorize
+an identity, or replace proof of possession. CA names are preferences, not trust
+anchors. OID filters are mandatory only for extension semantics understood here.
+Certificate values are read through cryptography's X.509 provider.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+from cryptography import x509
+from cryptography.x509.oid import ExtensionOID, ExtendedKeyUsageOID
+
+from .errors import ProtocolError
+from .pki import _load_pkix_der, certificate_extensions
+
+
+CERTIFICATE_AUTHORITIES = 47
+OID_FILTERS = 48
+_KU = ExtensionOID.KEY_USAGE.dotted_string
+_EKU = ExtensionOID.EXTENDED_KEY_USAGE.dotted_string
+
+
+def _vector(value: bytes, width: int) -> bytes:
+    if not isinstance(value, bytes) or len(value) >= 1 << (width * 8):
+        raise ProtocolError("certificate selection vector overflow")
+    return len(value).to_bytes(width, "big") + value
+
+
+def _take(data: bytes, offset: int, width: int) -> tuple[bytes, int]:
+    if offset + width > len(data):
+        raise ProtocolError("truncated certificate selection vector")
+    size = int.from_bytes(data[offset:offset + width], "big")
+    offset += width
+    if size > len(data) - offset:
+        raise ProtocolError("truncated certificate selection vector")
+    return data[offset:offset + size], offset + size
+
+
+def _der(data: bytes, offset: int = 0) -> tuple[int, bytes, int]:
+    """Minimal definite-length DER envelope, bounded by the enclosing vector."""
+    if offset + 2 > len(data):
+        raise ProtocolError("truncated selection DER")
+    tag, size = data[offset:offset + 2]
+    offset += 2
+    if tag & 31 == 31:
+        raise ProtocolError("unsupported selection DER tag")
+    if size & 128:
+        count = size & 127
+        if not count or count > 3 or offset + count > len(data) or data[offset] == 0:
+            raise ProtocolError("invalid selection DER length")
+        size = int.from_bytes(data[offset:offset + count], "big")
+        offset += count
+        if size < 128:
+            raise ProtocolError("non-minimal selection DER length")
+    if size > len(data) - offset:
+        raise ProtocolError("truncated selection DER value")
+    return tag, data[offset:offset + size], offset + size
+
+
+def _single_der(data: bytes, tag: int) -> bytes:
+    actual, value, end = _der(data)
+    if actual != tag or end != len(data):
+        raise ProtocolError("unexpected selection DER structure")
+    return value
+
+
+def _oid(data: bytes) -> str:
+    raw = _single_der(data, 6)
+    if not raw:
+        raise ProtocolError("empty selection OID")
+    arcs, value, start = [], 0, True
+    for item in raw:
+        if start and item == 128:
+            raise ProtocolError("non-minimal selection OID")
+        value = (value << 7) | (item & 127)
+        start = not bool(item & 128)
+        if start:
+            arcs.append(value)
+            value = 0
+    if not start:
+        raise ProtocolError("truncated selection OID")
+    first = min(arcs[0] // 40, 2)
+    return ".".join(str(item) for item in (first, arcs[0] - 40 * first, *arcs[1:]))
+
+
+def _length(value: bytes) -> bytes:
+    size = len(value)
+    if size < 128:
+        return bytes((size,)) + value
+    raw = size.to_bytes((size.bit_length() + 7) // 8, "big")
+    return bytes((128 | len(raw),)) + raw + value
+
+
+def _oid_der(value) -> bytes:
+    if isinstance(value, bytes):
+        _oid(value)
+        return value
+    try:
+        oid = value if isinstance(value, x509.ObjectIdentifier) else x509.ObjectIdentifier(value)
+        arcs = [int(item) for item in oid.dotted_string.split(".")]
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ProtocolError("invalid selection OID") from exc
+    output = bytearray()
+    for arc in (40 * arcs[0] + arcs[1], *arcs[2:]):
+        current = [arc & 127]
+        while arc >> 7:
+            arc >>= 7
+            current.insert(0, 128 | (arc & 127))
+        output.extend(current)
+    encoded = b"\x06" + _length(bytes(output))
+    if len(encoded) > 255:
+        raise ProtocolError("selection OID too large")
+    return encoded
+
+
+def _name(data: bytes) -> None:
+    """Check DER Name framing without interpreting its authorization meaning."""
+    sequence = _single_der(data, 48)
+    offset = 0
+    while offset < len(sequence):
+        tag, rdn, offset = _der(sequence, offset)
+        if tag != 49 or not rdn:
+            raise ProtocolError("invalid authority RDN")
+        cursor, previous = 0, b""
+        while cursor < len(rdn):
+            start = cursor
+            tag, attribute, cursor = _der(rdn, cursor)
+            encoded = rdn[start:cursor]
+            if tag != 48 or (previous and encoded < previous):
+                raise ProtocolError("invalid authority attribute or DER ordering")
+            previous = encoded
+            _, _, oid_end = _der(attribute)
+            _oid(attribute[:oid_end])
+            _, _, end = _der(attribute, oid_end)
+            if end != len(attribute):
+                raise ProtocolError("trailing authority attribute data")
+
+
+def parse_certificate_authorities(data: bytes) -> tuple[bytes, ...]:
+    names, end = _take(data, 0, 2)
+    if end != len(data) or len(names) < 3:
+        raise ProtocolError("invalid certificate_authorities list")
+    offset, output = 0, []
+    while offset < len(names):
+        value, offset = _take(names, offset, 2)
+        if not value:
+            raise ProtocolError("empty authority name")
+        _name(value)
+        output.append(value)
+    return tuple(output)
+
+
+def encode_certificate_authorities(names) -> bytes:
+    body = _vector(b"".join(_vector(name.public_bytes() if isinstance(name, x509.Name) else name, 2)
+                              for name in names), 2)
+    parse_certificate_authorities(body)
+    return body
+
+
+def _requested_usage(value: bytes) -> frozenset[int]:
+    bits = _single_der(value, 3)
+    if not bits or bits[0] > 7 or (len(bits) == 1 and bits[0]) or len(bits) > 3:
+        raise ProtocolError("invalid keyUsage filter")
+    unused, raw = bits[0], bits[1:]
+    if raw and (raw[-1] & ((1 << unused) - 1) or raw[-1] == 0):
+        raise ProtocolError("non-minimal keyUsage filter")
+    if raw and unused != (raw[-1] & -raw[-1]).bit_length() - 1:
+        raise ProtocolError("non-minimal keyUsage filter bit length")
+    count = len(raw) * 8 - unused
+    if count > 9:
+        raise ProtocolError("undefined keyUsage filter bit")
+    return frozenset(index for index in range(count) if raw[index // 8] & (128 >> (index % 8)))
+
+
+def _requested_eku(value: bytes) -> frozenset[str]:
+    body = _single_der(value, 48)
+    if not body:
+        raise ProtocolError("empty encoded extendedKeyUsage filter")
+    output, offset = set(), 0
+    while offset < len(body):
+        start = offset
+        _, _, offset = _der(body, offset)
+        oid = _oid(body[start:offset])
+        if oid == ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE.dotted_string:
+            raise ProtocolError("anyExtendedKeyUsage is forbidden in an OID filter")
+        output.add(oid)
+    return frozenset(output)
+
+
+def parse_oid_filters(data: bytes) -> tuple[tuple[str, bytes], ...]:
+    body, end = _take(data, 0, 2)
+    if end != len(data):
+        raise ProtocolError("trailing oid_filters data")
+    output, seen, offset = [], set(), 0
+    while offset < len(body):
+        encoded_oid, offset = _take(body, offset, 1)
+        value, offset = _take(body, offset, 2)
+        oid = _oid(encoded_oid)
+        if oid in seen:
+            raise ProtocolError("duplicate certificate extension OID filter")
+        seen.add(oid)
+        if value and oid == _KU:
+            _requested_usage(value)
+        elif value and oid == _EKU:
+            _requested_eku(value)
+        output.append((oid, value))
+    return tuple(output)
+
+
+def encode_oid_filters(filters) -> bytes:
+    parts = []
+    for oid, value in filters:
+        if isinstance(value, (x509.KeyUsage, x509.ExtendedKeyUsage)):
+            value = value.public_bytes()
+        parts.append(_vector(_oid_der(oid), 1) + _vector(value, 2))
+    output = _vector(b"".join(parts), 2)
+    parse_oid_filters(output)
+    return output
+
+
+def _request_extensions(extensions) -> dict[int, bytes]:
+    result = {}
+    for kind, value in (extensions.items() if isinstance(extensions, Mapping) else extensions):
+        if kind in result:
+            raise ProtocolError("duplicate certificate request extension")
+        result[kind] = value
+    if CERTIFICATE_AUTHORITIES in result:
+        parse_certificate_authorities(result[CERTIFICATE_AUTHORITIES])
+    if OID_FILTERS in result:
+        parse_oid_filters(result[OID_FILTERS])
+    return result
+
+
+def _certificate_usage(value: x509.KeyUsage) -> frozenset[int]:
+    flags = (value.digital_signature, value.content_commitment, value.key_encipherment,
+             value.data_encipherment, value.key_agreement, value.key_cert_sign,
+             value.crl_sign, value.encipher_only if value.key_agreement else False,
+             value.decipher_only if value.key_agreement else False)
+    return frozenset(index for index, enabled in enumerate(flags) if enabled)
+
+
+def match_credentials(credentials, request_extensions) -> bool:
+    """Apply mandatory recognized OID filters, not CA preference or trust.
+
+    For delegated credentials the filters apply to the delegating certificate.
+    A raw public key has no certificate extensions and cannot satisfy KU/EKU
+    presence requirements. Unknown extension semantics are explicitly ignored.
+    """
+    extensions = _request_extensions(request_extensions)
+    filters = parse_oid_filters(extensions.get(OID_FILTERS, b"\0\0"))
+    recognized = [(oid, value) for oid, value in filters if oid in (_KU, _EKU)]
+    if not recognized:
+        return True
+    if credentials.credential_type != 0 or not credentials.chain_der:
+        return False
+    cert = _load_pkix_der(credentials.chain_der[0])
+    for oid, requested in recognized:
+        try:
+            actual = certificate_extensions(cert).get_extension_for_oid(x509.ObjectIdentifier(oid)).value
+        except x509.ExtensionNotFound:
+            return False
+        if not requested:
+            continue
+        if oid == _KU and not _requested_usage(requested) <= _certificate_usage(actual):
+            return False
+        if oid == _EKU and not _requested_eku(requested) <= {item.dotted_string for item in actual}:
+            return False
+    return True
+
+
+def preferred_credentials(candidates, request_extensions) -> tuple:
+    """Stable candidates satisfying OID filters, preferred CA matches first.
+
+    A leaf issuer matches even when the CA is omitted from the outgoing chain.
+    Other CA names match actual CA subjects only, never a non-CA leaf subject.
+    RPKs are neutral to CA preferences. This function does not authorize peers.
+    """
+    extensions = _request_extensions(request_extensions)
+    names = set(parse_certificate_authorities(extensions[CERTIFICATE_AUTHORITIES])) if CERTIFICATE_AUTHORITIES in extensions else set()
+    ranked = []
+    for credential in candidates:
+        if not match_credentials(credential, extensions):
+            continue
+        preferred = not names or credential.credential_type != 0
+        if names and credential.credential_type == 0 and credential.chain_der:
+            certificates = [_load_pkix_der(value) for value in credential.chain_der]
+            preferred = certificates[0].issuer.public_bytes() in names
+            for cert in certificates[1:]:
+                try:
+                    is_ca = certificate_extensions(cert).get_extension_for_class(x509.BasicConstraints).value.ca
+                except x509.ExtensionNotFound:
+                    is_ca = False
+                preferred |= is_ca and cert.subject.public_bytes() in names
+        ranked.append((not preferred, credential))
+    return tuple(item[1] for item in sorted(ranked, key=lambda item: item[0]))
