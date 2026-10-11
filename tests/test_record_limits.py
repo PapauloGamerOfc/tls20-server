@@ -6,6 +6,7 @@ from tls20_server import messages as m
 from tls20_server.errors import ProtocolError
 from tls20_server.handshake import Wire, _peer_record_limit
 from tests import test_sessions
+from tests.early_data_helpers import assert_early_record_overflow
 
 
 class RecordLimitTests(unittest.TestCase):
@@ -117,14 +118,15 @@ class RecordLimitNetworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_omitting_rsl_does_not_relax_early_receive_limit(self):
         self.server_options = {"record_size_limit": 64}
-        await self.connect(record_size_limit=512)
-        old = next(iter(self.cache._tickets.values()))
-        self.assertEqual(self.store._tickets[old.identity].record_size_limit, 64)
-        old.record_size_limit = 16385  # Model a nonconforming early sender.
-        with self.assertRaises(ProtocolError) as failure:
-            await self.connect(early_data=b"x" * 100)
-        self.assertEqual(failure.exception.alert, 22)
-        self.assertFalse(self.early)
+        for delayed in (False, True):
+            with self.subTest(finish_after_rejection=delayed):
+                self.cache._tickets.clear()
+                await self.connect(record_size_limit=512)
+                old = next(iter(self.cache._tickets.values()))
+                self.assertEqual(self.store._tickets[old.identity].record_size_limit, 64)
+                old.record_size_limit = 16385  # Model a nonconforming early sender.
+                await assert_early_record_overflow(self, lambda: self.connect(early_data=b"x" * 100),
+                                                  finish_after_rejection=delayed)
 
     async def test_external_psk_early_limit_is_provisioned_independently_of_new_rsl(self):
         from dataclasses import replace
@@ -139,10 +141,11 @@ class RecordLimitNetworkTests(unittest.IsolatedAsyncioTestCase):
         self.cache._tickets.clear()
         self.early.clear()
         self.server_options["external_psks"] = (replace(key, record_size_limit=64),)
-        with self.assertRaises(ProtocolError) as failure:
-            await self.connect(external_psk=key, early_data=b"x" * 100)
-        self.assertEqual(failure.exception.alert, 22)
-        self.assertFalse(self.early)
+        for delayed in (False, True):
+            with self.subTest(finish_after_rejection=delayed):
+                await assert_early_record_overflow(self,
+                    lambda: self.connect(external_psk=key, early_data=b"x" * 100),
+                    finish_after_rejection=delayed)
 
     async def test_rsl_ignores_malformed_and_unknown_mfl(self):
         self.server_options = {"record_size_limit": 128}

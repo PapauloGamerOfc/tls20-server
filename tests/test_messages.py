@@ -55,6 +55,35 @@ class MessageTests(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 m.validate_service_identity(offered.decode())
 
+    def test_proactive_password_suite_classification_ignores_unknown_values(self):
+        # This is a structurally valid P-256 commit; native point validation is
+        # covered by the real password handshake regression.
+        commit = bytes(64) + b"\x01\x02"
+        for suites, accepted in (((0xc0b0,), True),
+                                 ((0x0a0a, 0xc0b0, 0xfefe), True),
+                                 ((0xc0b2, 0x0a0a, 0xc0b0), True),
+                                 ((0x0a0a, 0x1301, 0xc0b0), False),
+                                 ((0xc0b1, 0xfefe, 0xc0b0), False)):
+            with self.subTest(suites=suites):
+                hello = m.client_hello(b"", commit, "example.test", self.random,
+                    cipher_suites=suites, certificate_algorithms=(), group=23,
+                    supported_groups=(23,), extra_extensions=((30, b"\x05alice"),),
+                    password_authenticated=True)
+                if accepted:
+                    parsed = m.parse_client_hello(hello[4:])
+                    self.assertEqual(parsed.B, commit)
+                    self.assertEqual(parsed.cipher_suites, suites)
+                else:
+                    with self.assertRaises(ProtocolError) as failure:
+                        m.parse_client_hello(hello[4:])
+                    self.assertEqual(failure.exception.alert, 47)
+                    # The same known mixed offer is legal with an empty CH1.
+                    empty = m.client_hello(b"", commit, "example.test", self.random,
+                        cipher_suites=suites, certificate_algorithms=(), group=23,
+                        supported_groups=(23,), extra_extensions=((30, b"\x05alice"),),
+                        password_authenticated=True, empty_share=True)
+                    self.assertFalse(m.parse_client_hello(empty[4:]).B)
+
     def test_client_hello_exact_consumption_and_mutations(self):
         body = self.ch[4:]
         for length in range(len(body)):

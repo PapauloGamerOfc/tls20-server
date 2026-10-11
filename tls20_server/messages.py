@@ -346,8 +346,10 @@ def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticat
         if not username:
             raise ProtocolError("empty password account identity", alert=47)
     if password_authenticated is None:
-        pwd_only = all(value in c.CIPHER_SUITES and c.suite(value).password_authenticated
-                       for value in cipher_suites)
+        # Unknown/GREASE suites do not offer an ordinary authentication mode.
+        # Keep their bytes in the transcript, but classify only known suites.
+        pwd_only = all(c.suite(value).password_authenticated
+                       for value in cipher_suites if value in c.CIPHER_SUITES)
         password_authenticated = bool(names and pwd_only and len({value.hash_name for value in pwd_suites}) == 1)
         if names and shares.data and not password_authenticated:
             raise ProtocolError("mixed PWD hashes or modes require empty initial key shares", alert=47)

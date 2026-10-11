@@ -13,6 +13,7 @@ from tls20_server.pake_native import PakeProvider
 from tls20_server.pake import PasswordCredential, PasswordAccount, PasswordServer, SUITES
 from tls20_server.tickets import SessionTicket, TicketCache, TicketStore
 from tls20_server.handshake import Wire
+from tests.early_data_helpers import assert_early_record_overflow
 
 
 @unittest.skipUnless(os.environ.get("TLS20_TEST_PAKE") and os.environ.get("TLS20_TEST_OPENSSL"), "explicit native PAKE fixture required")
@@ -82,6 +83,80 @@ class PakeHandshakeTests(unittest.IsolatedAsyncioTestCase):
                     await second.send(b"application")
                     self.assertEqual(await second.recv(),b"application")
         self.assertFalse(self.errors)
+
+    async def test_proactive_password_offer_ignores_unknown_suites_not_known_modes(self):
+        from tls20_server import crypto as c, messages as m
+        from tls20_server.handshake import Transcript, handshake_keys, application_keys
+        account = PasswordAccount.provision("alice", "correct horse", salted=False)
+        self.policy = PasswordServer("localhost", self.provider, [account])
+        self.options = {"cipher_suites": (0xc0b0,)}
+        for suites, accepted in (((0xc0b0,), True),
+                                 ((0x0a0a, 0xc0b0), True),
+                                 ((0xc0b0, 0xfefe), True),
+                                 ((0xc0b2, 0x0a0a, 0xc0b0), True),
+                                 ((0x0a0a, 0x1301, 0xc0b0), False),
+                                 ((0xc0b1, 0xfefe, 0xc0b0), False)):
+            with self.subTest(suites=suites):
+                before, errors = len(self.channels), len(self.errors)
+                random = os.urandom(32)
+                state = self.provider.create(account.base, random, group=23, hash_name="sha256")
+                records = []
+                try:
+                    hello = m.client_hello(b"", state.commit(), "localhost", random,
+                        cipher_suites=suites, certificate_algorithms=(), group=23,
+                        supported_groups=(23,), extra_extensions=(self.credential.name_extension(),),
+                        password_authenticated=True)
+                    reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+                    self.writers.append(writer)
+                    wire = Wire(reader, writer)
+                    writer.write(c.PREFACE)
+                    await wire.send_frame(hello)
+                    if not accepted:
+                        with self.assertRaises(ProtocolError) as failure:
+                            await asyncio.wait_for(wire.receive_frame(2), 2)
+                        self.assertEqual(failure.exception.alert, 47)
+                        self.assertEqual(len(self.channels), before)
+                        self.assertEqual(len(self.errors), errors + 1)
+                        self.assertEqual(self.errors[-1].alert, 47)
+                        continue
+                    server_hello = await asyncio.wait_for(wire.receive_frame(2), 2)
+                    public, _, resumed, group, retry, _, suite = m.parse_server_hello(
+                        server_hello[4:], with_suite=True)
+                    self.assertFalse(retry)
+                    self.assertFalse(resumed)
+                    self.assertEqual((group, suite), (23, 0xc0b0))
+                    transcript = Transcript()
+                    transcript.add(hello)
+                    transcript.add(server_hello)
+                    root = c.handshake_secret(state.finish(public))
+                    client_secret, server_secret = handshake_keys(root, transcript)
+                    sender = c.RecordState(client_secret, "seal", suite)
+                    records.append(sender)
+                    receiver = c.RecordState(server_secret, "open", suite)
+                    records.append(receiver)
+                    ee = await asyncio.wait_for(wire.receive_frame(8, receiver), 2)
+                    m.parse_encrypted_extensions(ee[4:], b"http/1.1")
+                    transcript.add(ee)
+                    finished = await asyncio.wait_for(wire.receive_frame(20, receiver), 2)
+                    self.assertTrue(c.verify_finished(server_secret, transcript.snapshot(), finished[4:]))
+                    transcript.add(finished)
+                    _, server_app = application_keys(root, transcript)
+                    await wire.send_frame(m.frame(20, c.finished(client_secret, transcript.snapshot())), sender)
+                    app = c.RecordState(server_app, "open", suite)
+                    records.append(app)
+                    content, kind = await asyncio.wait_for(wire.read_record(app), 2)
+                    self.assertEqual(kind, 22)
+                    ticket_kind, ticket_body = m.decode_frame(content)
+                    self.assertEqual(ticket_kind, 4)
+                    m.parse_new_session_ticket(ticket_body)
+                    content, kind = await asyncio.wait_for(wire.read_record(app), 2)
+                    self.assertEqual((content, kind), (b"ready", 23))
+                    self.assertEqual(len(self.channels), before + 1)
+                    self.assertEqual(len(self.errors), errors)
+                finally:
+                    state.close()
+                    for record in records:
+                        record.close()
 
     async def test_wrong_password_unknown_account_and_revoked_ticket(self):
         for name,password in (("alice","wrong"),("unknown","correct horse")):
@@ -483,14 +558,15 @@ class PakeHandshakeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_password_early_limit_cannot_be_relaxed_by_omitting_rsl(self):
         self.options = {"record_size_limit": 64}
-        await self.connect(record_size_limit=512)
-        previous = next(iter(self.cache._tickets.values()))
-        self.assertEqual(self.store._tickets[previous.identity].record_size_limit, 64)
-        previous.record_size_limit = 16385  # Model a nonconforming early sender.
-        with self.assertRaises(ProtocolError) as failure:
-            await self.connect(early_data=b"x" * 100)
-        self.assertEqual(failure.exception.alert, 22)
-        self.assertFalse(self.early)
+        for delayed in (False, True):
+            with self.subTest(finish_after_rejection=delayed):
+                self.cache._tickets.clear()
+                await self.connect(record_size_limit=512)
+                previous = next(iter(self.cache._tickets.values()))
+                self.assertEqual(self.store._tickets[previous.identity].record_size_limit, 64)
+                previous.record_size_limit = 16385  # Model a nonconforming early sender.
+                await assert_early_record_overflow(self, lambda: self.connect(early_data=b"x" * 100),
+                                                  finish_after_rejection=delayed)
 
     async def test_consumed_early_ticket_not_replayed_and_exporter_lifecycle(self):
         await self.connect()

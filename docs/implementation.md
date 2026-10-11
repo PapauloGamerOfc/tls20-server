@@ -361,6 +361,32 @@ and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
 
+### Password negotiation and early-record rejection validation: 2026-10-11
+
+Unknown cipher-suite codes (including GREASE) are ignored when classifying a
+proactive password offer, while remaining in the authenticated transcript.
+Known ordinary/password mixtures and incompatible password hashes still require
+an empty first key-share offer. Parser and full native-handshake regressions
+exercise valid unknown-code offers and both prohibited mixtures.
+
+Oversized 0-RTT tests now verify the server's sealed `record_overflow` alert,
+absence of delivered early data and absence of an established channel. They
+exercise both ordinary scheduling and client Finished after server rejection;
+a peer-close transport error is not sufficient by itself to pass a test.
+Negative controls confirm that wrong alerts, delivered early data and accepted
+oversized records fail these assertions.
+
+Local Windows validation completed 639 tests with native providers: 637 passed
+and two OS-specific checks were skipped. The minimal environment completed
+639 tests: 549 passed and 90 optional-provider/OS checks were skipped.
+The 108-test focused run and 32 repeated race/password regressions passed.
+All 21 portable Phromium interoperability invocations and 18 optional-provider
+commands passed. Compilation, documentation, wheel/source-archive builds and
+isolated wheel installation/CLI checks passed. Logs are under
+`build/grease-ci-*`, `build/four-fixes-overflow-negative.*` and the browser's
+`out/httpps-native/four-fixes-*`. These are local results, not a completed
+remote Linux/macOS CI run or a formal security audit.
+
 ### Retry and authenticator conformance validation: 2026-10-11
 
 The Windows suite completed 598 tests with all optional native providers
