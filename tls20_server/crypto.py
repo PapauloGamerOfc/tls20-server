@@ -29,6 +29,7 @@ ZERO32 = bytes(32)
 MAX_CONTENT = 1 << 14
 MAX_RECORDS = 1 << 20
 MAX_CONTENT_BYTES = 1 << 30
+MAX_SEND_EPOCH = (1 << 48) - 1
 INNER_TYPES = frozenset((21, 22, 23, 24))
 
 
@@ -461,11 +462,11 @@ def nonce(iv: bytes, sequence: int) -> bytes:
 
 def validate_inner(content: bytes, inner_type: int) -> None:
     if inner_type not in INNER_TYPES:
-        raise ProtocolError("invalid inner type")
+        raise ProtocolError("invalid inner type", alert=10)
     if inner_type == 22 and not content:
-        raise ProtocolError("empty handshake record")
+        raise ProtocolError("empty handshake record", alert=10)
     if inner_type == 21 and len(content) != 2:
-        raise ProtocolError("alert content must have length 2")
+        raise ProtocolError("alert content must have length 2", alert=10 if not content else 50)
 
 
 @dataclass(repr=False)
@@ -486,6 +487,7 @@ class RecordState:
     content_bytes: int = field(default=0, init=False)
     failed: bool = field(default=False, init=False)
     max_opened_plaintext: int = field(default=0, init=False)
+    epoch: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if self.operation not in ("seal", "open"):
@@ -516,7 +518,7 @@ class RecordState:
         if not 0 <= self.sequence < record_bound:
             raise ProtocolError("record count limit")
         if not 0 <= content_length <= MAX_CONTENT:
-            raise ProtocolError("record content length limit")
+            raise ProtocolError("record content length limit", alert=22)
         if self.content_bytes < 0 or operation == "seal" and self.content_bytes > MAX_CONTENT_BYTES - content_length:
             raise ProtocolError("traffic key content-byte limit")
 
@@ -543,13 +545,19 @@ class RecordState:
 
     def open(self, record: bytes) -> tuple[bytes, int]:
         try:
-            if len(record) < 6 + self.suite.tag_length or record[:3] != b"\x17\x03\x03":
-                raise ProtocolError("invalid encrypted record header")
+            if len(record) < 5:
+                raise ProtocolError("truncated encrypted record header", alert=50)
+            if record[0] != 23:
+                raise ProtocolError("unexpected encrypted record type", alert=10)
+            if record[1:3] != b"\x03\x03":
+                raise ProtocolError("invalid encrypted record version", alert=47)
             ciphertext_length = int.from_bytes(record[3:5], "big")
             if ciphertext_length != len(record) - 5:
-                raise ProtocolError("encrypted record length mismatch")
-            if not 1 + self.suite.tag_length <= ciphertext_length <= 16640:
-                raise ProtocolError("encrypted record size")
+                raise ProtocolError("encrypted record length mismatch", alert=50)
+            if ciphertext_length > 16640:
+                raise ProtocolError("encrypted record size", alert=22)
+            if ciphertext_length < self.suite.tag_length:
+                raise ProtocolError("record authentication failed", alert=20)
             self._ready("open", 0)
             iv = nonce(self.iv, self.sequence)
             plaintext = (self._cipher.decrypt_record(self.sequence,iv,record[5:],record[:5]) if self._tree_cipher
@@ -557,10 +565,10 @@ class RecordState:
             if len(plaintext) > self.record_limit:
                 raise ProtocolError("padded plaintext exceeds record limit", alert=22)
             if not plaintext:
-                raise ProtocolError("missing inner type")
+                raise ProtocolError("missing inner type", alert=10)
             stripped = plaintext.rstrip(b"\x00")
             if not stripped:
-                raise ProtocolError("missing inner type")
+                raise ProtocolError("missing inner type", alert=10)
             content, inner_type = stripped[:-1], stripped[-1]
             self._ready("open", len(content))
             validate_inner(content, inner_type)
@@ -577,6 +585,7 @@ class RecordState:
         """Probe an epoch transition; failed AEAD trial never mutates this state."""
         trial = RecordState(self.secret, self.operation, self.cipher_suite, self.record_limit, self.provider)
         trial.sequence, trial.content_bytes = self.sequence, self.content_bytes
+        trial.epoch = self.epoch
         try:
             result = trial.open(record)
         except ProtocolError:
@@ -588,7 +597,12 @@ class RecordState:
     def update(self) -> None:
         if self.failed:
             raise ProtocolError("record state is closed")
+        # The RFC bound applies only to locally sent epochs. Receivers must
+        # continue accepting conforming key updates beyond this policy bound.
+        if self.operation == "seal" and self.epoch >= MAX_SEND_EPOCH:
+            raise ProtocolError("sending key-update epoch exhausted", alert=80)
         self.secret = label_expand(self.secret, "traffic upd", b"", len(self.secret), self.hash_context)
+        self.epoch += 1
         self.sequence = self.content_bytes = 0
         self.key, self.iv = key_iv(self.secret, self.cipher_suite, self.provider)
         self._reset_cipher()

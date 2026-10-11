@@ -14,6 +14,35 @@ class GenericHandshakeTests(unittest.IsolatedAsyncioTestCase):
     handle = test_sessions.SessionTests.handle
     connect = test_sessions.SessionTests.connect
 
+    async def test_supported_groups_in_encrypted_extensions_is_advisory(self):
+        original = m.encrypted_extensions
+        def with_groups(*args, **kwargs):
+            kwargs['extra_extensions'] = (*kwargs.get('extra_extensions', ()),
+                (10, m._vec(b'\x00\x17\x00\x1d\xfe\xff', 2)))
+            return original(*args, **kwargs)
+        with patch.object(m, 'encrypted_extensions', with_groups):
+            channel = await self.connect()
+            await channel.send(b'server group preferences')
+            self.assertEqual(await channel.recv(), b'server group preferences')
+
+    async def test_malformed_or_unsolicited_ee_groups_fail(self):
+        original = m.encrypted_extensions
+        for value in (b'\x00\x00', b'\x00\x01\x1d', b'\x00\x02\x00'):
+            def with_groups(*args, **kwargs):
+                kwargs['extra_extensions'] = (*kwargs.get('extra_extensions', ()), (10, value))
+                return original(*args, **kwargs)
+            with self.subTest(value=value), patch.object(m, 'encrypted_extensions', with_groups), self.assertRaises(ProtocolError) as caught:
+                await self.connect()
+            self.assertEqual(caught.exception.alert, 50)
+        key = ExternalPSK(b'groups absent', b'explicit secret', 'localhost')
+        self.server_options = {'external_psks': (key,)}
+        def unsolicited(*args, **kwargs):
+            kwargs['extra_extensions'] = (*kwargs.get('extra_extensions', ()), (10, b'\x00\x02\x00\x1d'))
+            return original(*args, **kwargs)
+        with patch.object(m, 'encrypted_extensions', unsolicited), self.assertRaises(ProtocolError) as caught:
+            await self.connect(external_psk=key, psk_modes=(0,))
+        self.assertEqual(caught.exception.alert, 110)
+
     async def test_no_sni_or_alpn_with_out_of_band_service_identity(self):
         self.server_options = {"require_server_name": False, "require_alpn": False,
                                "application_protocols": ()}

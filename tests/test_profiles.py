@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
 
 from tls20_server.client import fetch
 from tls20_server.config import Config, Endpoint, load_config
@@ -41,6 +42,34 @@ class ProfileTests(unittest.TestCase):
 
     def profile(self, role, extra="", mode="certificate", port=343, service="localhost"):
         return self.file(role + ".toml", f'role="{role}"\nservice="{service}"\nport={port}\nmode="{mode}"\n' + extra)
+
+    def bootstrap_inventory(self):
+        server, client = '', ''
+        for index, hashes in ((0, '["sha256"]'), (1, '["sha256", "sha384"]')):
+            key = x25519.X25519PrivateKey.generate()
+            self.file(f'bsk{index}.spki', key.public_key().public_bytes(serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo))
+            self.file(f'bsk{index}.key', key.private_bytes(serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8, serialization.NoEncryption()), private=True)
+            record = (f'[[bootstrap]]\npublic_key="bsk{index}.spki"\nscope="device-{index}"\n'
+                      f'target_hashes={hashes}\n')
+            server += record
+            client += record + f'private_key="bsk{index}.key"\n'
+        return server, client
+
+    def test_multiple_bootstrap_records_and_hashes_load_without_private_key_order_assumptions(self):
+        _, inventory = self.bootstrap_inventory()
+        client = load_profile(self.profile('client', '[negotiation]\ncipher_suites=[0x1301,0x1302]\n'
+            + '[trust]\nroots="ca.pem"\n' + inventory, mode='pok'), role='client')
+        self.addCleanup(client.close)
+        self.assertEqual(len(client.bootstrap), 2)
+        self.assertEqual(len(client.bootstrap_key), 2)
+        self.assertIsNone(client.bootstrap_hash)
+        self.assertEqual(client.bootstrap[1].target_hashes, ('sha256', 'sha384'))
+        duplicate = inventory.split('[[bootstrap]]')[1]
+        with self.assertRaises(ConfigurationError):
+            load_profile(self.profile('client', '[trust]\nroots="ca.pem"\n'
+                + 2 * ('[[bootstrap]]' + duplicate), mode='pok'), role='client')
 
     def test_certificate_and_raw_key_loader(self):
         for raw in (False, True):
@@ -258,6 +287,15 @@ class ProfileNetworkTests(ProfileTests, unittest.IsolatedAsyncioTestCase):
         server='[credential]\nchain="fullchain.pem"\nprivate_key="server.key"\n'+common
         client='[trust]\nroots="ca.pem"\n'+common+'private_key="server.key"'
         await self.run_pair("pok",server,client)
+
+    async def test_configured_multiple_pok_records_select_nonfirst_hash_and_resume(self):
+        server, client = self.bootstrap_inventory()
+        server = ('[negotiation]\ncipher_suites=[0x1302]\n[credential]\n'
+                  'chain="fullchain.pem"\nprivate_key="server.key"\n' + server)
+        # Keep A/SHA256 as the first client offer; the server must select B/SHA384.
+        client = ('[negotiation]\ncipher_suites=[0x1301,0x1302]\n'
+                  '[trust]\nroots="ca.pem"\n' + client)
+        await self.run_pair('pok', server, client)
 
     @unittest.skipUnless(os.environ.get("TLS20_TEST_OPENSSL"),"Explicit SM native provider required")
     async def test_configured_sm_suite_group_and_early_relay(self):

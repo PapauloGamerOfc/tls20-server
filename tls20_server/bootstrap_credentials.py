@@ -32,7 +32,8 @@ class BootstrapBinding:
         parse_x25519_spki(self.spki)
         if (not self.service or not self.scope or self.trust_mode not in (
                 "credential-validated", "provisioning-trust") or not self.target_hashes
-                or any(value not in ("sha256", "sha384") for value in self.target_hashes)):
+                or any(value not in ("sha256", "sha384") for value in self.target_hashes)
+                or len(set(self.target_hashes)) != len(self.target_hashes)):
             raise ProtocolError("invalid explicit bootstrap provisioning binding")
         if self.expires_at is not None and self.expires_at.tzinfo is None:
             raise ProtocolError("bootstrap expiry must include its time zone")
@@ -78,6 +79,7 @@ def bootstrap_client_material(binding, *, server_mac_verified, server_finished_v
         raise ProtocolError("bootstrap public key release precedes authenticated server Finished")
     if not isinstance(binding, BootstrapBinding):
         raise ProtocolError("bootstrap provisioning binding is required")
+    _current_binding(binding)
     return (binding.spki,)
 
 
@@ -87,6 +89,7 @@ def authorize_bootstrap_client(binding, material, *, credential_type,
         raise ProtocolError("bootstrap client key differs from the selected provisioned BSK")
     if client_mac_verified is not True or client_finished_verified is not True:
         raise ProtocolError("bootstrap authorization requires client MAC and Finished")
+    _current_binding(binding)
     # Explicit provenance is also the resumption authorization label. A ticket
     # must retain scope/trust_mode and recheck inventory; this is not Web-PKI.
     return {"profile": "tls20-pok", "scope": binding.scope, "service": binding.service,
@@ -143,62 +146,89 @@ def _current_binding(binding):
     return binding
 
 
+def current_bootstrap_bindings(binding, *, service=None):
+    """Normalize explicit local inventory; expired entries confer no authority."""
+    try:
+        bindings = (binding,) if isinstance(binding, BootstrapBinding) else tuple(binding)
+    except TypeError as exc:
+        raise ProtocolError("explicit bootstrap provisioning bindings are required") from exc
+    if not bindings or any(not isinstance(value, BootstrapBinding) for value in bindings):
+        raise ProtocolError("explicit bootstrap provisioning bindings are required")
+    service = service or bindings[0].service
+    if any(value.service != service for value in bindings):
+        raise ProtocolError("bootstrap bindings belong to different services")
+    if len({value.spki for value in bindings}) != len(bindings):
+        raise ProtocolError("duplicate or ambiguous bootstrap provisioning binding")
+    moment = datetime.now(timezone.utc)
+    current = tuple(value for value in bindings if value.expires_at is None or moment < value.expires_at)
+    if not current:
+        raise ProtocolError("bootstrap provisioning binding expired")
+    return current
+
+
 async def bootstrap_server_handshake(reader, writer, credentials, binding, *,
                                       application_protocols=(b'http/1.1',), **options):
-    """One explicitly scoped provisioning endpoint with proof-bound ticket state.
-
-    Separate endpoints/policy objects may serve separate devices. This wrapper
-    deliberately does not guess which inventory key was selected from a later
-    client Certificate, nor authorize after a ticket has already been issued.
-    """
+    """Serve one binding or an explicit inventory, selecting by verified PSK."""
     from .handshake import server_handshake
-    _current_binding(binding)
+    bindings = current_bootstrap_bindings(binding)
     reserved = {'external_psks', 'bootstrap_binding', 'client_credential_policy',
                 'client_certificate_types', 'require_client_auth', 'client_auth_validator'}
     if reserved.intersection(options) or not application_protocols:
         raise ProtocolError("bootstrap security policy cannot be overridden by generic handshake options")
-    external = tuple(bootstrap_public_key_psk(binding.spki[12:], binding.service,
+    external = tuple(bootstrap_public_key_psk(value.spki[12:], value.service,
                         target_hash=hash_name, protocol=protocol)
-                     for hash_name in binding.target_hashes for protocol in application_protocols)
-    policy = CredentialPolicy(peer_name=binding.service,
-        raw_public_keys=(RawPublicKeyBinding('client', binding.service, binding.spki),))
-    channel = await server_handshake(reader, writer, credentials, binding.service,
-        external_psks=external, bootstrap_binding=binding, client_credential_policy=policy,
+                     for value in bindings for hash_name in value.target_hashes for protocol in application_protocols)
+    service = bindings[0].service
+    policy = CredentialPolicy(peer_name=service,
+        raw_public_keys=tuple(RawPublicKeyBinding('client', service, value.spki) for value in bindings))
+    channel = await server_handshake(reader, writer, credentials, service,
+        external_psks=external, bootstrap_binding=bindings, client_credential_policy=policy,
         client_certificate_types=(2,), require_client_auth=True,
         application_protocols=application_protocols, **options)
-    if getattr(channel, 'bootstrap_binding', None) != binding or not getattr(channel, 'bootstrap_authorization', None):
+    if getattr(channel, 'bootstrap_binding', None) not in bindings or not getattr(channel, 'bootstrap_authorization', None):
         channel.wire.writer.transport.abort()
         raise ProtocolError("bootstrap handshake did not establish its selected scoped authority")
     return channel
 
 
 async def bootstrap_client_handshake(reader, writer, binding, private_key, trust_roots=(), *,
-                                      revocation_policy='offline', target_hash='sha256',
+                                      revocation_policy='offline', target_hash=None,
                                       application_protocols=(b'http/1.1',), **options):
-    """Perform explicitly selected POK; no certificate-error downgrade is possible."""
+    """Offer one binding/key or inventories; release only the authenticated choice.
+
+    With target_hash omitted, offer every authorized compatible KDF. Private
+    keys may be supplied in any order and are matched by their exact SPKI.
+    """
     from .handshake import client_handshake
     from cryptography.hazmat.primitives import serialization
-    _current_binding(binding)
-    reserved = {'external_psk', 'bootstrap_binding', 'client_credentials', 'cache_context'}
-    if reserved.intersection(options) or not application_protocols or target_hash not in binding.target_hashes:
+    bindings = current_bootstrap_bindings(binding)
+    reserved = {'external_psk', 'external_psks', 'bootstrap_binding', 'client_credentials',
+                'client_credential_candidates', 'cache_context'}
+    if (reserved.intersection(options) or not application_protocols
+            or target_hash is not None and not any(target_hash in value.target_hashes for value in bindings)):
         raise ProtocolError("invalid bootstrap client configuration")
-    if not isinstance(private_key, x25519.X25519PrivateKey):
-        raise ProtocolError("bootstrap client private key must be X25519")
-    public = private_key.public_key().public_bytes(serialization.Encoding.DER,
-                                                   serialization.PublicFormat.SubjectPublicKeyInfo)
-    if not hmac.compare_digest(public, binding.spki):
+    try:
+        keys = (private_key,) if isinstance(private_key, x25519.X25519PrivateKey) else tuple(private_key)
+    except TypeError as exc:
+        raise ProtocolError("bootstrap client private keys must be X25519") from exc
+    if not keys or any(not isinstance(key, x25519.X25519PrivateKey) for key in keys):
+        raise ProtocolError("bootstrap client private keys must be X25519")
+    keyed = {key.public_key().public_bytes(serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo): key for key in keys}
+    if len(keyed) != len(keys) or any(value.spki not in keyed for value in bindings):
         raise ProtocolError("bootstrap private key differs from the provisioned BSK")
-    credentials = Credentials([binding.spki], private_key, credential_type=2)
-    external = bootstrap_public_key_psk(binding.spki[12:], binding.service,
-                                        target_hash=target_hash, protocol=application_protocols[0])
-    options.setdefault('cipher_suites', (external.cipher_suite,))
+    credentials = tuple(Credentials([value.spki], keyed[value.spki], credential_type=2) for value in bindings)
+    service = bindings[0].service
+    external = tuple(bootstrap_public_key_psk(value.spki[12:], service,
+        target_hash=hash_name, protocol=application_protocols[0]) for value in bindings
+        for hash_name in value.target_hashes if target_hash is None or hash_name == target_hash)
+    options.setdefault('cipher_suites', tuple(dict.fromkeys(value.cipher_suite for value in external)))
     options.setdefault('normal_httpps', False)  # This API explicitly selects a provisioning application.
-    channel = await client_handshake(reader, writer, binding.service, trust_roots,
-        revocation_policy=revocation_policy, external_psk=external,
-        bootstrap_binding=binding, client_credentials=credentials,
-        cache_context=bootstrap_binding_fingerprint(binding),
+    channel = await client_handshake(reader, writer, service, trust_roots,
+        revocation_policy=revocation_policy, external_psks=external,
+        bootstrap_binding=bindings, client_credential_candidates=credentials,
         application_protocols=application_protocols, **options)
-    if getattr(channel, 'bootstrap_binding', None) != binding or not getattr(channel, 'bootstrap_authorization', None):
+    if getattr(channel, 'bootstrap_binding', None) not in bindings or not getattr(channel, 'bootstrap_authorization', None):
         channel.wire.writer.transport.abort()
         raise ProtocolError("bootstrap client did not establish its explicit provisioning scope")
     return channel

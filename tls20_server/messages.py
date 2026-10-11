@@ -563,6 +563,8 @@ def parse_encrypted_extensions(body: bytes, protocol: bytes = HTTP_PROTOCOL, *, 
         raise ProtocolError("required application protocol missing", alert=120)
     if 42 in ext and not offered_early:
         raise ProtocolError("unsolicited early_data selection", alert=110)
+    if 10 in ext:
+        _u16_list(ext[10])  # Server preferences are advisory, not a new share selection.
     return (42 in ext, selected, ext) if with_extensions else (42 in ext, selected) if details else 42 in ext
 
 

@@ -311,3 +311,38 @@ class ExternalHandshakeTests(unittest.IsolatedAsyncioTestCase):
         ch = await self.connect(external_psk=key, early_data=b"authorized")
         self.assertTrue(ch.early_data_accepted)
         self.assertEqual(self.early, [b"authorized", b""])
+
+    async def test_external_replay_identifier_ignores_unverified_secondary_binders(self):
+        selected = ExternalPSK(b"selected replay key", b"correct secret", "localhost", max_early_data=4096)
+        unused = ExternalPSK(b"unused replay key", b"other secret", "localhost")
+        seen, observations = set(), []
+        def authorize(psk, identifier):
+            observations.append(identifier)
+            if identifier in seen:
+                return False
+            seen.add(identifier)
+            return True
+        self.server_options = {'external_psks': (selected,), 'external_early_replay': authorize}
+        _, auth = c.traffic_key(29)
+        _, share = c.traffic_key(29)
+        placeholders = ((selected.identity, 0, bytes(32)), (unused.identity, 0, bytes(32)))
+        hello = m.client_hello(auth, share, 'localhost', bytes(32), early_data=True, psk_offers=placeholders)
+        parsed = m.parse_client_hello(hello[4:])
+        truncated = hello[:-parsed.binder_vector_size]
+        proof = c.binder(selected.psk, c.PREFACE + truncated, kind='ext')
+        for secondary_proof in (bytes(32), b'x' * 32):
+            reader, writer = await asyncio.open_connection('127.0.0.1', self.port)
+            self.writers.append(writer)
+            changed = m.client_hello(auth, share, 'localhost', bytes(32), early_data=True,
+                psk_offers=((selected.identity, 0, proof), (unused.identity, 0, secondary_proof)))
+            writer.write(c.PREFACE + b'\x16\x03\x03' + len(changed).to_bytes(2, 'big') + changed)
+            await writer.drain()
+            # Server invokes the replay policy before sending its ServerHello;
+            # no client Finished or early-record authentication is needed here.
+            header = await asyncio.wait_for(reader.readexactly(5), 2)
+            await reader.readexactly(int.from_bytes(header[3:5], 'big'))
+            writer.transport.abort()
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(observations[0], observations[1])
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(self.early)

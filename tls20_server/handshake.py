@@ -94,8 +94,10 @@ class Wire:
         # the Hello is the authenticated selection. Ciphertext uses 0x0303.
         if kind == 23 and version != b"\x03\x03":
             raise ProtocolError("invalid record framing version", alert=47)
-        if not 1 <= length <= (16640 if kind == 23 else 16384):
+        if length > (16640 if kind == 23 else 16384):
             raise ProtocolError("invalid record length", alert=22)
+        if length == 0 and kind in (21, 22):
+            raise ProtocolError("empty handshake or alert record", alert=10)
         self.count()
         fragment = await self.exact(length)
         return header + fragment
@@ -264,6 +266,7 @@ class SecureChannel:
         self.pending_client_auth = {}
         self._active_client_auth = None
         self._seen_auth_contexts = set()
+        self._key_update_requested = False
 
     def _clear_auth(self):
         for access in getattr(self, "_exporter_accesses", ()):
@@ -447,8 +450,7 @@ class SecureChannel:
         # One complete heartbeat per record, never a handshake-type24 frame.
         if (self.sender.sequence >= c.MAX_RECORDS - 1
                 or self.sender.content_bytes + len(content) + 5 > c.MAX_CONTENT_BYTES):
-            await self.wire.send_frame(m.frame(24, b"\x00"), self.sender)
-            self.sender.update()
+            await self._key_update_locked(False)
         self.wire.writer.write(self.sender.seal(content, 24))
         await self.wire.writer.drain()
 
@@ -505,12 +507,29 @@ class SecureChannel:
         async with self.send_lock:
             if self.closed or self.sent_close:
                 raise ProtocolError("connection is closing")
+            if request_peer and self._key_update_requested:
+                raise ProtocolError("a peer key update is already pending")
+            if self.sender.epoch >= c.MAX_SEND_EPOCH:
+                raise ProtocolError("sending key-update epoch exhausted", alert=80)
             try:
-                await self.wire.send_frame(m.frame(24, bytes((int(bool(request_peer)),))), self.sender)
-                self.sender.update()
+                await self._key_update_locked(bool(request_peer))
             except BaseException:
                 self.abort()
                 raise
+
+    async def _key_update_locked(self, request_peer):
+        # Check before emitting a record: announcing an epoch we cannot enter
+        # would desynchronize the peer. The caller owns send_lock.
+        if self.sender.epoch >= c.MAX_SEND_EPOCH:
+            raise ProtocolError("sending key-update epoch exhausted", alert=80)
+        if request_peer:
+            if self._key_update_requested:
+                raise ProtocolError("a peer key update is already pending")
+            # drain() can yield to a simultaneous peer response; record the
+            # request before yielding so that response can clear it safely.
+            self._key_update_requested = True
+        await self.wire.send_frame(m.frame(24, bytes((int(request_peer),))), self.sender)
+        self.sender.update()
 
     async def _post_handshake(self, content):
         self.post_handshake.extend(content)
@@ -524,11 +543,14 @@ class SecureChannel:
                 return
             frame = bytes(self.post_handshake[:size]); del self.post_handshake[:size]
             kind, body = m.decode_frame(frame)
+            if self._active_client_auth is not None and kind not in (15, 20):
+                raise ProtocolError("interleaved client authentication response", alert=10)
             if kind == 24:
                 if self.post_handshake:
-                    raise ProtocolError("KeyUpdate must end its record")
+                    raise ProtocolError("KeyUpdate must end its record", alert=10)
                 self.receiver.update()
-                if body == b"\x01":
+                self._key_update_requested = False
+                if body == b"\x01" and self.sender.epoch < c.MAX_SEND_EPOCH:
                     await self.key_update(False)
             elif kind in (13, 252):
                 await self._answer_client_auth(frame)
@@ -578,7 +600,9 @@ class SecureChannel:
                         await self._post_handshake(content)
                         continue
                     if self.post_handshake:
-                        raise ProtocolError("interleaved fragmented handshake")
+                        raise ProtocolError("interleaved fragmented handshake", alert=10)
+                    if self._active_client_auth is not None and (kind != 21 or content[1] == 90):
+                        raise ProtocolError("interleaved client authentication response", alert=10)
                     if kind == 24:
                         await self._receive_heartbeat(content)
                         continue
@@ -624,8 +648,7 @@ class SecureChannel:
                 for chunk in chunks:
                     if (self.sender.sequence >= c.MAX_RECORDS - 1
                             or self.sender.content_bytes + len(chunk) + 5 > c.MAX_CONTENT_BYTES):
-                        await self.wire.send_frame(m.frame(24, b"\x00"), self.sender)
-                        self.sender.update()
+                        await self._key_update_locked(False)
                     self.wire.writer.write(self.sender.seal(chunk, 23))
                     await self.wire.writer.drain()
             except BaseException:
@@ -1019,6 +1042,11 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
         require_server_name = False  # IP reference identity must not appear in SNI.
     if require_client_auth and client_auth_validator is None and client_credential_policy is None and bootstrap_binding is None:
         raise ValueError("required client authentication needs an explicit trust validator")
+    bootstrap_bindings = ()
+    if bootstrap_binding is not None:
+        from .bootstrap_credentials import current_bootstrap_bindings
+        bootstrap_bindings = current_bootstrap_bindings(bootstrap_binding, service=server_name)
+        bootstrap_binding = bootstrap_bindings[0]
     if 3 in client_certificate_types and getattr(client_credential_policy, "its_policy", None) is None:
         raise ValueError("ITS client authentication requires an explicit ITS service policy")
     wire = Wire(reader, writer)
@@ -1101,15 +1129,13 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             if not protocol and (require_alpn or application_protocols and hello.protocols):
                 raise ProtocolError("no application protocol", alert=120)
             provisioned = tuple(external_psks)
-            bootstrap_context = b""
+            bootstrap_scoped_psks = {}
             if bootstrap_binding is not None:
                 from .bootstrap_credentials import bootstrap_binding_fingerprint, resolve_bootstrap_identity
                 from .psk import bootstrap_public_key_psk
-                bootstrap_context = bootstrap_binding_fingerprint(bootstrap_binding)
-                if bootstrap_binding.service != server_name:
-                    raise ProtocolError("bootstrap binding belongs to another service")
-                provisioned = tuple(bootstrap_public_key_psk(bootstrap_binding.spki[12:], server_name,
-                    target_hash=name, protocol=protocol) for name in bootstrap_binding.target_hashes)
+                bootstrap_scoped_psks = {value.spki: tuple(bootstrap_public_key_psk(value.spki[12:], server_name,
+                    target_hash=name, protocol=protocol) for name in value.target_hashes) for value in bootstrap_bindings}
+                provisioned = tuple(psk for values in bootstrap_scoped_psks.values() for psk in values)
                 request_client_auth, require_client_auth = True, True
                 client_credential_type = 2 if 2 in (_certificate_types(ext_values[19]) if 19 in ext_values else ()) else None
             if any(not isinstance(value, ExternalPSK) for value in provisioned):
@@ -1118,19 +1144,34 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 if value.identity == identity and value.name == server_name and value.protocol == protocol
                 and value.hash_name == selected.hash_name and value.combined == (33 in hello.extensions)
                 and c.suite(value.cipher_suite).confidential == selected.confidential), None)
-            ticket_context = c.digest(b"".join(credentials.chain_der if credentials else ())
+            ticket_context_base = (b"".join(credentials.chain_der if credentials else ())
                 + bytes((request_client_auth, require_client_auth, server_credential_type, bool(allow_non_confidential)))
-                + _policy_context(client_credential_policy)
-                + bootstrap_context
+                + (b"" if bootstrap_bindings else _policy_context(client_credential_policy))
                 + initial_controls.signaling_context
                 + repr(_credential_extensions(credentials) if credentials else ()).encode()
                 + repr(client_auth_offers).encode()
-                + local_limit.to_bytes(2, "big")
-                + b"".join(value.policy_digest() for value in provisioned))
+                + local_limit.to_bytes(2, "big"))
+            def ticket_scope(binding=None):
+                scoped = bootstrap_scoped_psks[binding.spki] if binding is not None else provisioned
+                return c.digest(ticket_context_base
+                    + (bootstrap_binding_fingerprint(binding) if binding is not None else b"")
+                    + b"".join(value.policy_digest() for value in scoped))
+            ticket_context = ticket_scope()
+            def lookup_ticket(identity):
+                for binding in bootstrap_bindings or (None,):
+                    candidate = ticket_store.lookup(identity, server_name, protocol, ticket_scope(binding))
+                    if candidate is not None:
+                        if binding is not None:
+                            resolved, _ = resolve_bootstrap_identity(candidate.external_psk_identity,
+                                bootstrap_bindings, service=server_name)
+                            if resolved != binding:
+                                raise ProtocolError("bootstrap ticket scope differs from its selected BSK")
+                        return candidate
+                return None
             resumable = None
             if ticket_store is not None and external is None and 33 not in hello.extensions:
                 for identity, _, _ in hello.psk_offers:
-                    value = ticket_store.lookup(identity, server_name, protocol, ticket_context)
+                    value = lookup_ticket(identity)
                     if (value is not None and c.suite(value.cipher_suite).hash_name == selected.hash_name
                             and c.suite(value.cipher_suite).confidential == selected.confidential
                             and set(value.allowed_psk_modes).intersection(hello.psk_modes, psk_modes)):
@@ -1205,7 +1246,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 selected_identity, (_, psk_age, psk_binder) = selected_offer
             if ticket_store is not None and ticket is None and 33 not in hello.extensions:
                 for index, (identity, age, proof) in enumerate(hello.psk_offers):
-                    candidate = ticket_store.lookup(identity, server_name, protocol, ticket_context)
+                    candidate = lookup_ticket(identity)
                     if (candidate is not None and c.suite(candidate.cipher_suite).hash_name == selected.hash_name
                             and c.suite(candidate.cipher_suite).confidential == selected.confidential
                             and set(candidate.allowed_psk_modes).intersection(hello.psk_modes, psk_modes)):
@@ -1220,7 +1261,9 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             if bootstrap_binding is not None:
                 # Scope and current inventory are checked before ANY authorized
                 # early callback, client identity, or successor ticket can exist.
-                resolve_bootstrap_identity(selected_external_identity, (bootstrap_binding,), service=server_name)
+                bootstrap_binding, _ = resolve_bootstrap_identity(selected_external_identity,
+                    bootstrap_bindings, service=server_name)
+                ticket_context = ticket_scope(bootstrap_binding)
                 if ticket is None:
                     raise ProtocolError("bootstrap authentication requires its provisioned PSK")
             if ticket is not None:
@@ -1269,7 +1312,10 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 elif external_early_replay is not None and ticket.max_early_data:
                     # Explicit deployment replay store must atomically reject
                     # reuse across workers AND restarts for the PSK's lifetime.
-                    replay_ok = external_early_replay(external, c.digest(ch, schedule.hash_name))
+                    # Nonselected binders have not been authenticated and may
+                    # change without changing this client's replay identity.
+                    replay_ok = external_early_replay(external,
+                        c.digest(ch[:-hello.binder_vector_size], schedule.hash_name))
                     if inspect.isawaitable(replay_ok):
                         replay_ok = await replay_ok
             accepted = bool(ticket is not None and hello.early_data and max_early_data
@@ -1397,6 +1443,8 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                     if record[0] == 20 and record[5:] == b"\x01":
                         continue
                     if accepted:
+                        if bootstrap_binding is not None:
+                            current_bootstrap_bindings(bootstrap_binding, service=server_name)
                         content, kind = early_receiver.open(record)
                         if kind == 22:
                             wire.pending.extend(content)
@@ -1460,6 +1508,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 raise ProtocolError("client certificate required", alert=116)
             bootstrap_authorization = None
             if bootstrap_binding is not None:
+                current_bootstrap_bindings(bootstrap_binding, service=server_name)
                 if external is not None:
                     from .bootstrap_credentials import authorize_bootstrap_client
                     bootstrap_authorization = authorize_bootstrap_client(bootstrap_binding, client_chain,
@@ -1471,6 +1520,11 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         "bsk": bootstrap_binding.spki, "fresh_client_possession": False}
             authenticated_client = tuple(client_chain) if client_chain else None
             client_auth_private = None
+            if bootstrap_binding is not None and client_credential_policy is not None:
+                from dataclasses import replace
+                client_credential_policy = replace(client_credential_policy,
+                    raw_public_keys=tuple(value for value in client_credential_policy.raw_public_keys
+                        if value.spki == bootstrap_binding.spki))
             wire.check_deadline()
             channel = SecureChannel(wire, server_app, client_app, exporter_secret=exporter,
                 resumed=ticket is not None and external is None, early_data_accepted=accepted,
@@ -1583,6 +1637,11 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             raise ValueError("invalid explicit client group policy")
         enabled_groups = tuple(supported_groups)
     credential_candidates = ((client_credentials,) if client_credentials is not None else ()) + tuple(client_credential_candidates)
+    bootstrap_bindings = ()
+    if bootstrap_binding is not None:
+        from .bootstrap_credentials import current_bootstrap_bindings
+        bootstrap_bindings = current_bootstrap_bindings(bootstrap_binding, service=server_name)
+        bootstrap_binding = bootstrap_bindings[0]
     offered_client_types = tuple(dict.fromkeys(value.credential_type for value in credential_candidates)) or (0,)
     if max_fragment_length is not None:
         _fragment_limit(max_fragment_length)
@@ -1611,7 +1670,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             or certificate_evidence_extensions or pinning_cache is not None or external_psk is not None or external_psks
             or early_data or enable_authenticators):
         raise ValueError("unauthenticated operation requires a separately selected generic credential profile")
-    provisioning_trust = bootstrap_binding is not None and bootstrap_binding.trust_mode == "provisioning-trust"
+    provisioning_trust = any(value.trust_mode == "provisioning-trust" for value in bootstrap_bindings)
     if (any(value != 0 for value in server_certificate_types) or delegated_credentials) and credential_policy is None and not provisioning_trust and not unauthenticated:
         raise ValueError("extended credentials require an explicit credential policy")
     if not application_protocols and require_alpn:
@@ -1631,33 +1690,68 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
         raise ValueError("duplicate provisioned PSK identity")
     if len({value.combined for value in provisioned_psks}) > 1:
         raise ValueError("combined and plain PSK profiles require distinct attempts")
-    bootstrap_context = b""
+    bootstrap_offer_bindings = {}
     if bootstrap_binding is not None:
         from .bootstrap_credentials import bootstrap_binding_fingerprint, resolve_bootstrap_identity
-        bootstrap_context = bootstrap_binding_fingerprint(bootstrap_binding)
-        if external_psk is None:
+        if not provisioned_psks:
             raise ValueError("bootstrap client requires its imported PSK")
-        resolve_bootstrap_identity(external_psk.identity, (bootstrap_binding,), service=server_name)
-        if (client_credentials is None or client_credentials.credential_type != 2
-                or tuple(client_credentials.chain_der) != (bootstrap_binding.spki,)):
-            raise ValueError("bootstrap client requires the exact provisioned RPK")
+        for value in provisioned_psks:
+            binding, imported = resolve_bootstrap_identity(value.identity, bootstrap_bindings, service=server_name)
+            if (not value.combined or value.binder_kind != "imp" or value.hash_name != imported.hash_name
+                    or not hmac.compare_digest(value.psk, imported.psk)):
+                raise ValueError("bootstrap client requires its exact imported PSK")
+            bootstrap_offer_bindings[value.identity] = binding
+        for binding in bootstrap_bindings:
+            candidates = tuple(value for value in credential_candidates if value.credential_type == 2
+                and tuple(value.chain_der) == (binding.spki,))
+            if len(candidates) != 1 or not isinstance(candidates[0].private_key, X25519PrivateKey):
+                raise ValueError("bootstrap client requires the exact provisioned RPK")
+            if candidates[0].private_key.public_key().public_bytes(serialization.Encoding.DER,
+                    serialization.PublicFormat.SubjectPublicKeyInfo) != binding.spki:
+                raise ValueError("bootstrap private key differs from the provisioned BSK")
         if provisioning_trust and normal_httpps:
             raise ValueError("provisioning trust is not normal authenticated HTTPPS")
-    cache_fields = (b"".join(root.public_bytes(serialization.Encoding.DER) for root in trust_roots),
+    def client_ticket_context(binding=None, selected_protocol=None):
+        scoped_psks = (tuple(value for value in provisioned_psks
+            if bootstrap_offer_bindings.get(value.identity) == binding) if binding is not None else provisioned_psks)
+        if binding is not None and selected_protocol is not None:
+            from dataclasses import replace
+            scoped_psks = tuple(replace(value, protocol=selected_protocol) for value in scoped_psks)
+        scoped_candidates = (tuple(value for value in credential_candidates
+            if value.credential_type == 2 and tuple(value.chain_der) == (binding.spki,))
+            if binding is not None else credential_candidates)
+        cache_fields = (b"".join(root.public_bytes(serialization.Encoding.DER) for root in trust_roots),
                     revocation_policy.encode("ascii"), cache_context,
-                    b"\x01" + c.digest(b"".join(client_credentials.chain_der)) if client_credentials else b"\x00",
-                    repr((client_credentials.credential_type, _credential_extensions(client_credentials))).encode() if client_credentials else b"",
+                    b"" if binding is not None else (b"\x01" + c.digest(b"".join(client_credentials.chain_der)) if client_credentials else b"\x00"),
+                    b"" if binding is not None else (repr((client_credentials.credential_type, _credential_extensions(client_credentials))).encode() if client_credentials else b""),
                     repr(tuple((value.credential_type, value.chain_der, _credential_extensions(value))
-                               for value in credential_candidates)).encode(),
-                    b"".join(value.policy_digest() for value in provisioned_psks), _policy_context(credential_policy),
-                    bootstrap_context,
+                               for value in scoped_candidates)).encode(),
+                    b"".join(value.policy_digest() for value in scoped_psks), _policy_context(credential_policy),
+                    bootstrap_binding_fingerprint(binding) if binding is not None else b"",
                     password_credential.context() if mixed_password else b"",
                     signaling.context() if signaling is not None else b"",
                     repr((certificate_algorithms, grant_algorithms)).encode(),
                     bytes(server_certificate_types), bytes((bool(delegated_credentials), bool(allow_non_confidential))))
-    roots_hash = c.digest(b"TLS20 client ticket context\x00" + b"".join(
-        len(field).to_bytes(4, "big") + field for field in cache_fields))
-    ticket = ticket_cache.take(server_name, protocol, roots_hash) if ticket_cache and pin_attempt is None and not unauthenticated else None
+        return c.digest(b"TLS20 client ticket context\x00" + b"".join(
+            len(field).to_bytes(4, "big") + field for field in cache_fields))
+    roots_hash = client_ticket_context()
+    ticket = None
+    if ticket_cache and pin_attempt is None and not unauthenticated:
+        scopes = ((binding, candidate_protocol) for binding in bootstrap_bindings
+                  for candidate_protocol in application_protocols) if bootstrap_bindings else ((None, protocol),)
+        for binding, candidate_protocol in scopes:
+            ticket = ticket_cache.take(server_name, candidate_protocol,
+                client_ticket_context(binding, candidate_protocol))
+            if ticket is not None:
+                if binding is not None:
+                    resolved, _ = resolve_bootstrap_identity(ticket.external_psk_identity, bootstrap_bindings, service=server_name)
+                    if resolved != binding or ticket.external_psk_identity not in bootstrap_offer_bindings:
+                        raise ProtocolError("bootstrap ticket scope differs from its selected BSK")
+                    bootstrap_binding = binding
+                    provisioning_trust = binding.trust_mode == "provisioning-trust"
+                protocol = candidate_protocol
+                roots_hash = client_ticket_context(binding, protocol)
+                break
     # Changing a local offer is not authority to widen a cached ticket's modes.
     # With no overlap, retry normal authentication without sending early bytes.
     if ticket is not None and not set(psk_modes).intersection(ticket.allowed_psk_modes):
@@ -1824,6 +1918,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", random, early_sender.secret)
                 early_chunk = min(16384, ticket.record_size_limit - 1)
                 for offset in range(0, len(early_data), early_chunk):
+                    if bootstrap_binding is not None:
+                        current_bootstrap_bindings(bootstrap_binding, service=server_name)
                     writer.write(early_sender.seal(early_data[offset:offset+early_chunk], 23))
                 await writer.drain()
             sh = await wire.receive_frame(2, boundary=True)
@@ -1891,8 +1987,13 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 # when the declined offer was its descendant session ticket.
                 raise ProtocolError("server declined the required provisioned PSK")
             selected_external_identity = external.identity if external is not None else ticket.external_psk_identity if resumed else b""
-            if bootstrap_binding is not None and selected_external_identity != external_psk.identity:
-                raise ProtocolError("bootstrap PSK lineage changed")
+            if bootstrap_binding is not None:
+                if selected_external_identity not in bootstrap_offer_bindings:
+                    raise ProtocolError("bootstrap PSK lineage changed")
+                bootstrap_binding, _ = resolve_bootstrap_identity(selected_external_identity,
+                    bootstrap_bindings, service=server_name)
+                provisioning_trust = bootstrap_binding.trust_mode == "provisioning-trust"
+                roots_hash = client_ticket_context(bootstrap_binding, protocol)
             if resumed and c.suite(ticket.cipher_suite).hash_name != selected.hash_name:
                 raise ProtocolError("PSK is incompatible with selected hash")
             if resumed and c.suite(ticket.cipher_suite).confidential != selected.confidential:
@@ -1922,7 +2023,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             accepted, protocol, selected_extensions = m.parse_encrypted_extensions(ee[4:], application_protocols,
                                     offered_early=offer_early, with_extensions=True,
                                     offered_name=send_server_name, require_alpn=require_alpn,
-                                    allowed_extensions=tuple(kind for kind, _ in client_extra if kind in (1, 15, 19, 20, 25, 28, 32, 55, 56, 58)))
+                                    allowed_extensions=((10,) if options["group"] else ()) + tuple(
+                                        kind for kind, _ in client_extra if kind in (1, 15, 19, 20, 25, 28, 32, 55, 56, 58)))
             send_limit = _peer_record_limit(selected_extensions[28]) if 28 in selected_extensions else 16385
             receive_limit = local_limit if 28 in selected_extensions else 16385
             if 1 in selected_extensions:
@@ -1950,8 +2052,17 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 raise ProtocolError("unoffered client credential type", alert=47)
             if resumed and external is None:
                 client_type = bytes((ticket.client_certificate_type,))
+            if bootstrap_binding is not None and external is not None:
+                # The imported bootstrap identity is TLS-protocol separated;
+                # the explicit application offer authorizes its fresh ALPN.
+                # Descendant tickets retain one exact negotiated ALPN.
+                from dataclasses import replace
+                external = replace(external, protocol=protocol)
+                ticket = external
             if resumed and ticket.protocol != protocol:
                 raise ProtocolError("PSK application protocol binding mismatch")
+            if bootstrap_binding is not None:
+                roots_hash = client_ticket_context(bootstrap_binding, protocol)
             if accepted and (not resumed or psk_index != 0 or ticket.cipher_suite != selected_id):
                 raise ProtocolError("early data requires selected PSK")
             transcript.add(ee)
@@ -2028,19 +2139,26 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 stage="server-finished", role="client", peer_authenticated=not unauthenticated, hash_name=schedule.hash_name)
             if bootstrap_binding is not None and selected_combined:
                 from .bootstrap_credentials import bootstrap_client_material
-                material = bootstrap_client_material(bootstrap_binding, server_mac_verified=True,
+                bootstrap_client_material(bootstrap_binding, server_mac_verified=True,
                     server_finished_verified=True, combined=selected_combined, fresh_key_share=bool(group),
                     initial_early_data=offer_early, client_credential_type=client_type[0],
                     client_request_present=client_auth_request is not None)
-                if tuple(client_credentials.chain_der) != material:
+            if bootstrap_binding is not None:
+                current_bootstrap_bindings(bootstrap_binding, service=server_name)
+                candidates = tuple(value for value in credential_candidates if value.credential_type == 2
+                    and tuple(value.chain_der) == (bootstrap_binding.spki,))
+                if len(candidates) != 1:
                     raise ProtocolError("bootstrap client credential changed before release")
+                client_credentials = candidates[0]
+                credential_candidates = candidates
             if accepted:
                 eoed = m.frame(5, b"")
                 await wire.send_frame(eoed, early_sender)
                 transcript.add(eoed)
             if client_auth_request is not None:
                 context, share, algorithms, request_extensions = client_auth_request
-                candidates = preferred_credentials((value for value in credential_candidates
+                candidates = preferred_credentials((value for value in (
+                    (client_credentials,) if bootstrap_binding is not None else credential_candidates)
                     if value.credential_type == client_type[0]), request_extensions)
                 client_credentials = candidates[0] if candidates else None
                 messages = _client_auth_messages(client_credentials, context, share,

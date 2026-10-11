@@ -251,7 +251,7 @@ class LoadedProfile:
     password: object = None
     bootstrap: object = None
     bootstrap_key: object = None
-    bootstrap_hash: str = "sha256"
+    bootstrap_hash: str | None = None
     protocol: bytes = b"http/1.1"
 
     def close(self):
@@ -695,6 +695,24 @@ def _client_auth(result, data, files):
 
 def _bootstrap(result, data, files):
     from .bootstrap_credentials import BootstrapBinding
+    if type(data) is list:
+        if not data or any(type(item) is not dict for item in data):
+            raise ConfigurationError("Bootstrap inventory must not be empty")
+        bindings, keys = [], []
+        for item in data:
+            _bootstrap(result, item, files)
+            binding = result.bootstrap
+            if result.bootstrap_hash is not None:
+                from dataclasses import replace
+                binding = replace(binding, target_hashes=(result.bootstrap_hash,))
+            bindings.append(binding)
+            if result.role == 'client':
+                keys.append(result.bootstrap_key)
+        if len({binding.spki for binding in bindings}) != len(bindings):
+            raise ConfigurationError("Duplicate or ambiguous bootstrap inventory record")
+        result.bootstrap, result.bootstrap_key = tuple(bindings), tuple(keys)
+        result.bootstrap_hash = None
+        return
     data = _table(data, ("public_key", "private_key", "scope", "expires_at", "target_hashes", "target_hash"), "bootstrap inventory")
     expiry = None
     if "expires_at" in data:
@@ -708,8 +726,9 @@ def _bootstrap(result, data, files):
     result.bootstrap = BootstrapBinding(files.read(data.get("public_key"), 44), result.service,
         _text(data.get("scope"), "bootstrap authorization scope"), "credential-validated", targets, expiry)
     if result.role == "client":
-        result.bootstrap_hash = data.get("target_hash", "sha256")
-        if result.bootstrap_hash not in targets or result.bootstrap_hash not in {c.suite(value).hash_name for value in result.options["cipher_suites"]}:
+        result.bootstrap_hash = data.get("target_hash")
+        compatible = set(targets).intersection(c.suite(value).hash_name for value in result.options["cipher_suites"])
+        if not compatible or result.bootstrap_hash is not None and result.bootstrap_hash not in compatible:
             raise ConfigurationError("Bootstrap target hash must match its provisioning and offered suites")
         result.bootstrap_key = files.key(data.get("private_key"))
         if not isinstance(result.bootstrap_key, x25519.X25519PrivateKey) or not hmac.compare_digest(

@@ -297,11 +297,20 @@ identity HTTP header or invent per-route authorization from certificate fields.
 
 `mode = "pok"` uses `[bootstrap]` with `public_key` (BSK SPKI), `scope`, optional
 ISO8601 `expires_at` with time zone, and `target_hashes` (`sha256`/`sha384`). Only
-the client also supplies its `private_key`. Its optional `target_hash` selects
-one provisioned hash compatible with its offered suite. The HTTPPS profile always uses
+the client also supplies its `private_key`. Use repeated `[[bootstrap]]` tables
+to authorize multiple distinct BSKs, each with its own key, scope and hash policy.
+The client offers every provisioned hash compatible with its offered suites;
+optional `target_hash` limits that record to one compatible hash. The HTTPPS profile always uses
 `credential-validated` trust; a public-derived bootstrap PSK is not identity
 proof. Exact BSK possession through client MAC and Finished is mandatory.
 The separate programmatic provisioning-trust API is not a web trust bypass.
+The programmatic handshake wrappers accept either one binding/key or sequences
+of bindings/keys; keys are matched by exact SPKI, independent of sequence order.
+Only the authenticated selection's private credential is used, after the server
+MAC and Finished. Tickets retain that record's scope and trust mode; changes to
+unrelated inventory records do not confer or remove its authority.
+A fresh bootstrap may negotiate any ALPN in the explicit application offer;
+resumed tickets remain bound to the exact ALPN selected by their original handshake.
 
 Server `[pinning]` uses `current_id_hex` (16-byte ID), `lifetime_seconds`,
 `ramp_down`, and `[[pinning.keys]]` entries with `id_hex` and a `key_file` of
