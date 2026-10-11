@@ -25,7 +25,8 @@ def main():
     with tarfile.open(sources[0], "r:gz") as archive:
         names = archive.getnames()
         for required in ("native/its/Cargo.toml", "native/its/Cargo.lock",
-                         "native/its/src/lib.rs", "native/its/vendor/rasn/src/oer/de.rs",
+                         "native/its/src/lib.rs", "native/its/src/geography.rs",
+                         "native/its/vendor/rasn/src/oer/de.rs",
                          "native/its/vendor/rasn/LICENCE-MIT", "native/its/vendor/rasn/LICENCE-APACHE",
                          "native/its/THIRD_PARTY_NOTICES.txt", "native/its/check_licenses.py",
                          "tools/build_native_dependencies.py", "tools/getdns_msvc/strings.h"):
@@ -35,6 +36,7 @@ def main():
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
         assert "tls20_server/handshake.py" in names
+        assert "tls20_server/retry_cookie.py" in names
         assert b"TEST_DIAGNOSTICS = False" in archive.read("tls20_server/_build_features.py")
         assert any(name.endswith("/entry_points.txt") for name in names)
         assert any(name.endswith("/share/tls20-server/native/pake.c") for name in names)

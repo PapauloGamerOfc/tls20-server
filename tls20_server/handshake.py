@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 
 from . import crypto as c
 from . import messages as m
-from .errors import ProtocolError
+from .errors import ProtocolError, PeerClosed
 from .pki import (validate_chain, certificate_signature_scheme, SUPPORTED_CERTIFICATE_ALGORITHMS,
                   supported_certificate_algorithms, certificate_public_key, verify_public_signature,
                   SM2_CERTIFICATE_IDENTIFIER, find_certificate_issuer, certificate_extensions)
@@ -93,9 +93,9 @@ class Wire:
         # Plaintext legacy_record_version is ignored; supported_versions in
         # the Hello is the authenticated selection. Ciphertext uses 0x0303.
         if kind == 23 and version != b"\x03\x03":
-            raise ProtocolError("invalid record framing version")
+            raise ProtocolError("invalid record framing version", alert=47)
         if not 1 <= length <= (16640 if kind == 23 else 16384):
-            raise ProtocolError("invalid record length")
+            raise ProtocolError("invalid record length", alert=22)
         self.count()
         fragment = await self.exact(length)
         return header + fragment
@@ -109,7 +109,7 @@ class Wire:
             break
         if state is None:
             if kind not in (21, 22):
-                raise ProtocolError("invalid plaintext record")
+                raise ProtocolError("invalid plaintext record", alert=10)
             return fragment, kind
         return state.open(record)
 
@@ -128,6 +128,9 @@ class Wire:
 
     async def fatal(self, error, state=None):
         """Best-effort fatal alert in the active write epoch, then orderly EOF."""
+        if isinstance(error, PeerClosed):
+            self.writer.close()
+            return
         try:
             content = bytes((2, error.alert))
             self.writer.write(state.seal(content, 21) if state else b"\x15\x03\x03\x00\x02" + content)
@@ -153,22 +156,28 @@ class Wire:
                 kind = self.pending[0]
                 length = int.from_bytes(self.pending[1:4], "big")
                 expected_types = (expected,) if isinstance(expected, int) else expected
-                if kind not in expected_types or length > MAX_BODY:
-                    raise ProtocolError("unexpected or oversized handshake message")
+                if kind not in expected_types:
+                    raise ProtocolError("unexpected handshake message", alert=10)
+                if length > MAX_BODY:
+                    raise ProtocolError("oversized handshake message", alert=50)
                 if kind == 20 and length not in (32, 48):
-                    raise ProtocolError("invalid authenticator size")
+                    raise ProtocolError("invalid authenticator size", alert=50)
                 if len(self.pending) >= length + 4:
                     message = bytes(self.pending[:length + 4])
                     del self.pending[:length + 4]
                     if boundary and self.pending:
-                        raise ProtocolError("handshake bytes cross a key transition")
+                        raise ProtocolError("handshake bytes cross a key transition", alert=10)
                     m.decode_frame(message)
                     return message
             fragment, kind = await self.read_record(state)
             if kind == 21:
-                raise ProtocolError("peer aborted the handshake")
+                if len(fragment) != 2:
+                    raise ProtocolError("malformed alert", alert=50)
+                if fragment[1] == 90:
+                    continue  # advisory user_canceled; normally followed by close_notify
+                raise PeerClosed("peer closed or aborted the handshake", alert=fragment[1])
             if kind != 22 or not fragment:
-                raise ProtocolError("application data before authentication")
+                raise ProtocolError("application data before authentication", alert=10)
             if len(self.pending) + len(fragment) > MAX_BODY + 4 + 16384:
                 raise ProtocolError("handshake reassembly limit exceeded")
             self.pending.extend(fragment)
@@ -193,7 +202,7 @@ class SecureChannel:
                  heartbeat_local_mode=None, heartbeat_peer_mode=None,
                  selected_external_psk_identity=b"", bootstrap_binding=None, bootstrap_authorization=None,
                  peer_authenticated=True, client_credential_candidates=(), native_provider=None, pake_identity=b"",
-                 credential_expires_at=None):
+                 credential_expires_at=None, allowed_psk_modes=(1, 0)):
         if wire.pending:
             raise ProtocolError("leftover handshake bytes")
         self.wire = wire
@@ -211,6 +220,7 @@ class SecureChannel:
         self.psk_provenance = psk_provenance
         self.pake_identity = pake_identity
         self.selected_external_psk_identity = selected_external_psk_identity
+        self.allowed_psk_modes = tuple(dict.fromkeys(allowed_psk_modes))
         self.bootstrap_binding = bootstrap_binding
         self.bootstrap_authorization = bootstrap_authorization
         self._authenticators = None
@@ -275,7 +285,8 @@ class SecureChannel:
                 state["future"].cancel()
 
     async def request_client_auth(self, *, required=False, max_pending=128,
-                                  certificate_authorities=None, oid_filters=None):
+                                  certificate_authorities=None, oid_filters=None,
+                                  certificate_algorithms=None, delegation_signature_algorithms=None):
         """Return a Future completed by recv(); application must keep reading.
 
         max_pending is a local memory budget, not a TLS protocol maximum.
@@ -293,6 +304,17 @@ class SecureChannel:
             context = os.urandom(32)
         private = X25519PrivateKey.generate()
         request_offers = dict(self.client_auth_offers)
+        signature_provider = getattr(self.client_credential_policy, "signature_provider", None) or self.native_provider
+        if certificate_algorithms is not None:
+            if self.client_certificate_type != 0:
+                raise ValueError("certificate signature policy requires X.509 credentials")
+            algorithms = _signature_preferences(certificate_algorithms, signature_provider)
+            request_offers[50] = m._vec(b"".join(value.to_bytes(2, "big") for value in algorithms), 2)
+        if delegation_signature_algorithms is not None:
+            if 34 not in request_offers:
+                raise ValueError("delegation signature policy requires an enabled delegation verifier")
+            algorithms = _signature_preferences(delegation_signature_algorithms, signature_provider)
+            request_offers[0xff04] = m._vec(b"".join(value.to_bytes(2, "big") for value in algorithms), 2)
         if certificate_authorities is not None:
             request_offers.pop(47, None)
             if certificate_authorities:
@@ -369,7 +391,7 @@ class SecureChannel:
                 else:
                     if self.client_certificate_type != 0 or any(state["metadata"]):
                         raise ProtocolError("extended client credentials require an explicit policy")
-                    _check_certificate_offer(state["chain"], supported_certificate_algorithms(self.native_provider), self.native_provider)
+                    _check_certificate_offer(state["chain"], m._u16_list(state["offers"][50]), self.native_provider)
                     state["key"] = await _validate_client(self.client_auth_validator, state["chain"])
                 state["stage"] = "proof"
             else:
@@ -382,14 +404,14 @@ class SecureChannel:
             expected = self.schedule.client_proof(self.exporter_secret, state["private"],
                                      c.public_bytes(state["key"]), bytes(state["transcript"]))
             if body[:2] != b"\xfe\x01" or not hmac.compare_digest(expected, body[4:]):
-                raise ProtocolError("client MAC verification failed")
+                raise ProtocolError("client MAC verification failed", alert=51)
             state["transcript"].extend(frame)
             state["stage"] = "finished"
         elif kind == 20 and state["stage"] == "finished":
             if not self.schedule.verify_finished(self.receiver.secret, bytes(state["transcript"]), body):
-                raise ProtocolError("post-handshake client Finished failed")
+                raise ProtocolError("post-handshake client Finished failed", alert=51)
             if state["required"] and not state["chain"]:
-                raise ProtocolError("client certificate required")
+                raise ProtocolError("client certificate required", alert=116)
             self.authenticated_client = tuple(state["chain"]) if state["chain"] else None
             del self.pending_client_auth[state["context"]]
             self._active_client_auth = None
@@ -527,6 +549,7 @@ class SecureChannel:
                         external_psk_identity=self.selected_external_psk_identity,
                         pake_identity=self.pake_identity,
                         credential_expires_at=self.credential_expires_at,
+                        allowed_psk_modes=self.allowed_psk_modes,
                         record_size_limit=self.sender.record_limit))
             else:
                 raise ProtocolError("unexpected post-handshake message")
@@ -561,12 +584,16 @@ class SecureChannel:
                         continue
                     if kind == 23:
                         return content
-                    if kind == 21 and content == b"\x01\x00":
+                    if kind == 21 and len(content) == 2 and content[1] == 0:
                         self.received_close = True
                         self._clear_auth()
                         return None
                     if kind == 21 and len(content) == 2 and content[1] == 90:
                         continue  # user_canceled does not terminate the connection.
+                    if kind == 21:
+                        if len(content) != 2:
+                            raise ProtocolError("malformed alert", alert=50)
+                        raise PeerClosed("peer fatal alert", alert=content[1])
                     raise ProtocolError("peer alert or unexpected post-handshake message")
             except asyncio.CancelledError:
                 # A partial record cannot be resumed, but the independent send
@@ -677,7 +704,7 @@ def _peer_fragment_limit(value):
 
 def _check_certificate_offer(chain, offered, signature_provider=None, signature_issuers=()):
     if not offered:
-        raise ProtocolError("missing signature_algorithms_cert")
+        raise ProtocolError("missing signature_algorithms_cert", alert=109)
     for index, der in enumerate(chain):
         cert = x509.load_der_x509_certificate(der)
         if index == len(chain) - 1 and cert.subject == cert.issuer:
@@ -833,7 +860,7 @@ def _decode_credential(message, *, context=b"", allow_empty=False, offered_compr
             raise ProtocolError("selected cached certificate requires a reference")
         material, blocks = resolve_cached_certificate(body, snapshots,
             credential_type=credential_type, expected_context=context)
-        return list(material), tuple(tuple(m.extensions(block).items()) for block in blocks)
+        return list(material), tuple(tuple(m.extensions(block, context="CE").items()) for block in blocks)
     if message[0] not in (11, 25):
         raise ProtocolError("unselected cached certificate reference")
     return m.parse_certificate(body, context=context, allow_empty=allow_empty, details=True)
@@ -950,6 +977,18 @@ def _close_on_error(method):
     return guarded
 
 
+def _signature_preferences(values, provider):
+    """Explicit verifier capability policy; certificate and grant lists are independent."""
+    supported = supported_certificate_algorithms(provider)
+    if values is None:
+        return supported
+    values = tuple(values)
+    if (not values or len(values) > 32767 or len(set(values)) != len(values)
+            or any(type(value) is not int or value not in supported for value in values)):
+        raise ValueError("invalid certificate/grant signature preference list")
+    return values
+
+
 @_close_on_error
 async def server_handshake(reader, writer, credentials, server_name, timeout=10, *,
                            ticket_store=None, max_early_data=0, on_early_data=None,
@@ -966,8 +1005,13 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                            pinning=None, pinning_port=343,
                            require_server_name=True, require_alpn=True,
                            client_certificate_authorities=(), client_oid_filters=(),
-                           server_credential_candidates=(), native_provider=None, supported_groups=None):
+                           server_credential_candidates=(), native_provider=None, supported_groups=None,
+                           retry_cookie_policy=None, client_certificate_algorithms=None,
+                           client_delegation_signature_algorithms=None):
     check_timeout(timeout)
+    from .retry_cookie import RetryCookiePolicy, validate_retry_cookie
+    if retry_cookie_policy is not None and not isinstance(retry_cookie_policy, RetryCookiePolicy):
+        raise ValueError("explicit RetryCookiePolicy required")
     if any(c.suite(value).password_authenticated for value in cipher_suites):
         raise ValueError("PWD suites require the explicit pake_handshake.server policy API")
     m.validate_service_identity(server_name)
@@ -984,8 +1028,9 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
     exporter_accesses = []
     local_limit = _record_limit(record_size_limit)
     bootstrap_valid = False
-    certificate_algorithms = supported_certificate_algorithms(
-        getattr(client_credential_policy, "signature_provider", None) or native_provider)
+    signature_provider = getattr(client_credential_policy, "signature_provider", None) or native_provider
+    certificate_algorithms = _signature_preferences(client_certificate_algorithms, signature_provider)
+    grant_algorithms = _signature_preferences(client_delegation_signature_algorithms, signature_provider)
     from .gost_provider import GOSTProvider
     enabled_groups = tuple(value for value in c.GROUP_LENGTHS if (value != 41 or native_provider is not None)
                            and (not 34 <= value <= 40 or isinstance(native_provider,GOSTProvider)))
@@ -1034,9 +1079,9 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 client_auth_offers += ((47, encode_certificate_authorities(client_certificate_authorities)),)
             if client_oid_filters:
                 client_auth_offers += ((48, encode_oid_filters(client_oid_filters)),)
-            if client_credential_policy is not None:
+            if client_credential_policy is not None and client_credential_type == 0:
                 client_auth_offers += ((34, b"\x00\x02\xfe\x01"),
-                    (0xff04, m._vec(b"".join(value.to_bytes(2,"big") for value in certificate_algorithms), 2)))
+                    (0xff04, m._vec(b"".join(value.to_bytes(2,"big") for value in grant_algorithms), 2)))
             if certificate_compression:
                 client_auth_offers += ((27, m._vec(b"".join(value.to_bytes(2,"big") for value in certificate_compression),1)),)
             send_limit = _peer_record_limit(ext_values[28], server=True) if 28 in ext_values else 16385
@@ -1049,7 +1094,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 signaling=signaling)
             wire.allow_ccs = True
             if 44 in hello.extensions:
-                raise ProtocolError("unsolicited cookie in initial ClientHello")
+                raise ProtocolError("unsolicited cookie in initial ClientHello", alert=47)
             protocol = next((value for value in application_protocols if value in hello.protocols), b"")
             if hello.name != server_name and (hello.name or require_server_name):
                 raise ProtocolError("unsupported service identity", alert=112)
@@ -1087,18 +1132,30 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 for identity, _, _ in hello.psk_offers:
                     value = ticket_store.lookup(identity, server_name, protocol, ticket_context)
                     if (value is not None and c.suite(value.cipher_suite).hash_name == selected.hash_name
-                            and c.suite(value.cipher_suite).confidential == selected.confidential):
+                            and c.suite(value.cipher_suite).confidential == selected.confidential
+                            and set(value.allowed_psk_modes).intersection(hello.psk_modes, psk_modes)):
                         resumable = value
                         break
+            selected_psk = external or resumable
+            if selected_psk is not None:
+                selected_offer = next(offer for offer in hello.psk_offers if offer[0] == selected_psk.identity)
+                if len(selected_offer[2]) != selected.hash_length:
+                    raise ProtocolError("selected PSK binder has the wrong hash length", alert=51)
+            selectable_modes = set(hello.psk_modes).intersection(psk_modes,
+                resumable.allowed_psk_modes if resumable else (0, 1))
             psk_only = bool((resumable or external and not external.combined)
-                            and 0 in hello.psk_modes and 0 in psk_modes
-                            and (not hello.group or 1 not in hello.psk_modes or 1 not in psk_modes))
+                            and 0 in selectable_modes
+                            and (not hello.group or 1 not in selectable_modes))
             sent_ccs = False
-            if not hello.B and not psk_only:
-                if not hello.group:
-                    raise ProtocolError("no acceptable PSK-only selection or DHE share")
+            if not hello.group and not psk_only:
+                raise ProtocolError("no acceptable PSK-only selection or DHE share")
+            retry_group = hello.group if not hello.B and not psk_only else 0
+            if retry_group or retry_cookie_policy is not None:
+                retry_cookie = (retry_cookie_policy.issue(writer, ch, selected_id, retry_group)
+                                if retry_cookie_policy is not None else b"")
                 hrr = m.server_hello(b"", bytes(32), session_id=hello.session_id,
-                                     group=hello.group, retry=True, cipher_suite=selected_id)
+                                     group=retry_group, retry=True, cipher_suite=selected_id,
+                                     cookie=retry_cookie)
                 await wire.send_frame(hrr)
                 if hello.session_id:
                     await wire.send_ccs()
@@ -1109,6 +1166,13 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                     record = await wire.raw_record()
                     if record[0] == 20 and record[5:] == b"\x01":
                         continue
+                    if record[0] == 21:
+                        fragment = record[5:]
+                        if len(fragment) != 2:
+                            raise ProtocolError("malformed alert", alert=50)
+                        if fragment[1] == 90:
+                            continue
+                        raise PeerClosed("peer closed or aborted the retry", alert=fragment[1])
                     if record[0] == 22:
                         wire.pending.extend(record[5:]); break
                     discarded += len(record)
@@ -1116,33 +1180,42 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         raise ProtocolError("unexpected record after retry")
                 ch2 = await wire.receive_frame(1, boundary=True)
                 second = m.parse_client_hello(ch2[4:], enabled_groups=enabled_groups, password_authenticated=False)
+                validate_retry_cookie(retry_cookie_policy, dict(second.extension_values), retry_cookie,
+                                      writer, ch, selected_id, retry_group)
                 mutable = {21, 41, 42, 44, 51}
                 stable = lambda h: {k: v for k, v in h.extension_values if k not in mutable}
                 if (second.fixed_hello != hello.fixed_hello or stable(second) != stable(hello)
-                        or not second.B or second.group != hello.group or second.early_data
-                        or not _retry_psks_unchanged(hello, second, selected.hash_length) or 44 in second.extensions
-                        or second.share_groups != (hello.group,)):
-                    raise ProtocolError("ClientHello changed forbidden fields after retry")
+                        or second.early_data
+                        or not _retry_psks_unchanged(hello, second, selected.hash_length)
+                        or (retry_group and (not second.B or second.group != retry_group
+                                             or second.share_groups != (retry_group,)))
+                        or (not retry_group and dict(second.extension_values).get(51)
+                            != dict(hello.extension_values).get(51))):
+                    raise ProtocolError("ClientHello changed forbidden fields after retry", alert=47)
                 ch, hello = ch2, second
             static_public = c.public_bytes(credentials.private_key) if credentials else b""
             if static_public and static_public in (hello.A, c.traffic_auth_component(hello.group, hello.B)):
                 raise ProtocolError("non-independent key shares")
             ticket, selected_identity, psk_age, psk_binder = external, 0, 0, b""
             if external is not None:
-                selected_identity, (_, psk_age, psk_binder) = next((index, offer)
-                    for index, offer in enumerate(hello.psk_offers) if offer[0] == external.identity)
+                selected_offer = next(((index, offer) for index, offer in enumerate(hello.psk_offers)
+                    if offer[0] == external.identity), None)
+                if selected_offer is None:
+                    raise ProtocolError("selected PSK was removed after retry", alert=47)
+                selected_identity, (_, psk_age, psk_binder) = selected_offer
             if ticket_store is not None and ticket is None and 33 not in hello.extensions:
                 for index, (identity, age, proof) in enumerate(hello.psk_offers):
                     candidate = ticket_store.lookup(identity, server_name, protocol, ticket_context)
                     if (candidate is not None and c.suite(candidate.cipher_suite).hash_name == selected.hash_name
-                            and c.suite(candidate.cipher_suite).confidential == selected.confidential):
+                            and c.suite(candidate.cipher_suite).confidential == selected.confidential
+                            and set(candidate.allowed_psk_modes).intersection(hello.psk_modes, psk_modes)):
                         ticket, selected_identity, psk_age, psk_binder = candidate, index, age, proof
                         break
             if ticket is not None and not hmac.compare_digest(
                     c.binder(ticket.psk, transcript.snapshot() + ch[:-hello.binder_vector_size],
                              hash_name=schedule.hash_name,
                              kind=external.binder_kind if external is not None else "res"), psk_binder):
-                raise ProtocolError("PSK binder verification failed")
+                raise ProtocolError("PSK binder verification failed", alert=51)
             selected_external_identity = external.identity if external is not None else ticket.external_psk_identity if ticket else b""
             if bootstrap_binding is not None:
                 # Scope and current inventory are checked before ANY authorized
@@ -1150,8 +1223,15 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 resolve_bootstrap_identity(selected_external_identity, (bootstrap_binding,), service=server_name)
                 if ticket is None:
                     raise ProtocolError("bootstrap authentication requires its provisioned PSK")
-            if ticket is not None and not psk_only and not (1 in hello.psk_modes and 1 in psk_modes):
-                raise ProtocolError("no mutually supported PSK key exchange mode")
+            if ticket is not None:
+                # A ticket may expire while the client answers HRR, causing
+                # the final lookup to choose a different offered identity.
+                # Check that identity's authority, not the pre-HRR candidate's
+                # modes. Do not change a DHE/group decision committed by HRR.
+                final_modes = set(hello.psk_modes).intersection(psk_modes,
+                    (0, 1) if external is not None else ticket.allowed_psk_modes)
+                if (0 if psk_only else 1) not in final_modes:
+                    raise ProtocolError("no mutually supported PSK key exchange mode")
             combined = bool(external and external.combined)
             credential_auth = ticket is None or combined
             authenticated_client = None
@@ -1179,6 +1259,9 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 raise ProtocolError("PSK-only identity is no longer authorized")
             if external is not None and not combined and require_client_auth:
                 raise ProtocolError("external PSK-only authentication does not satisfy required client credentials")
+            successor_modes = tuple(mode for mode in dict.fromkeys(hello.psk_modes)
+                if mode in (0, 1) and (external is not None or ticket is None
+                                      or mode in ticket.allowed_psk_modes))
             replay_ok = False
             if ticket is not None and hello.early_data and selected_identity == 0:
                 if external is None:
@@ -1197,7 +1280,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 if credentials is None:
                     raise ProtocolError("server credentials are required for this authentication mode")
                 if len(hello.A) != 32:
-                    raise ProtocolError("credential authentication requires auth_share")
+                    raise ProtocolError("credential authentication requires auth_share", alert=109)
                 if server_credential_type not in offered_server_types:
                     raise ProtocolError("server credential type was not offered", alert=43)
             if bootstrap_binding is not None and external is not None:
@@ -1367,14 +1450,14 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                     expected = schedule.client_proof(exporter, client_auth_private,
                                              c.public_bytes(key), transcript.snapshot())
                     if cv[4:6] != b"\xfe\x01" or not hmac.compare_digest(expected, cv[8:]):
-                        raise ProtocolError("initial client MAC verification failed")
+                        raise ProtocolError("initial client MAC verification failed", alert=51)
                     transcript.add(cv)
             cf = await wire.receive_frame(20, receiver, boundary=True)
             if not schedule.verify_finished(client_secret, transcript.snapshot(), cf[4:]):
-                raise ProtocolError("client Finished verification failed")
+                raise ProtocolError("client Finished verification failed", alert=51)
             transcript.add(cf)
             if require_client_auth and not client_chain:
-                raise ProtocolError("client certificate required")
+                raise ProtocolError("client certificate required", alert=116)
             bootstrap_authorization = None
             if bootstrap_binding is not None:
                 if external is not None:
@@ -1403,6 +1486,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 client_credential_policy=client_credential_policy,
                 client_certificate_type=client_credential_type or 0, client_auth_offers=client_auth_offers,
                 selected_external_psk_identity=selected_external_identity,
+                allowed_psk_modes=successor_modes,
                 bootstrap_binding=bootstrap_binding, bootstrap_authorization=bootstrap_authorization,
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode,
                 native_provider=native_provider)
@@ -1412,7 +1496,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 access.complete(peer_authenticated=bool(ticket is not None or authenticated_client))
             channel._exporter_accesses = tuple(exporter_accesses)
             sender = channel.sender
-            if ticket_store is not None and 45 in hello.extensions:
+            if ticket_store is not None and 45 in hello.extensions and successor_modes:
                 resumption = schedule.derive_secret(schedule.master_secret(traffic_root), "res master", transcript.snapshot())
                 count = controls.expected_tickets if controls.expected_tickets is not None else 1
                 for _ in range(count):
@@ -1420,6 +1504,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         max_early_data if on_early_data is not None else 0, ticket_context, client_chain,
                         cipher_suite=selected_id, client_certificate_type=client_credential_type or 0,
                         client_certificate_extensions=client_metadata, external_psk_identity=selected_external_identity,
+                        allowed_psk_modes=successor_modes,
                         native_provider=native_provider)
                     if message is not None:
                         await channel.send_handshake(message)
@@ -1457,7 +1542,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                            send_server_name=True, require_alpn=True,
                            allow_unauthenticated_server=False,
                            client_credential_candidates=(), server_certificate_authorities=(), native_provider=None,
-                           supported_groups=None, password_credential=None):
+                           supported_groups=None, password_credential=None,
+                           server_certificate_algorithms=None, server_delegation_signature_algorithms=None):
     check_timeout(timeout)
     mixed_password = password_credential is not None
     if mixed_password:
@@ -1480,8 +1566,9 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
     sender = None
     exporter_accesses = []
     local_limit = _record_limit(record_size_limit)
-    certificate_algorithms = supported_certificate_algorithms(
-        getattr(credential_policy, "signature_provider", None) or native_provider)
+    signature_provider = getattr(credential_policy, "signature_provider", None) or native_provider
+    certificate_algorithms = _signature_preferences(server_certificate_algorithms, signature_provider)
+    grant_algorithms = _signature_preferences(server_delegation_signature_algorithms, signature_provider)
     if native_provider is None and (traffic_group == 41 or any(c.suite(value).hash_name == "sm3" for value in cipher_suites)):
         raise ValueError("SM cipher suites and groups require an explicitly selected native provider")
     from .gost_provider import GOSTProvider
@@ -1566,10 +1653,15 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     bootstrap_context,
                     password_credential.context() if mixed_password else b"",
                     signaling.context() if signaling is not None else b"",
+                    repr((certificate_algorithms, grant_algorithms)).encode(),
                     bytes(server_certificate_types), bytes((bool(delegated_credentials), bool(allow_non_confidential))))
     roots_hash = c.digest(b"TLS20 client ticket context\x00" + b"".join(
         len(field).to_bytes(4, "big") + field for field in cache_fields))
     ticket = ticket_cache.take(server_name, protocol, roots_hash) if ticket_cache and pin_attempt is None and not unauthenticated else None
+    # Changing a local offer is not authority to widen a cached ticket's modes.
+    # With no overlap, retry normal authentication without sending early bytes.
+    if ticket is not None and not set(psk_modes).intersection(ticket.allowed_psk_modes):
+        ticket = None
     if (ticket is not None and credential_policy is not None and credential_policy.dane_policy is not None
             and ticket.credential_expires_at is None):
         ticket = None  # Missing original DNS TTL is not authority for cached early data.
@@ -1586,7 +1678,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     authenticator_offers = list(certificate_evidence_extensions)
                     if delegated_credentials:
                         authenticator_offers += [(34, b"\x00\x02\xfe\x00"),
-                            (0xff04,m._vec(b"".join(value.to_bytes(2,"big") for value in certificate_algorithms),2))]
+                            (0xff04,m._vec(b"".join(value.to_bytes(2,"big") for value in grant_algorithms),2))]
                     return await password_client(reader,writer,password_credential,timeout=timeout,
                         application_protocols=application_protocols,
                         cipher_suites=tuple(value for value in cipher_suites if c.suite(value).password_authenticated),
@@ -1626,7 +1718,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 client_extra.append((27, m._vec(b"".join(value.to_bytes(2,"big") for value in certificate_compression),1)))
             if delegated_credentials:
                 client_extra += [(34, b"\x00\x02\xfe\x00"),
-                    (0xff04, m._vec(b"".join(value.to_bytes(2,"big") for value in certificate_algorithms),2))]
+                    (0xff04, m._vec(b"".join(value.to_bytes(2,"big") for value in grant_algorithms),2))]
             client_extra.extend(certificate_evidence_extensions)
             snapshots = tuple((kind, tuple(bytes(value) for value in material)) for kind, material in cached_certificates)
             request_snapshots = tuple(bytes(value) for value in cached_requests)
@@ -1659,6 +1751,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     ticket = None
             elif ticket and not provisioned_psks:
                 ticket = None
+            if ticket is not None:
+                psk_modes = tuple(mode for mode in psk_modes if mode in ticket.allowed_psk_modes)
             offered_psks = (ticket,) if ticket else tuple(value for value in provisioned_psks
                 if any(candidate.hash_name == value.hash_name and candidate.confidential == c.suite(value.cipher_suite).confidential
                        for candidate in offered_suites))
@@ -1669,6 +1763,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 ticket = external
                 protocol = external.protocol
             combined = bool(external and external.combined)
+            if combined and 1 not in psk_modes:
+                raise ProtocolError("a fresh combined PSK exchange requires the DHE mode")
             psk_only = bool(ticket and not combined and tuple(psk_modes) == (0,))
             if mixed_password and ticket is None:
                 client_extra.append(password_credential.name_extension())
@@ -1752,15 +1848,17 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     _first_flight=(wire,ch,sh),_ticket_context=roots_hash,
                     enable_authenticators=enable_authenticators,_auth_share_secret=auth_private)
             if retry:
-                if sid or not force_retry and group == traffic_group:
-                    raise ProtocolError("useless HelloRetryRequest")
+                if sid or (group and not force_retry and group == traffic_group) or (not group and not cookie):
+                    raise ProtocolError("useless HelloRetryRequest", alert=47)
                 transcript.retry(ch, sh, schedule.hash_name)
                 if group:
                     if 34 <= traffic_group <= 41 and traffic_private is not None:
                         traffic_private.close()
                     traffic_private, traffic_public = c.traffic_key(group, provider=native_provider)
                     traffic_group = group
-                options.update(group=traffic_group, empty_share=False, early_data=False, cookie=cookie)
+                options.update(group=0 if psk_only else traffic_group,
+                               empty_share=force_retry if not group else False,
+                               early_data=False, cookie=cookie)
                 offered_psks = tuple(value for value in offered_psks if c.suite(value.cipher_suite).hash_name == selected.hash_name)
                 ch = bound_hello(transcript.snapshot())
                 transcript.add(ch)
@@ -1787,9 +1885,10 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             selected_combined = 33 in selection_extensions
             if selected_combined != (combined and resumed):
                 raise ProtocolError("combined PSK authentication selection mismatch")
-            if external is not None and not resumed:
+            if provisioned_psks and not resumed:
                 # An explicitly provisioned external PSK is not permission to
-                # silently fall back to an unrelated credential-only identity.
+                # silently fall back to a credential-only identity, including
+                # when the declined offer was its descendant session ticket.
                 raise ProtocolError("server declined the required provisioned PSK")
             selected_external_identity = external.identity if external is not None else ticket.external_psk_identity if resumed else b""
             if bootstrap_binding is not None and selected_external_identity != external_psk.identity:
@@ -1909,11 +2008,11 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 auth_root = schedule.authentication_root(traffic_root, c.dh(auth_private, static_public), transcript.snapshot())
                 cv = await wire.receive_frame(15, receiver)
                 if cv[4:6] != b"\xfe\x00" or not schedule.verify_proof(auth_root, transcript.snapshot(), cv[8:]):
-                    raise ProtocolError("server authentication verification failed")
+                    raise ProtocolError("server authentication verification failed", alert=51)
                 transcript.add(cv)
             sf = await wire.receive_frame(20, receiver, boundary=True)
             if not schedule.verify_finished(server_secret, transcript.snapshot(), sf[4:]):
-                raise ProtocolError("server Finished verification failed")
+                raise ProtocolError("server Finished verification failed", alert=51)
             transcript.add(sf)
             if pin_attempt is not None:
                 effective_spki = static_key.public_bytes(serialization.Encoding.DER,
@@ -1979,6 +2078,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 selected_external_psk_identity=selected_external_identity, bootstrap_binding=bootstrap_binding,
                 bootstrap_authorization=bootstrap_authorization,
                 credential_expires_at=credential_expires_at,
+                allowed_psk_modes=tuple(mode for mode in psk_modes if mode in (0, 1)),
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode,
                 peer_authenticated=not unauthenticated, native_provider=native_provider)
             channel.client_credential_candidates = credential_candidates

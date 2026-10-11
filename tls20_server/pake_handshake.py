@@ -10,7 +10,7 @@ import hmac
 import os
 
 from . import crypto as c, messages as m
-from .errors import ProtocolError
+from .errors import ProtocolError, PeerClosed
 from .pake import PasswordCredential, PasswordServer, SUITES, RESUMPTION_SUITES, password_base
 from .handshake_options import client_controls, server_controls, client_control_selection
 from .diagnostics import emit as emit_diagnostic
@@ -68,6 +68,13 @@ async def _next_after_retry(wire, early):
         record = await wire.raw_record()
         if record[0] == 20 and record[5:] == b"\x01":
             continue
+        if record[0] == 21:
+            fragment = record[5:]
+            if len(fragment) != 2:
+                raise ProtocolError("malformed alert", alert=50)
+            if fragment[1] == 90:
+                continue
+            raise PeerClosed("peer closed or aborted the password retry", alert=fragment[1])
         if record[0] == 22:
             wire.pending.extend(record[5:])
             return await wire.receive_frame(1, boundary=True)
@@ -86,10 +93,14 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                  cipher_suites=SUITES, ticket_store=None, max_early_data=0, on_early_data=None,
                  record_size_limit=None, heartbeat_mode=None, ticket_count_limit=1, signaling=None,
                  require_server_name=True, require_alpn=True, diagnostics=None,
-                 on_exporter=None, on_early_exporter=None, groups=tuple(GROUPS), enable_authenticators=False):
+                 on_exporter=None, on_early_exporter=None, groups=tuple(GROUPS), enable_authenticators=False,
+                 retry_cookie_policy=None):
     from .handshake import (Wire, Transcript, SecureChannel, check_timeout, handshake_keys, application_keys,
                             _record_limit, _peer_record_limit, _peer_fragment_limit, _retry_psks_unchanged)
     check_timeout(timeout)
+    from .retry_cookie import RetryCookiePolicy, validate_retry_cookie
+    if retry_cookie_policy is not None and not isinstance(retry_cookie_policy, RetryCookiePolicy):
+        raise ValueError("explicit RetryCookiePolicy required")
     if not isinstance(policy, PasswordServer):
         raise ValueError("explicit password server policy required")
     if not cipher_suites or any(type(value) is not int or value not in SUITES for value in cipher_suites) or len(set(cipher_suites)) != len(cipher_suites):
@@ -133,7 +144,8 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                 selected_id = None
                 for index, (identity_bytes, age, binder) in enumerate(hello.psk_offers):
                     candidate = ticket_store.lookup(identity_bytes, policy.service, protocol, context)
-                    if candidate is None or not candidate.pake_identity:
+                    if (candidate is None or not candidate.pake_identity
+                            or not set(candidate.allowed_psk_modes).intersection(hello.psk_modes)):
                         continue
                     compatible = tuple(value for value in successors if value in hello.cipher_suites
                         and c.suite(value).hash_name == c.suite(candidate.cipher_suite).hash_name)
@@ -146,6 +158,8 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             if selected_id is None:
                 raise ProtocolError("no acceptable password-mode cipher suite")
             selected, schedule = c.suite(selected_id), c.KeySchedule(c.suite(selected_id).hash_name)
+            if ticket is not None and len(binder) != selected.hash_length:
+                raise ProtocolError("password session binder has the wrong hash length", alert=51)
             wire.allow_ccs = True
             if pwd:
                 identity, account, authorized = policy.acquire(ext); acquired = True
@@ -155,36 +169,65 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                     raise ProtocolError("no supported password group")
                 # A selected PWD exchange rejects every PSK/early-data offer.
                 # Salt or an empty/mixed CH requires exactly one useful HRR.
-                retry = account.salt is not None or not hello.B or hello.group != group or hello.early_data
+                retry = (account.salt is not None or not hello.B or hello.group != group
+                         or hello.early_data or retry_cookie_policy is not None)
                 if retry:
+                    retry_cookie = (retry_cookie_policy.issue(writer, ch, selected_id, group)
+                                    if retry_cookie_policy is not None else b"")
                     hrr = m.server_hello(b"", bytes(32), retry=True, group=group,
-                        cipher_suite=selected_id, session_id=hello.session_id, password_salt=account.salt)
+                        cipher_suite=selected_id, session_id=hello.session_id, password_salt=account.salt,
+                        cookie=retry_cookie)
                     await wire.send_frame(hrr)
                     if hello.session_id:
                         await wire.send_ccs()
                     transcript.retry(ch, hrr, selected.hash_name)
                     ch2 = await _next_after_retry(wire, hello.early_data)
                     second = m.parse_client_hello(ch2[4:], enabled_groups=(group,), password_authenticated=True)
+                    validate_retry_cookie(retry_cookie_policy, dict(second.extension_values), retry_cookie,
+                                          writer, ch, selected_id, group)
                     mutable = {21, 41, 42, 44, 51}
                     stable = lambda value: {k: v for k, v in value.extension_values if k not in mutable}
                     if (second.fixed_hello != hello.fixed_hello or stable(second) != stable(hello)
-                            or second.share_groups != (group,) or second.early_data or 44 in second.extensions
+                            or second.share_groups != (group,) or second.early_data
                             or not _retry_psks_unchanged(hello, second, selected.hash_length)):
                         raise ProtocolError("forbidden PWD retry mutation", alert=47)
                     ch, hello = ch2, second
                 public, shared = await _native_work(lambda: _server_commit(policy.provider, account.base,
                     hello.random, group, selected.hash_name, hello.B))
             else:
-                if not hmac.compare_digest(c.binder(ticket.psk, c.PREFACE + ch[:-hello.binder_vector_size],
+                if retry_cookie_policy is not None:
+                    retry_cookie = retry_cookie_policy.issue(writer, ch, selected_id, 0)
+                    hrr = m.server_hello(b"", bytes(32), retry=True, group=0,
+                        cipher_suite=selected_id, session_id=hello.session_id, cookie=retry_cookie)
+                    await wire.send_frame(hrr)
+                    if hello.session_id:
+                        await wire.send_ccs()
+                    transcript.retry(ch, hrr, selected.hash_name)
+                    ch2 = await _next_after_retry(wire, hello.early_data)
+                    second = m.parse_client_hello(ch2[4:])
+                    validate_retry_cookie(retry_cookie_policy, dict(second.extension_values), retry_cookie,
+                                          writer, ch, selected_id, 0)
+                    stable = lambda value: {k: v for k, v in value.extension_values if k not in {21, 41, 42, 44}}
+                    if (second.fixed_hello != hello.fixed_hello or stable(second) != stable(hello)
+                            or second.early_data or not _retry_psks_unchanged(hello, second, selected.hash_length)):
+                        raise ProtocolError("forbidden password resumption retry mutation", alert=47)
+                    ch, hello = ch2, second
+                    identity_index = next((index for index, offer in enumerate(hello.psk_offers)
+                                          if offer[0] == ticket.identity), None)
+                    if identity_index is None:
+                        raise ProtocolError("selected password session was removed after retry", alert=47)
+                    binder = hello.psk_offers[identity_index][2]
+                if not hmac.compare_digest(c.binder(ticket.psk, transcript.snapshot() + ch[:-hello.binder_vector_size],
                             hash_name=selected.hash_name), binder):
-                    raise ProtocolError("password session binder failed")
+                    raise ProtocolError("password session binder failed", alert=51)
                 identity, authorized = ticket.pake_identity, policy.authorized(ticket.pake_identity)
                 if not authorized:
                     raise ProtocolError("password session is no longer authorized")
                 group = hello.group
-                if 1 in hello.psk_modes and hello.B:
+                allowed_modes = set(ticket.allowed_psk_modes).intersection(hello.psk_modes)
+                if 1 in allowed_modes and hello.B:
                     public, shared = c.traffic_server(group, hello.B)
-                elif 0 in hello.psk_modes:
+                elif 0 in allowed_modes:
                     group, public, shared = 0, b"", bytes(selected.hash_length)
                 else:
                     raise ProtocolError("password successor requires a compatible PSK mode")
@@ -263,10 +306,13 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             if not schedule.verify_finished(client_secret, transcript.snapshot(), cf[4:]) or not authorized or not policy.authorized(identity):
                 raise ProtocolError("password authentication failed", alert=20)
             transcript.add(cf)
+            successor_modes = tuple(mode for mode in dict.fromkeys(hello.psk_modes)
+                if mode in (0, 1) and (ticket is None or mode in ticket.allowed_psk_modes))
             channel = SecureChannel(wire, server_app, client_app, exporter_secret=exporter,
                 role="server", protocol=protocol, cipher_suite=selected_id, resumed=ticket is not None,
                 early_data_accepted=accepted, early_exporter_secret=early_exporter,
                 handshake_transcript=transcript.snapshot(), psk_provenance="pake", pake_identity=identity,
+                allowed_psk_modes=successor_modes,
                 enable_authenticators=enable_authenticators,peer_auth_share=hello.A,peer_capabilities=hello.extension_values,
                 receive_record_limit=receive_limit, send_record_limit=send_limit,
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode)
@@ -276,13 +322,14 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             for access in exporter_accesses:
                 access.complete(peer_authenticated=True)
             channel._exporter_accesses = tuple(exporter_accesses)
-            if ticket_store is not None and 45 in ext:
+            if ticket_store is not None and 45 in ext and successor_modes:
                 resumption = schedule.derive_secret(schedule.master_secret(root), "res master", transcript.snapshot())
                 ordinary_suite = RESUMPTION_SUITES.get(selected_id, selected_id)
                 early_limit = max_early_data if on_early_data is not None and selected_id != 0xc0b3 else 0
                 for _ in range(controls.expected_tickets if controls.expected_tickets is not None else 1):
                     message = ticket_store.issue(resumption, policy.service, protocol, early_limit, context,
-                                                 cipher_suite=ordinary_suite, pake_identity=identity)
+                                                 cipher_suite=ordinary_suite, pake_identity=identity,
+                                                 allowed_psk_modes=successor_modes)
                     if message:
                         await channel.send_handshake(message)
             return channel
@@ -328,6 +375,8 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                credential.context() + (signaling.context() if signaling is not None else b""))
     protocol = application_protocols[0] if application_protocols else b""
     ticket = ticket_cache.take(credential.service, protocol, context) if ticket_cache and not _first_flight else None
+    if ticket is not None and 1 not in ticket.allowed_psk_modes:
+        ticket = None  # This client profile offers only fresh-DHE resumption.
     permitted_successors = {RESUMPTION_SUITES[value] for value in cipher_suites if value in RESUMPTION_SUITES}
     if ticket is not None and (ticket.pake_identity != credential.identity or ticket.cipher_suite not in permitted_successors):
         ticket = None
@@ -424,6 +473,21 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                     raise ProtocolError("inconsistent password retry selection")
                 shared=await _native_work(lambda: state.finish(public_peer));state=None
             else:
+                if retry:
+                    if selected_group or not cookie or resumed or selected_id != ticket.cipher_suite:
+                        raise ProtocolError("invalid password successor retry", alert=47)
+                    transcript.retry(ch, sh, selected.hash_name)
+                    kwargs["early_data"] = False
+                    kwargs["cookie"] = cookie
+                    ch = make_hello(public)
+                    size = selected.hash_length
+                    ch = ch[:-size] + c.binder(ticket.psk, transcript.snapshot() + ch[:-(size+3)],
+                                               hash_name=selected.hash_name)
+                    await wire.send_frame(ch)
+                    sh = await wire.receive_frame(2, boundary=True)
+                    public_peer,sid,resumed,selected_group,retry,cookie,final_suite=m.parse_server_hello(sh[4:],with_suite=True)
+                    if sid or cookie or final_suite != selected_id:
+                        raise ProtocolError("inconsistent password successor retry", alert=47)
                 if retry or not resumed or selected_group!=29 or int.from_bytes(m.server_hello_extensions(sh[4:]).get(41,b""),"big")!=0:
                     raise ProtocolError("password successor ticket was not selected; fresh connection required")
                 shared=c.traffic_dh(ordinary_private,29,public_peer)
@@ -468,6 +532,7 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                 role="client",protocol=protocol,cipher_suite=selected_id,resumed=ticket is not None,
                 early_data_accepted=accepted,early_exporter_secret=early_exporter,
                 handshake_transcript=transcript.snapshot(),psk_provenance="pake",pake_identity=credential.identity,
+                allowed_psk_modes=(1,),
                 enable_authenticators=enable_authenticators,auth_share_secret=auth_private,
                 local_capabilities=m.parse_client_hello(ch[4:],password_authenticated=ticket is None).extension_values,
                 receive_record_limit=receive_limit,send_record_limit=send_limit,

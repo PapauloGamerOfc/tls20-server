@@ -17,6 +17,10 @@ private_key = "lab/server.key"
 
 max_connections = 128
 handshake_timeout_seconds = 10
+# Optional reachability challenge: adds one RTT and disables 0-RTT acceptance
+# for challenged handshakes. Uses ephemeral per-listener HMAC keys, no disk cache.
+retry_cookie = false
+retry_cookie_lifetime_seconds = 30 # 1..300
 connect_timeout_seconds = 5
 idle_timeout_seconds = 60
 max_connection_seconds = 3600

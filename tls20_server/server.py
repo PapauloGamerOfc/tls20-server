@@ -124,6 +124,9 @@ class RunningServer:
         self.config = config
         self.credentials = credentials
         self.profile = profile
+        from .retry_cookie import RetryCookiePolicy
+        self.retry_cookie_policy = (RetryCookiePolicy(lifetime_seconds=config.retry_cookie_lifetime_seconds)
+                                    if config.retry_cookie else None)
         # Tickets and replay reservations are confined to this listener's
         # lifetime. Restarting or replacing its credentials invalidates them;
         # no reusable ticket keys are silently restored without replay state.
@@ -212,6 +215,7 @@ class RunningServer:
                         certificate_compression=self.config.certificate_compression,
                         heartbeat_mode=self.config.heartbeat_mode or None,
                         ticket_count_limit=self.config.ticket_count_limit,
+                        retry_cookie_policy=self.retry_cookie_policy,
                     ), timeout=self.config.handshake_timeout_seconds,
                 )
                 if gate.rejected:

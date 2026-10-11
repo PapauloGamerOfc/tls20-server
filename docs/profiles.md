@@ -318,7 +318,19 @@ client validation uses `[trust.its]`, and server-side client validation uses
 `application_scope_hex`, `ssp_coer_hex`, `roots` (COER files),
 `authorized_leaf_sha256`, `revoked_sha256`, `inventory_valid_until` (IEEE Time64),
 `max_grant_lifetime_microseconds`, and a trusted `tai_utc_offset`.
-`allowed_regions` can contain exact COER region files. The trusted inventory and
+`allowed_regions` contains COER files for authenticated service footprints.
+Optional `geographic_containment` is an array of `{parent="parent.coer",
+child="child.coer"}` tables referencing canonical COER region files, resolved
+relative to the profile. Each exact, directional pair must be provisioned by
+the application's trusted geography authority and asserts valid geometry plus
+containment of the child in the parent. It must never be constructed from a
+peer's unsupported region or obtained by trust on first use. Native WGS84
+circle, rectangle-union and administrative-hierarchy checks cannot be
+overridden when they reject containment. General geodesic polygon/cross-kind
+containment requires these local statements; it is not inferred from a planar
+approximation. Polygon equality also needs its exact `(region, region)` validity
+statement. The complete policy, including statement direction, binds resumption
+tickets and its lifetime is capped by the inventory expiry. The trusted inventory and
 clock offset must be maintained externally; the implementation does not pretend
 to fetch/verify arbitrary ITS CRLs. Signature/path/permission/grant validation
 and the normal online MAC/Finished are all required. A parser alone is not

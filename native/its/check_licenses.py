@@ -47,7 +47,7 @@ def main():
             text = file.read_text(encoding="utf8")
             if not text.strip():
                 raise SystemExit(f"Empty license: {file}")
-            output.append(text.strip() + "\n")
+            output.append("\n".join(line.rstrip() for line in text.strip().splitlines()) + "\n")
     (root / "THIRD_PARTY_NOTICES.txt").write_text("\n".join(output), encoding="utf8", newline="\n")
     print(f"Reviewed {len(metadata['packages'])-1} dependency licenses; notices generated.")
 

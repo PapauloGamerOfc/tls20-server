@@ -106,6 +106,7 @@ def _read_frame(reader, expected):
 
 
 def _offers(extensions, role):
+    m.validate_delegation_offer(extensions)
     if 50 not in extensions:
         raise ProtocolError("authenticator request requires certificate path algorithms")
     algorithms = m._u16_list(extensions[50])
@@ -132,6 +133,7 @@ def parse_request(wire):
     role = "server" if kind == 17 else "client"
     context, extensions = body.vector(1), m.extensions(body.vector(2))
     body.end()
+    m.validate_extension_context(extensions, "ASR" if role == "server" else "ACR")
     expected, forbidden = (0xff02, 0xff03) if role == "server" else (0xff03, 0xff02)
     if len(extensions.get(expected, b"")) != 32 or forbidden in extensions:
         raise ProtocolError("invalid application authenticator verifier share")
@@ -170,7 +172,7 @@ def _parse_certificate(body):
         if not der:
             raise ProtocolError("empty authenticator certificate entry")
         chain.append(der)
-        extensions.append(tuple(m.extensions(entries.vector(2)).items()))
+        extensions.append(tuple(m.extensions(entries.vector(2), context="CE").items()))
     return CertificateIdentity(tuple(chain), tuple(extensions), context)
 
 

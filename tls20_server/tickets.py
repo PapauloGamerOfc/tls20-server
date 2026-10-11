@@ -41,6 +41,9 @@ class SessionTicket:
     # Original wall-clock credential deadline. Revalidating cached DNSSEC
     # evidence must not restart its TTL for every resumption/new ticket.
     credential_expires_at: float | None = None
+    # Local state, not an NST wire field. A successor cannot acquire a mode
+    # that the ClientHello authorizing its ancestor ticket did not offer.
+    allowed_psk_modes: tuple[int, ...] = (1, 0)
 
     def expired(self, now=None):
         return ((time.monotonic() if now is None else now) - self.issued >= self.lifetime
@@ -67,7 +70,12 @@ class TicketStore:
 
     def issue(self, secret, name, protocol, max_early_data=0, context=b"", client_certificate_chain=None,
               *, cipher_suite=0x1301, client_certificate_type=0, client_certificate_extensions=(),
-              external_psk_identity=b"", pake_identity=b"", native_provider=None):
+              external_psk_identity=b"", pake_identity=b"", native_provider=None,
+              allowed_psk_modes=(1, 0)):
+        allowed_psk_modes = tuple(allowed_psk_modes)
+        if (not allowed_psk_modes or len(set(allowed_psk_modes)) != len(allowed_psk_modes)
+                or any(type(mode) is not int or mode not in (0, 1) for mode in allowed_psk_modes)):
+            raise ValueError("invalid ticket PSK key exchange modes")
         nonce, identity = os.urandom(8), os.urandom(32)
         age_add = int.from_bytes(os.urandom(4), "big")
         selected = c.suite(cipher_suite)
@@ -97,6 +105,7 @@ class TicketStore:
             ticket.client_certificate_extensions = tuple(client_certificate_extensions)
             ticket.external_psk_identity = external_psk_identity
             ticket.pake_identity = pake_identity
+            ticket.allowed_psk_modes = allowed_psk_modes
             self._tickets[identity] = ticket
             self._bytes += size
         return message

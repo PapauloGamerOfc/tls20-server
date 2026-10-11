@@ -123,6 +123,14 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend_connections, 8)
         self.assertTrue(all(output.getvalue() == outputs[0].getvalue() for output in outputs))
 
+    async def test_configured_retry_cookie_preserves_authenticated_http_forwarding(self):
+        port = await self.proxy(retry_cookie=True, retry_cookie_lifetime_seconds=15)
+        output = io.BytesIO()
+        await fetch(f"httpps://localhost:{port}/cookie", self.roots,
+                    revocation_policy="lab-offline", connect_host="127.0.0.1", output=output)
+        self.assertTrue(output.getvalue().startswith(b"HTTP/1.1 200 OK"))
+        self.assertEqual(self.backend_connections, 1)
+
     async def test_fetch_explicit_general_pkix_policy(self):
         port = await self.proxy()
         output = io.BytesIO()

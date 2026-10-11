@@ -59,6 +59,37 @@ authenticates a client, application authorization remains an explicit policy.
 
 ## Optional client authentication API
 
+### Explicit retry-cookie policy
+
+`server_handshake(..., retry_cookie_policy=RetryCookiePolicy())` and the password
+server API can send a cookie-only HelloRetryRequest, or combine the cookie with
+the necessary group/salt retry. The forwarding configuration exposes
+`retry_cookie=false` (default) and `retry_cookie_lifetime_seconds=30` (1..300).
+Enabling it adds one RTT and rejects 0-RTT for that exchange; it is not enabled
+as a general performance optimization. The ordinary fast resumption/early-data
+path remains unchanged with the default.
+
+`tls20_server.retry_cookie.RetryCookiePolicy` uses an OS-random 256-bit HMAC key,
+fixed-size opaque cookies and a bounded lifetime. It binds the cookie to the
+transport peer IP, exact initial ClientHello, selected suite and requested
+group; changed/missing/expired cookies are rejected before proceeding. No
+per-cookie store grows with traffic. The listener's key is not persisted and
+restart invalidates cookies. TCP connection/transcript state remains bounded
+by the existing connection and handshake limits: this is a stateless cookie
+token, not a claim of an entirely stateless TCP server. A cookie proves
+reachability only, never credential authentication or replay-safe early data.
+
+The parser validates recognized extension placement and delegation offers
+before selecting ordinary credentials or resumption. This also applies to
+initial/PHA/cached certificate requests and application-authenticator requests.
+Version negotiation uses the specification's distinct `protocol_version`,
+`missing_extension`, `decode_error` and `illegal_parameter` alerts. Unknown
+offers still follow their defined ignore rules. `user_canceled` is advisory
+during and after the handshake, and received fatal/closure alerts do not cause
+an alert-response loop.
+
+### Client certificate policy
+
 `server_handshake(..., client_auth_validator=callback,
 require_client_auth=False)` requests initial client authentication on a full
 handshake. `require_client_auth=True` requires a validator and refuses an empty
@@ -70,6 +101,19 @@ EKU, and the application's revocation policy. It must return the authorized
 key. The server's restricted server-EKU validator is not substituted for this
 client policy. Callback approval is not identity establishment: MAC and Finished
 must also pass before `channel.authenticated_client` is populated.
+
+Certificate-chain signatures and delegation-grant signatures have independent
+preference lists. The server API accepts `client_certificate_algorithms` and
+`client_delegation_signature_algorithms`; the client API accepts
+`server_certificate_algorithms` and `server_delegation_signature_algorithms`.
+Each defaults to the available provider's supported public signature schemes,
+but explicit nonempty lists may differ (for example an ECDSA chain and Ed25519
+grant). Unknown, duplicate, unavailable or online-MAC schemes are rejected as
+local policy errors. PHA can override the two lists for an individual request
+using `certificate_algorithms` and `delegation_signature_algorithms`; enabling
+the latter requires an existing delegation verifier. Resumption is isolated
+when either handshake preference changes. These are embedding API controls,
+not additional mandatory server configuration fields.
 
 `client_handshake(..., client_credentials=Credentials(...),
 post_handshake_auth=True)` supplies an optional client chain/private key and
@@ -101,11 +145,23 @@ identity present when issued; later PHA does not promote those earlier tickets.
 ## Optimizations and 0-RTT policy
 
 Session tickets are enabled by default. Tickets and replay state live only in
-bounded process memory. Restarting discards both, causing a fresh handshake;
+bounded process memory. Restarting discards both, requiring fresh authentication;
 the server never restores tickets without their replay state. Expired entries
 are removed from the insertion-ordered prefix, avoiding a full cache scan per
 handshake. Capacity eviction invalidates a ticket rather than forgetting its
 replay state while continuing to accept it.
+
+Each ticket locally retains the allowed `psk_key_exchange_modes` from its
+authorizing ClientHello. Resumption intersects that restriction with the new
+offer and current server policy before any early-data authorization; successor
+tickets cannot widen it. The final selected identity is checked again after
+HelloRetryRequest, so an expired first candidate cannot lend its modes to a
+different ticket selected afterward. This also applies to combined-PSK and password-session
+descendants, without adding an NST wire field. A client with no compatible mode
+discards the cached ticket and authenticates afresh without early data. If an
+explicit external PSK is required and the server declines its descendant ticket,
+the client rejects credential-only fallback; a new attempt must prove the
+provisioned external key instead of silently losing that authentication factor.
 
 Besides the configured entry count, `TicketStore` has a default 16 MiB accounted
 byte budget. It counts retained identity, PSK, context and client-certificate
@@ -270,12 +326,15 @@ than replace, end-to-end tests that share implementation code.
 
 ### Local validation: 2026-10-11
 
-The Windows native-provider suite ran twice after the final fixes: 498 tests
-per run, both successful. The two skips are Windows-specific POSIX-mode and
+The final Windows native-provider suite completed successfully: 534 tests.
+The two skips are Windows-specific POSIX-mode and
 symlink-privilege checks, not missing cryptographic profiles. Optional OpenSSL,
 PAKE, GOST and ITS providers were supplied explicitly; missing native coverage
 is an error in the runner. The production wheel and source archive were rebuilt
 and the wheel's CLI verified in an isolated environment outside the checkout.
+Python 3.11 was also checked separately: 534 tests completed successfully,
+with 74 optional-provider/OS skips in that minimal environment. In particular,
+the strict IPv6 authority regression that failed the earlier CI is covered.
 
 A repeated run exposed a native thread-lifetime defect before these results:
 executor threads retained OpenSSL resources after their private context was

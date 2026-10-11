@@ -96,6 +96,70 @@ class PakeHandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.early)
         self.assertEqual(self.policy._active,0)
 
+    async def test_password_ticket_modes_remain_bound_before_early_authorization(self):
+        from tls20_server import messages
+        await self.connect()
+        cached = next(iter(self.cache._tickets.values()))
+        server_ticket = self.store._tickets[cached.identity]
+        self.assertEqual(cached.allowed_psk_modes, (1,))
+        self.assertEqual(server_ticket.allowed_psk_modes, (1,))
+        original = messages.client_hello
+        def forbidden_mode(A, B, *args, **kwargs):
+            if kwargs.get("identity"):
+                kwargs["psk_modes"] = (0,)
+                kwargs["group"] = 0
+                B = b""
+            return original(A, B, *args, **kwargs)
+        with patch.object(messages, "client_hello", forbidden_mode):
+            with self.assertRaises(ProtocolError):
+                await self.connect(early_data=b"forbidden password early")
+        self.assertFalse(server_ticket.early_used)
+        self.assertFalse(self.early)
+        self.assertEqual(len(self.store._tickets), 1)
+        # The honest mode-1 client discards an incompatible cache entry and
+        # proves the password afresh without forwarding the old early request.
+        self.cache.put(replace(cached, allowed_psk_modes=(0,)))
+        channel = await self.connect(early_data=b"old cache authority")
+        self.assertFalse(channel.resumed)
+        self.assertFalse(channel.early_data_accepted)
+        self.assertFalse(self.early)
+
+    async def test_cookie_bound_password_retry_and_successor_retry(self):
+        from tls20_server.retry_cookie import RetryCookiePolicy
+        self.options["retry_cookie_policy"] = RetryCookiePolicy()
+        first = await self.connect()
+        self.assertFalse(first.resumed)
+        second = await self.connect(early_data=b"rejected after retry")
+        self.assertTrue(second.resumed)
+        self.assertFalse(second.early_data_accepted)
+        await second.send(b"password cookie")
+        self.assertEqual(await second.recv(), b"password cookie")
+        self.assertFalse(self.early)
+        self.assertFalse(self.errors)
+
+    async def test_password_successor_bad_binder_has_exact_alert_before_or_after_retry(self):
+        from tls20_server import messages as m
+        from tls20_server.retry_cookie import RetryCookiePolicy
+        from tests.test_conformance import replace_extensions
+        self.options["retry_cookie_policy"] = RetryCookiePolicy()
+        for length in (48, 32):
+            self.cache = TicketCache()
+            await self.connect()
+            original = Wire.send_frame
+            async def send(wire, message, state=None):
+                if message[0] == 1:
+                    def mutate(ext):
+                        reader = m._Reader(ext[41])
+                        identities = reader.vector(2)
+                        reader.vector(2); reader.end()
+                        ext[41] = m._vec(identities, 2) + m._vec(m._vec(bytes(length), 1), 2)
+                    message = replace_extensions(message, mutate)
+                return await original(wire, message, state)
+            with self.subTest(length=length), patch.object(Wire, "send_frame", send), self.assertRaises(ProtocolError) as raised:
+                await self.connect()
+            self.assertEqual(raised.exception.alert, 51)
+        self.assertEqual(len(self.channels), 2)
+
     async def test_successor_selection_uses_ticket_hash_not_first_ordinary_offer(self):
         from tls20_server import messages
         self.options={"cipher_suites":(0xc0b1,)}

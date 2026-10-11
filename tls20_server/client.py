@@ -53,6 +53,21 @@ def parse_url(url):
             raise ValueError("expected httpps://name[:port]/path without credentials")
         if parsed.fragment or any(ord(char) < 33 or ord(char) == 127 for char in url):
             raise ValueError("URL contains a fragment, whitespace or control characters")
+        # urlsplit on Python 3.11 accepts junk after a closing IPv6 bracket.
+        # Validate the entire authority, not only its extracted hostname/port.
+        authority = parsed.netloc
+        if authority.startswith("["):
+            closing = authority.find("]")
+            suffix = authority[closing + 1:]
+            if closing < 0 or suffix and (not suffix.startswith(":") or not suffix[1:].isascii()
+                                        or not suffix[1:].isdigit()):
+                raise ValueError("invalid bracketed IP authority")
+            ipaddress.IPv6Address(authority[1:closing])
+        elif "[" in authority or "]" in authority or authority.count(":") > 1:
+            raise ValueError("invalid URL authority")
+        elif ":" in authority and (not authority.rsplit(":", 1)[1].isascii()
+                                   or not authority.rsplit(":", 1)[1].isdigit()):
+            raise ValueError("invalid URL port")
         hostname = parsed.hostname.encode("idna").decode("ascii").lower()
         try:
             hostname = str(ipaddress.ip_address(hostname))

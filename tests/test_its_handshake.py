@@ -16,8 +16,10 @@ from tls20_server.tickets import TicketCache, TicketStore
 from tests import test_sessions
 
 
-def load_live_fixture():
+def load_live_fixture(profile=""):
     directory = Path(os.environ["TLS20_ITS_FIXTURE_DIR"])
+    if profile:
+        directory = directory / profile
     wire = (directory / "live-policy.bin").read_bytes()
     cursor = 37
     def vector(width):
@@ -127,3 +129,21 @@ class ITSHandshakeTests(unittest.IsolatedAsyncioTestCase):
             await self.connect()
         self.assertEqual(self.channels, [])
         self.assertEqual(self.early, [])
+
+    async def test_brainpool_and_implicit_profiles_over_real_tcp(self):
+        for profile in ("brainpool256", "brainpool384", "implicit-nist256", "implicit-brainpool256"):
+            with self.subTest(profile=profile):
+                directory, policy = load_live_fixture(profile)
+                private = X25519PrivateKey.from_private_bytes(bytes([9])*32)
+                self.credentials = Credentials([(directory / "live-server.bin").read_bytes()], private,
+                    credential_type=3, its_policy=policy)
+                self.peer_policy = CredentialPolicy(peer_name="example.test", its_policy=policy)
+                self.store, self.cache = TicketStore(), TicketCache()
+                first = await self.connect()
+                self.assertFalse(first.resumed)
+                second = await self.connect(early_data=b"profile early data")
+                self.assertTrue(second.resumed)
+                self.assertTrue(second.early_data_accepted)
+                await second.send(b"profile application data")
+                self.assertEqual(await asyncio.wait_for(second.recv(), 5), b"profile application data")
+        self.assertFalse(self.errors)

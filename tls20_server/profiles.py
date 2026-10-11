@@ -747,7 +747,15 @@ def _its(data, files, *, role, identity):
     from .its_credentials import ITSProvider, ITSServicePolicy
     data = _table(data, ("library", "psid", "application_scope_hex", "ssp_coer_hex", "roots",
         "authorized_leaf_sha256", "revoked_sha256", "inventory_valid_until", "max_grant_lifetime_microseconds",
-        "tai_utc_offset", "allowed_regions"), "ITS authorization")
+        "tai_utc_offset", "allowed_regions", "geographic_containment"), "ITS authorization")
+    containment = []
+    for relation in _array(data.get("geographic_containment", []), "ITS geographic containment", maximum=256):
+        relation = _table(relation, ("parent", "child"), "ITS geographic containment statement")
+        parent = files.read(relation.get("parent"), 16384)
+        child = files.read(relation.get("child"), 16384)
+        if not parent or not child:
+            raise ConfigurationError("ITS geographic containment requires nonempty COER region files")
+        containment.append((parent, child))
     policy = ITSServicePolicy(ITSProvider(files.path(data.get("library"))), identity, role,
         _integer(data.get("psid"), 0, (1 << 64)-1, "ITS PSID"),
         _hex(data.get("application_scope_hex"), "ITS application scope"),
@@ -760,7 +768,8 @@ def _its(data, files, *, role, identity):
         _integer(data.get("inventory_valid_until"), 1, (1 << 64)-1, "ITS inventory expiry"),
         _integer(data.get("max_grant_lifetime_microseconds"), 1, (1 << 64)-1, "ITS grant lifetime"),
         _integer(data.get("tai_utc_offset"), 0, 100, "trusted TAI-UTC offset"),
-        tuple(files.read(value, 16384) for value in _array(data.get("allowed_regions", []), "ITS regions", maximum=32)))
+        tuple(files.read(value, 16384) for value in _array(data.get("allowed_regions", []), "ITS regions", maximum=32)),
+        tuple(containment))
     policy_bytes = policy.policy_bytes()
     if policy.inventory_valid_until <= int.from_bytes(policy_bytes[4:12], "big"):
         raise ConfigurationError("ITS authorization inventory is already expired")

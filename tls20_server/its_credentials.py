@@ -1,4 +1,4 @@
-"""Explicit offline IEEE 1609.2 ITS-X25519 grant profile.
+"""Provisioned offline IEEE 1609.2 ITS-X25519 grant profiles.
 
 The native provider verifies COER, signatures, path and permission constraints;
 the normal TLS20 handshake must still verify the X25519 MAC and Finished.
@@ -73,6 +73,9 @@ class ITSServicePolicy:
     provider does not download or pretend to parse signed ITS CRLs. The explicit
     tai_utc_offset must be maintained by the deployment's trusted time source.
     SSP is exact canonical COER ServiceSpecificPermissions, or empty for absent.
+    allowed_regions_coer contains authenticated service footprints. General
+    WGS84 polygon/cross-kind containment needs exact parent/child statements
+    from the deployment's trusted geography authority, never peer input.
     """
     provider: ITSProvider
     identity: str
@@ -87,6 +90,9 @@ class ITSServicePolicy:
     max_grant_lifetime_microseconds: int
     tai_utc_offset: int
     allowed_regions_coer: tuple[bytes, ...] = ()
+    # Exact (parent, child) canonical COER pairs certified by a locally trusted
+    # geometry authority. Not peer input, discovery or trust on first use.
+    geographic_containment: tuple[tuple[bytes, bytes], ...] = ()
 
     def policy_bytes(self, *, now=None):
         if (not isinstance(self.provider, ITSProvider) or not isinstance(self.identity, str)
@@ -94,7 +100,8 @@ class ITSServicePolicy:
                 or type(self.tai_utc_offset) is not int or not 0 <= self.tai_utc_offset <= 100
                 or not 1 <= len(self.trust_roots) <= 32
                 or not 1 <= len(self.authorized_leaf_sha256) <= 1024
-                or len(self.revoked_sha256) > 4096 or len(self.allowed_regions_coer) > 32):
+                or len(self.revoked_sha256) > 4096 or len(self.allowed_regions_coer) > 32
+                or len(self.geographic_containment) > 256):
             raise ProtocolError("invalid or absent ITS service policy")
         if now is not None:
             if not isinstance(now, datetime) or now.tzinfo is None:
@@ -116,6 +123,14 @@ class ITSServicePolicy:
             + _vector(roots, 3) + _vector(b"".join(self.authorized_leaf_sha256), 3)
             + _vector(b"".join(self.revoked_sha256), 3)
             + _vector(b"".join(_vector(region, 3) for region in self.allowed_regions_coer), 3))
+        if self.geographic_containment:
+            encoded = []
+            for pair in self.geographic_containment:
+                if (not isinstance(pair, tuple) or len(pair) != 2
+                        or any(not isinstance(region, bytes) or not 1 <= len(region) <= 16384 for region in pair)):
+                    raise ProtocolError("invalid locally authenticated ITS geometry statement")
+                encoded.append(_vector(pair[0], 3) + _vector(pair[1], 3))
+            value += b"GEO1" + _vector(b"".join(encoded), 3)
         if len(value) > MAX_INPUT:
             raise ProtocolError("ITS policy exceeds provider budget")
         return value

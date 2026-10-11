@@ -11,3 +11,7 @@ class ProtocolError(ValueError):
 
 class ConfigurationError(ValueError):
     """Invalid local settings or credential files."""
+
+
+class PeerClosed(ProtocolError):
+    """A peer alert ended the exchange; do not send a responding fatal alert."""

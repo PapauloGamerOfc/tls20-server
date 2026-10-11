@@ -46,6 +46,8 @@ class Config:
     profile_file: Path | None = None
     max_connections: int = 128
     handshake_timeout_seconds: float = 10
+    retry_cookie: bool = False
+    retry_cookie_lifetime_seconds: int = 30
     connect_timeout_seconds: float = 5
     idle_timeout_seconds: float = 60
     max_connection_seconds: float = 3600
@@ -92,9 +94,11 @@ class Config:
             "idle_timeout_seconds", "max_connection_seconds",
         ):
             _positive_number(name, getattr(self, name))
-        for name in ("session_tickets", "upstream_early_data_aware"):
+        for name in ("session_tickets", "upstream_early_data_aware", "retry_cookie"):
             if type(getattr(self, name)) is not bool:
                 raise ConfigError(f"{name} must be a boolean")
+        if type(self.retry_cookie_lifetime_seconds) is not int or not 1 <= self.retry_cookie_lifetime_seconds <= 300:
+            raise ConfigError("retry_cookie_lifetime_seconds must be 1..300")
         _positive_integer("ticket_lifetime_seconds", self.ticket_lifetime_seconds)
         if self.ticket_lifetime_seconds > 604800:
             raise ConfigError("ticket_lifetime_seconds exceeds the seven-day TLS ticket lifetime")

@@ -1,17 +1,20 @@
 """Provisioned PSK modes, importer domain separation, and actual wire exchanges."""
 
 from dataclasses import replace
+import asyncio
 import hashlib
 import hmac
 import unittest
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
 from tls20_server import crypto as c, messages as m
 from tls20_server.errors import ProtocolError
+from tls20_server.handshake import Transcript, Wire
 from tls20_server.psk import ExternalPSK, import_psk, bootstrap_public_key_psk
-from tls20_server.tickets import TicketCache
+from tls20_server.tickets import TicketCache, TicketStore
 from tests import test_sessions
 
 
@@ -88,6 +91,173 @@ class ExternalHandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.roots = []
         with self.assertRaises(ProtocolError):
             await self.connect(external_psk=key)
+
+    async def test_combined_ticket_modes_remain_dhe_only_across_early_successors(self):
+        key = ExternalPSK(b"combo modes", b"key material", "localhost", combined=True)
+        self.server_options = {"external_psks": (key,)}
+        first = await self.connect(external_psk=key, psk_modes=(1,))
+        self.assertFalse(first.resumed)
+        for index in range(3):
+            cached = next(iter(self.cache._tickets.values()))
+            self.assertEqual(cached.allowed_psk_modes, (1,))
+            self.assertEqual(self.store._tickets[cached.identity].allowed_psk_modes, (1,))
+            channel = await self.connect(external_psk=key, psk_modes=(0, 1),
+                                         early_data=f"successor {index}".encode())
+            self.assertTrue(channel.resumed)
+            self.assertTrue(channel.early_data_accepted)
+            self.assertEqual(dict(channel.local_capabilities)[45], b"\x01\x01")
+            self.assertIn(51, dict(channel.local_capabilities))
+            self.assertEqual(channel.allowed_psk_modes, (1,))
+        self.assertFalse(self.errors)
+
+    async def test_ticket_mode_state_normalizes_duplicates_and_ignores_unknown_modes(self):
+        key = ExternalPSK(b"combo repeated", b"key material", "localhost", combined=True)
+        self.server_options = {"external_psks": (key,)}
+        await self.connect(external_psk=key, psk_modes=(1, 255, 1))
+        cached = next(iter(self.cache._tickets.values()))
+        self.assertEqual(cached.allowed_psk_modes, (1,))
+        self.assertEqual(self.store._tickets[cached.identity].allowed_psk_modes, (1,))
+        resumed = await self.connect(external_psk=key, psk_modes=(1, 0), early_data=b"valid descendant")
+        self.assertTrue(resumed.resumed)
+        self.assertTrue(resumed.early_data_accepted)
+        self.assertEqual(resumed.allowed_psk_modes, (1,))
+        self.assertFalse(self.errors)
+
+    async def test_combined_offer_can_authorize_later_psk_only_but_not_widen_successor(self):
+        key = ExternalPSK(b"combo both", b"key material", "localhost", combined=True)
+        self.server_options = {"external_psks": (key,)}
+        await self.connect(external_psk=key, psk_modes=(1, 0))
+        self.assertEqual(next(iter(self.cache._tickets.values())).allowed_psk_modes, (1, 0))
+        for modes in ((0,), (1, 0), (0, 1)):
+            channel = await self.connect(external_psk=key, psk_modes=modes, early_data=b"permitted early")
+            self.assertTrue(channel.resumed)
+            self.assertTrue(channel.early_data_accepted)
+            self.assertNotIn(51, dict(channel.local_capabilities))
+            self.assertEqual(dict(channel.local_capabilities)[45], b"\x01\x00")
+            cached = next(iter(self.cache._tickets.values()))
+            self.assertEqual(cached.allowed_psk_modes, (0,))
+            self.assertEqual(self.store._tickets[cached.identity].allowed_psk_modes, (0,))
+        self.assertFalse(self.errors)
+
+    async def test_server_rejects_forged_ticket_mode_before_early_authorization(self):
+        key = ExternalPSK(b"combo reject", b"key material", "localhost", combined=True)
+        self.server_options = {"external_psks": (key,)}
+        await self.connect(external_psk=key, psk_modes=(1,))
+        cached = next(iter(self.cache._tickets.values()))
+        server_ticket = self.store._tickets[cached.identity]
+        cached.allowed_psk_modes = (0,)  # Bypass the honest client filter.
+        before = len(self.store._tickets)
+        with self.assertRaises(ProtocolError):
+            await self.connect(external_psk=key, psk_modes=(0,), early_data=b"must not be authorized")
+        self.assertFalse(server_ticket.early_used)
+        self.assertFalse(self.early)
+        self.assertEqual(len(self.store._tickets), before)
+
+    async def test_retry_rechecks_final_ticket_modes_after_first_candidate_expires(self):
+        from tls20_server.retry_cookie import RetryCookiePolicy
+        for first_mode, final_mode in ((1, 0), (0, 1), (1, 1), (0, 0)):
+            with self.subTest(first_mode=first_mode, final_mode=final_mode):
+                self.server_options = {}
+                self.cache = TicketCache()
+                await self.connect(psk_modes=(first_mode,))
+                first = next(iter(self.cache._tickets.values()))
+                self.cache = TicketCache()
+                await self.connect(psk_modes=(final_mode,))
+                final = next(iter(self.cache._tickets.values()))
+                first_server = self.store._tickets[first.identity]
+                final_server = self.store._tickets[final.identity]
+                self.server_options["retry_cookie_policy"] = RetryCookiePolicy()
+                _, public = c.traffic_key(29)
+                group = 29 if first_mode else 0
+                def hello(prefix, *, cookie=b"", empty_share=False):
+                    offers = tuple((value.identity, value.obfuscated_age(), bytes(32)) for value in (first, final))
+                    options = dict(group=group, psk_modes=(1, 0), psk_offers=offers,
+                                   cookie=cookie, empty_share=empty_share)
+                    frame = m.client_hello(bytes([2]) * 32, public if group else b"",
+                                           "localhost", bytes(32), **options)
+                    parsed = m.parse_client_hello(frame[4:])
+                    context = prefix + frame[:-parsed.binder_vector_size]
+                    options["psk_offers"] = tuple((identity, age, c.binder(value.psk, context))
+                        for value, (identity, age, _) in zip((first, final), offers))
+                    return m.client_hello(bytes([2]) * 32, public if group else b"",
+                                          "localhost", bytes(32), **options)
+                reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+                self.writers.append(writer)
+                writer.write(c.PREFACE)
+                wire = Wire(reader, writer)
+                initial = hello(c.PREFACE, empty_share=bool(group))
+                await wire.send_frame(initial)
+                retry = await asyncio.wait_for(wire.receive_frame(2), 2)
+                cookie = m.parse_server_hello(retry[4:], details=True)[5]
+                self.assertTrue(cookie)
+                # Expire A during the actual HRR network boundary. B remains
+                # authorized; its own modes must govern the final selection.
+                first_server.issued -= first_server.lifetime + 1
+                transcript = Transcript()
+                transcript.retry(initial, retry)
+                await wire.send_frame(hello(transcript.snapshot(), cookie=cookie))
+                record = await asyncio.wait_for(wire.raw_record(), 2)
+                if first_mode != final_mode:
+                    self.assertEqual(record, b"\x15\x03\x03\x00\x02\x02\x28")
+                else:
+                    self.assertEqual(record[0], 22)
+                    self.assertEqual(m.server_hello_extensions(record[9:])[41], b"\x00\x01")
+                self.assertFalse(final_server.early_used)
+                self.assertFalse(self.early)
+                writer.close()
+
+    async def test_no_ticket_mode_overlap_does_not_offer_ticket_or_early_data(self):
+        key = ExternalPSK(b"combo no overlap", b"key material", "localhost", combined=True)
+        self.server_options = {"external_psks": (key,)}
+        await self.connect(external_psk=key, psk_modes=(1,))
+        seen = []
+        original = Wire.send_frame
+        async def capture(wire, frame, state=None):
+            if frame[0] == 1:
+                seen.append(frame)
+            return await original(wire, frame, state)
+        # A fresh combined exchange also requires DHE. A caller insisting on
+        # only mode 0 cannot silently revive the old mode-1 ticket instead.
+        with patch.object(Wire, "send_frame", capture):
+            with self.assertRaises(ProtocolError):
+                await self.connect(external_psk=key, psk_modes=(0,), early_data=b"not sent")
+        self.assertFalse(seen)  # Invalid combined-only mode is rejected locally.
+        self.assertFalse(self.early)
+
+    async def test_no_ticket_mode_overlap_allows_fresh_credential_handshake(self):
+        await self.connect(psk_modes=(0,))
+        channel = await self.connect(psk_modes=(1,), early_data=b"old ticket does not authorize this")
+        self.assertFalse(channel.resumed)
+        self.assertFalse(channel.early_data_accepted)
+        self.assertEqual(channel.allowed_psk_modes, (1,))
+        self.assertFalse(self.early)
+        self.assertFalse(self.errors)
+
+    async def test_new_external_policy_performs_fresh_combined_authentication(self):
+        key = ExternalPSK(b"combo policy", b"old key material", "localhost", combined=True)
+        self.server_options = {"external_psks": (key,)}
+        await self.connect(external_psk=key, psk_modes=(1,))
+        renewed = replace(key, psk=b"renewed independent external secret")
+        self.server_options = {"external_psks": (renewed,)}
+        channel = await self.connect(external_psk=renewed, psk_modes=(1, 0), early_data=b"old authority")
+        self.assertFalse(channel.resumed)
+        self.assertFalse(channel.early_data_accepted)
+        self.assertEqual(channel.psk_provenance, "ext")
+        self.assertEqual(channel.allowed_psk_modes, (1, 0))
+        self.assertFalse(self.early)
+        self.assertFalse(self.errors)
+
+    async def test_declined_external_successor_cannot_fall_back_to_credential_only(self):
+        for combined in (False, True):
+            with self.subTest(combined=combined):
+                self.cache = TicketCache()
+                key = ExternalPSK(b"required external", b"key material", "localhost", combined=combined)
+                self.server_options = {"external_psks": (key,)}
+                await self.connect(external_psk=key)
+                self.store = TicketStore()  # Restart loses the opaque ticket.
+                with self.assertRaisesRegex(ProtocolError, "declined the required provisioned PSK"):
+                    await self.connect(external_psk=key, early_data=b"do not downgrade")
+                self.assertFalse(self.early)
 
     async def test_multiple_external_hashes_and_selected_identity_one(self):
         first = ExternalPSK(b"not provisioned here", b"key one", "localhost", max_early_data=1024)
