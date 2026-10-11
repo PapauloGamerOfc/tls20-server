@@ -91,6 +91,44 @@ class CredentialSelectionTests(unittest.TestCase):
         self.assertTrue(match_credentials(one, {48: ext}))
         self.assertEqual(preferred_credentials([one, two], {48: ext}), (one, two))
 
+    def test_algorithm_filter_precedes_ca_ranking_without_changing_oid_constraints(self):
+        from tests.test_credential_profiles import CredentialProfileTests
+        from tests.test_pki import der
+        from tls20_server import messages as m
+        fixture = CredentialProfileTests(); fixture.setUp()
+        incompatible = credential("preferred")
+        compatible = Credentials([der(fixture.leaf)], fixture.key)
+        offers = {50: m._vec(b"\x04\x03", 2), 47: encode_certificate_authorities([name("preferred")])}
+        self.assertEqual(preferred_credentials([incompatible, compatible], offers, role="server"), (compatible,))
+        offers[50] = m._vec(b"\x04\x03\x08\x07", 2)
+        self.assertEqual(preferred_credentials([compatible, incompatible], offers, role="server"), (incompatible, compatible))
+        offers[48] = encode_oid_filters([(ExtensionOID.EXTENDED_KEY_USAGE,
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]))])
+        self.assertEqual(preferred_credentials([incompatible, compatible], offers, role="server"), (compatible,))
+
+    def test_independent_grant_filter_and_invalid_local_material(self):
+        from tests.test_credential_profiles import CredentialProfileTests
+        from tests.test_pki import der
+        from tls20_server import messages as m
+        fixture = CredentialProfileTests(); fixture.setUp()
+        direct = Credentials([der(fixture.leaf)], fixture.key)
+        for role, tag in (("server", 0xfe00), ("client", 0xfe01)):
+            parent, grant = fixture.parent_and_grant(role=role)
+            delegated = Credentials([der(parent)], fixture.key, delegation=grant)
+            offers = {50: m._vec(b"\x04\x03", 2), 34: m._vec(tag.to_bytes(2, "big"), 2),
+                      0xff04: m._vec(b"\x08\x07", 2)}
+            self.assertEqual(preferred_credentials([delegated, direct], offers, role=role), (delegated, direct))
+            offers[0xff04] = m._vec(b"\x04\x03", 2)
+            self.assertEqual(preferred_credentials([delegated, direct], offers, role=role), (direct,))
+            self.assertEqual(preferred_credentials([delegated], {50: offers[50]}, role=role), ())
+            for invalid in (replace(delegated, delegation=grant[:-1]),
+                            replace(delegated, private_key=x25519.X25519PrivateKey.generate()),
+                            replace(direct, entry_extensions=(((34, grant), (34, grant)),))):
+                with self.subTest(role=role), self.assertRaises(ProtocolError):
+                    preferred_credentials([invalid, direct], offers, role=role)
+        with self.assertRaises((ValueError, ProtocolError)):
+            preferred_credentials([replace(direct, chain_der=[b"not DER"]), direct], offers, role="server")
+
     def test_duplicate_oids_and_request_extensions_are_rejected(self):
         with self.assertRaises(ProtocolError):
             encode_oid_filters([(ExtensionOID.KEY_USAGE, b""), ("2.5.29.15", b"")])

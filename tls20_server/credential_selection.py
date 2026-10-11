@@ -271,17 +271,68 @@ def match_credentials(credentials, request_extensions) -> bool:
     return True
 
 
-def preferred_credentials(candidates, request_extensions) -> tuple:
+def credential_algorithms_match(credentials, request_extensions, *, role,
+                                signature_provider=None, entry_extensions=None) -> bool:
+    """Select independent path/grant algorithms; invalid local material raises.
+
+    This checks compatibility, not peer trust. Non-X.509 representations retain
+    their own native algorithms and are validated by their credential provider.
+    """
+    from . import crypto as c, messages as m
+    from .credential_profiles import validate_delegation
+    from .handshake import _check_certificate_offer, _credential_extensions
+    from .pki import supported_certificate_algorithms
+    if role not in ("server", "client"):
+        raise ValueError("credential selection requires an explicit direction")
+    if credentials.credential_type != 0:
+        return True
+    offered = _request_extensions(request_extensions)
+    m.validate_delegation_offer(offered)
+    metadata = _credential_extensions(credentials) if entry_extensions is None else entry_extensions
+    if not credentials.chain_der or len(metadata) != len(credentials.chain_der):
+        raise ProtocolError("invalid local certificate chain or entry metadata")
+    for index, pairs in enumerate(metadata):
+        values = m.extensions(b"".join(m.extension(kind, value) for kind, value in pairs), context="CE")
+        if index and 34 in values:
+            raise ProtocolError("misplaced local delegated credential")
+    matches = _check_certificate_offer(credentials.chain_der,
+        m._u16_list(offered[50]) if 50 in offered else (), signature_provider,
+        credentials.signature_issuers, require_match=False)
+    grant = dict(metadata[0]).get(34)
+    if grant is not None:
+        # Validate first, against local capabilities. A malformed or wrong-key
+        # grant is not an ordinary refusal merely because its scheme is absent.
+        key, _ = validate_delegation(credentials.chain_der[0], grant, role=role,
+            grant_algorithms=supported_certificate_algorithms(signature_provider),
+            delegated_schemes=(0xfe00 if role == "server" else 0xfe01,),
+            signature_provider=signature_provider)
+        reader = m._Reader(grant)
+        reader.take(6); reader.vector(3)
+        scheme = int.from_bytes(reader.take(2), "big")
+        matches = matches and 34 in offered and (0xfe00 if role == "server" else 0xfe01) in m._u16_list(offered[34])
+        matches = matches and scheme in m._u16_list(offered[0xff04])
+    else:
+        key = _load_pkix_der(credentials.chain_der[0]).public_key()
+    if c.public_bytes(key) != c.public_bytes(credentials.private_key):
+        raise ProtocolError("local credential does not match its private key")
+    return matches
+
+
+def preferred_credentials(candidates, request_extensions, *, role=None, signature_provider=None) -> tuple:
     """Stable candidates satisfying OID filters, preferred CA matches first.
 
     A leaf issuer matches even when the CA is omitted from the outgoing chain.
     Other CA names match actual CA subjects only, never a non-CA leaf subject.
-    RPKs are neutral to CA preferences. This function does not authorize peers.
+    RPKs are neutral to CA preferences. A role additionally filters by independent
+    path/grant offers before ranking. This function does not authorize peers.
     """
     extensions = _request_extensions(request_extensions)
     names = set(parse_certificate_authorities(extensions[CERTIFICATE_AUTHORITIES])) if CERTIFICATE_AUTHORITIES in extensions else set()
     ranked = []
     for credential in candidates:
+        if role is not None and not credential_algorithms_match(credential, extensions,
+                role=role, signature_provider=signature_provider):
+            continue
         if not match_credentials(credential, extensions):
             continue
         preferred = not names or credential.credential_type != 0

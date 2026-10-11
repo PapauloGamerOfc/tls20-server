@@ -298,6 +298,46 @@ class PakeHandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.errors[-1].alert, 20)
         self.assertEqual(len(self.channels), 1)
 
+    async def test_successor_rejected_early_probe_rejects_authenticated_malformed_records(self):
+        from tls20_server import crypto as c
+        from tls20_server.errors import PeerClosed
+        self.options["record_size_limit"] = 64
+        for plaintext, alert in ((None, None), (b"x\xff", 10), (b"\x00", 10),
+                                 (b"\x01\x15", 50), (b"x" * 64 + b"\x17", 22)):
+            with self.subTest(plaintext=plaintext):
+                self.cache = TicketCache()
+                await self.connect(record_size_limit=64)
+                cached = next(iter(self.cache._tickets.values()))
+                self.store._tickets[cached.identity].early_used = True
+                original, injected = Wire.send_frame, False
+                async def send(wire, message, state=None):
+                    nonlocal injected
+                    if message[0] == 20 and wire.writer.get_extra_info("peername")[1] == self.port:
+                        injected = True
+                        if plaintext is None:
+                            record = bytes.fromhex("1703030010") + bytes(16)
+                        else:
+                            header = b"\x17\x03\x03" + (len(plaintext) + state.suite.tag_length).to_bytes(2, "big")
+                            record = header + state._cipher.encrypt(
+                                c.nonce(state.iv, state.sequence), plaintext, header)
+                        wire.writer.write(record)
+                        await wire.writer.drain()
+                    return await original(wire, message, state)
+                with patch.object(Wire, "send_frame", send):
+                    if alert is not None:
+                        with self.assertRaises(PeerClosed) as failure:
+                            await self.connect(record_size_limit=64, early_data=b"rejected early")
+                        self.assertEqual(failure.exception.alert, alert)
+                        self.assertEqual(self.errors[-1].alert, alert)
+                    else:
+                        channel = await self.connect(record_size_limit=64, early_data=b"rejected early")
+                        self.assertTrue(channel.resumed)
+                        self.assertFalse(channel.early_data_accepted)
+                        await channel.send(b"valid after stale early records")
+                        self.assertEqual(await channel.recv(), b"valid after stale early records")
+                self.assertTrue(injected)
+                self.assertFalse(self.early)
+
     async def test_password_successor_bad_binder_has_exact_alert_before_or_after_retry(self):
         from tls20_server import messages as m
         from tls20_server.retry_cookie import RetryCookiePolicy

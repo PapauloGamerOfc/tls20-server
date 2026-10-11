@@ -469,6 +469,10 @@ def validate_inner(content: bytes, inner_type: int) -> None:
         raise ProtocolError("alert content must have length 2", alert=10 if not content else 50)
 
 
+class _RecordAuthenticationError(ProtocolError):
+    """Only an unauthenticated ciphertext may be skipped by an epoch probe."""
+
+
 @dataclass(repr=False)
 class RecordState:
     """One direction and epoch; a failed operation permanently closes the state.
@@ -490,14 +494,20 @@ class RecordState:
     epoch: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
-        if self.operation not in ("seal", "open"):
-            raise ProtocolError("record operation must be seal or open")
-        if type(self.record_limit) is not int or not 64 <= self.record_limit <= 16385:
-            raise ProtocolError("invalid negotiated record size limit")
-        self.suite = suite(self.cipher_suite)
-        self.hash_context = hash_context(self.suite.hash_name, self.provider)
-        self.key, self.iv = key_iv(self.secret, self.cipher_suite, self.provider)
-        self._reset_cipher()
+        try:
+            if self.operation not in ("seal", "open"):
+                raise ProtocolError("record operation must be seal or open")
+            if type(self.record_limit) is not int or not 64 <= self.record_limit <= 16385:
+                raise ProtocolError("invalid negotiated record size limit")
+            self.suite = suite(self.cipher_suite)
+            self.hash_context = hash_context(self.suite.hash_name, self.provider)
+            self.key, self.iv = key_iv(self.secret, self.cipher_suite, self.provider)
+            self._reset_cipher()
+        except BaseException:
+            # A failed constructor can remain reachable through its traceback.
+            # Release any keys already derived without closing shared providers.
+            self.close()
+            raise
 
     def _reset_cipher(self):
         self._tree_cipher = self.suite.hash_name == "streebog256"
@@ -566,7 +576,7 @@ class RecordState:
             if ciphertext_length > 16640:
                 raise ProtocolError("encrypted record size", alert=22)
             if ciphertext_length < self.suite.tag_length:
-                raise ProtocolError("record authentication failed", alert=20)
+                raise _RecordAuthenticationError("record authentication failed", alert=20)
             self._ready("open", 0)
             iv = nonce(self.iv, self.sequence)
             plaintext = (self._cipher.decrypt_record(self.sequence,iv,record[5:],record[:5]) if self._tree_cipher
@@ -587,26 +597,33 @@ class RecordState:
         except BaseException as exc:
             self.close()
             if isinstance(exc, InvalidTag):
-                raise ProtocolError("record authentication failed", alert=20) from exc
+                raise _RecordAuthenticationError("record authentication failed", alert=20) from exc
             raise
 
     def try_open(self, record: bytes) -> tuple[bytes, int] | None:
-        """Probe an epoch transition; failed AEAD trial never mutates this state."""
+        """Skip only failed authentication, never authenticated record errors."""
         if self.failed:
             raise ProtocolError("record state is closed")
-        trial = RecordState(self.secret, self.operation, self.cipher_suite, self.record_limit, self.provider)
-        trial.sequence, trial.content_bytes = self.sequence, self.content_bytes
-        trial.epoch = self.epoch
+        trial = None
         try:
+            trial = RecordState(self.secret, self.operation, self.cipher_suite, self.record_limit, self.provider)
+            trial.sequence, trial.content_bytes = self.sequence, self.content_bytes
+            trial.epoch = self.epoch
             result = trial.open(record)
-        except ProtocolError:
+        except _RecordAuthenticationError:
             return None
+        except BaseException:
+            # Successful decryption commits the receive epoch even if its
+            # plaintext is invalid. Framing/provider failures are terminal too.
+            self.close()
+            raise
         else:
             self.sequence, self.content_bytes = trial.sequence, trial.content_bytes
             self.max_opened_plaintext = max(self.max_opened_plaintext, trial.max_opened_plaintext)
             return result
         finally:
-            trial.close()
+            if trial is not None:
+                trial.close()
 
     def update(self) -> None:
         if self.failed:

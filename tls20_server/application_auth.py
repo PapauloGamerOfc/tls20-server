@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 
 from . import crypto as c
 from . import messages as m
-from .credential_selection import match_credentials
+from .credential_selection import match_credentials, credential_algorithms_match
 from .errors import ProtocolError
 
 
@@ -78,6 +78,7 @@ def credential_validator(policy, *, role, authorize, spontaneous_offers=()):
             raise ProtocolError("authenticator credential policy direction mismatch")
         offers = dict(request.extensions if request is not None else spontaneous_offers)
         _offers(offers, role)
+        _check_status_responses(identity, offers, requested=request is not None)
         resolved = resolve_peer(identity.chain, 0, role, policy=policy,
             certificate_algorithms=m._u16_list(offers[50]),
             grant_algorithms=m._u16_list(offers[0xff04]) if 0xff04 in offers else (),
@@ -146,6 +147,7 @@ def parse_request(wire):
     if role == "client" and 0 in extensions:
         raise ProtocolError("server_name is only allowed in a client-generated request")
     _offers(extensions, role)
+    _status_request(extensions, requested=True)
     return AuthenticatorRequest(wire, context, role, extensions[expected], tuple(extensions.items()))
 
 
@@ -193,27 +195,25 @@ def _check_certificate_filters(identity, offered):
 
 
 def _credential_matches_algorithms(credentials, identity, offered, role, provider):
-    """Select with independent path/grant offers, without weakening validation."""
-    from .handshake import _check_certificate_offer
-    from .credential_profiles import validate_delegation
-    from .pki import supported_certificate_algorithms
-    matches = _check_certificate_offer(identity.chain, m._u16_list(offered[50]), provider,
-        credentials.signature_issuers, require_match=False)
-    grant = dict(identity.extensions[0]).get(34) if identity.chain else None
-    if grant is not None:
-        # Validate the local grant before treating an incompatible offer as a
-        # refusal. Malformed grants and wrong-role/key material remain errors.
-        key, _ = validate_delegation(identity.chain[0], grant, role=role,
-            grant_algorithms=supported_certificate_algorithms(provider),
-            delegated_schemes=(0xfe00 if role == "server" else 0xfe01,),
-            signature_provider=provider)
-        if not isinstance(credentials.private_key, X25519PrivateKey) or c.public_bytes(key) != c.public_bytes(credentials.private_key):
-            raise ProtocolError("authenticator delegated credential/key mismatch")
-        reader = m._Reader(grant)
-        reader.take(6); reader.vector(3)
-        scheme = int.from_bytes(reader.take(2), "big")
-        matches = matches and 34 in offered and scheme in m._u16_list(offered[0xff04])
-    return matches
+    return credential_algorithms_match(credentials, offered, role=role,
+        signature_provider=provider, entry_extensions=identity.extensions)
+
+
+def _status_request(offered, *, requested):
+    from .status_request import parse_status_request
+    # Both RFC9261 request structures use CR extensions: status_request is
+    # empty. Only spontaneous server authentication inherits a full CH request.
+    return parse_status_request(offered[5], certificate_request=requested) if 5 in offered else None
+
+
+def _check_status_responses(identity, offered, *, requested):
+    from .status_request import response_matches_request
+    from .credential_evidence import _status_response
+    request = _status_request(offered, requested=requested)
+    for entries in identity.extensions:
+        for kind, value in entries:
+            if kind == 5 and not response_matches_request(_status_response(value), request):
+                raise ProtocolError("OCSP evidence does not match the actual authenticator request")
 
 
 def _proof(finished_key, private, share, transcript, role, name):
@@ -316,6 +316,15 @@ class AuthenticatorManager:
         # A local delegated identity can be unavailable because delegation was
         # not offered; other unsolicited/misplaced entry extensions still fail.
         _check_certificate_extensions(identity, {**offers, 34: offers.get(34, b"")})
+        if 5 in offers:
+            from .status_request import response_matches_request
+            from .credential_evidence import _status_response
+            status = _status_request(offers, requested=request is not None)
+            metadata = tuple(tuple((kind, value) for kind, value in entries
+                if kind != 5 or response_matches_request(_status_response(value), status))
+                for entries in identity.extensions)
+            certificate = _certificate(identity.chain, context, metadata)
+            identity = _parse_certificate(certificate[4:])
         if credentials is not None and (not _credential_matches_algorithms(
                 credentials, identity, offers, role, self.channel.native_provider)
                 or not match_credentials(credentials, offers)):

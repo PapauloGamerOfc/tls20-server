@@ -23,6 +23,34 @@ def unhex(value):
 
 
 class CryptoTests(unittest.TestCase):
+    def test_failed_record_construction_releases_partial_keys(self):
+        for target, name in ((c, "key_iv"), (c.RecordState, "_reset_cipher")):
+            with self.subTest(stage=name):
+                provider = Mock()
+                state = c.RecordState.__new__(c.RecordState)
+                with patch.object(target, name, side_effect=RuntimeError("provider failed")):
+                    with self.assertRaisesRegex(RuntimeError, "provider failed"):
+                        state.__init__(bytes(32), "open", provider=provider)
+                self.assertTrue(state.failed)
+                self.assertEqual((state.secret, state.key, state.iv), (b"", b"", b""))
+                self.assertIsNone(state._cipher)
+                self.assertIsNone(state.provider)
+                provider.close.assert_not_called()
+
+    def test_failed_epoch_probe_construction_closes_both_states(self):
+        state, trials = c.RecordState(bytes(32), "open"), []
+        def fail(trial):
+            trials.append(trial)
+            raise RuntimeError("provider failed")
+        with patch.object(c.RecordState, "_reset_cipher", fail):
+            with self.assertRaisesRegex(RuntimeError, "provider failed"):
+                state.try_open(bytes.fromhex("1703030010") + bytes(16))
+        self.assertEqual(len(trials), 1)
+        for closed in (state, *trials):
+            self.assertTrue(closed.failed)
+            self.assertEqual((closed.secret, closed.key, closed.iv), (b"", b"", b""))
+            self.assertIsNone(closed._cipher)
+
     def test_provider_record_failures_close_state_and_release_secrets(self):
         record = c.RecordState(bytes(32), "seal").seal(b"fixture", 23)
         for operation in ("seal", "open"):
@@ -60,7 +88,7 @@ class CryptoTests(unittest.TestCase):
                 with self.assertRaises(ProtocolError):
                     state.seal(b"inconsistent epoch", 23)
 
-    def test_epoch_probe_releases_trial_secrets_without_closing_receiver(self):
+    def test_epoch_probe_releases_trial_secrets_and_closes_terminal_failures(self):
         from contextlib import nullcontext
         record = c.RecordState(bytes(32), "seal").seal(b"probe", 23)
         original_close = c.RecordState.close
@@ -80,13 +108,48 @@ class CryptoTests(unittest.TestCase):
                         self.assertIsNone(state.try_open(record[:-1] + bytes((record[-1] ^ 1,))))
                     else:
                         self.assertEqual(state.try_open(record), (b"probe", 23))
-                self.assertFalse(state.failed)
+                self.assertEqual(state.failed, outcome == "provider_error")
                 self.assertEqual(state.sequence, int(outcome == "valid"))
                 self.assertTrue(trials)
                 for trial in trials:
-                    self.assertIsNot(trial, state)
                     self.assertEqual((trial.secret, trial.key, trial.iv), (b"", b"", b""))
                     self.assertIsNone(trial._cipher)
+
+    def test_epoch_probe_propagates_authenticated_plaintext_errors(self):
+        for plaintext, alert in ((b"x\xff", 10), (b"\x00", 10), (b"", 10),
+                                 (b"\x16", 10), (b"\x01\x15", 50),
+                                 (b"x" * 64 + b"\x17", 22)):
+            with self.subTest(plaintext=plaintext):
+                sender = c.RecordState(bytes(32), "seal")
+                header = b"\x17\x03\x03" + (len(plaintext) + sender.suite.tag_length).to_bytes(2, "big")
+                record = header + sender._cipher.encrypt(c.nonce(sender.iv, 0), plaintext, header)
+                state = c.RecordState(bytes(32), "open", record_limit=64)
+                with self.assertRaises(ProtocolError) as failure:
+                    state.try_open(record)
+                self.assertEqual(failure.exception.alert, alert)
+                self.assertTrue(state.failed)
+                self.assertEqual((state.secret, state.key, state.iv), (b"", b"", b""))
+                self.assertIsNone(state._cipher)
+                with self.assertRaises(ProtocolError):
+                    state.try_open(sender.seal(b"valid after invalid", 23))
+
+    def test_epoch_probe_discards_only_authentication_failures(self):
+        sender, state = c.RecordState(bytes(32), "seal"), c.RecordState(bytes(32), "open")
+        valid = sender.seal(b"handshake epoch", 23)
+        for record in (b"\x17\x03\x03\x00\x00", b"\x17\x03\x03\x00\x10" + bytes(16),
+                       valid[:-1] + bytes((valid[-1] ^ 1,))):
+            self.assertIsNone(state.try_open(record))
+            self.assertFalse(state.failed)
+            self.assertEqual(state.sequence, 0)
+        self.assertEqual(state.try_open(valid), (b"handshake epoch", 23))
+        for record, alert in ((b"\x16\x03\x03\x00\x00", 10),
+                              (b"\x17\x03\x01\x00\x00", 47),
+                              (b"\x17\x03\x03\x00\x01", 50)):
+            state = c.RecordState(bytes(32), "open")
+            with self.assertRaises(ProtocolError) as failure:
+                state.try_open(record)
+            self.assertEqual(failure.exception.alert, alert)
+            self.assertTrue(state.failed)
 
     def test_rfc7748_known_answer(self):
         alice = X25519PrivateKey.from_private_bytes(unhex(

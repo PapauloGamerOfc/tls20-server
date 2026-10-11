@@ -221,6 +221,73 @@ class AuthenticatorTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ProtocolError):
                 self.server.authenticate(self.credentials, request=malformed)
 
+    async def test_spontaneous_ocsp_selection_and_validation_use_actual_clienthello(self):
+        from tests.test_status_request import StatusRequestTests, nonce_extensions
+        from tls20_server.application_auth import _parse_certificate
+        from tls20_server.credential_evidence import CredentialEvidencePolicy
+        from tls20_server.credential_selection import _oid_der, _length
+        from tls20_server.status_request import encode_status_request
+        fixture = StatusRequestTests(); fixture.setUp()
+        evidence = CredentialEvidencePolicy(require_ocsp=True, offered_extensions=(5,))
+        policy = replace(fixture.fixture.policy, revocation_policy="require-evidence", evidence_validator=evidence)
+        wrong_responder = b"\xa2\x16\x04\x14" + bytes(20)
+        critical = b"\x30" + _length(b"\x30" + _length(_oid_der("1.2.3.4") + b"\x01\x01\xff\x04\x00"))
+        for status, accepted in ((fixture.request, True),
+                (encode_status_request(request_extensions=nonce_extensions(b"different nonce")), False),
+                (encode_status_request((wrong_responder,)), False),
+                (encode_status_request(request_extensions=critical), False), (b"\x02", False)):
+            with self.subTest(status=status, accepted=accepted):
+                offers = ((50, m._vec(b"\x04\x03", 2)), (5, status))
+                self.client_channel.local_capabilities = self.server_channel.peer_capabilities = offers
+                validator = credential_validator(policy, role="server", authorize=lambda identity: True,
+                                                   spontaneous_offers=offers)
+                response = self.server.authenticate(fixture.credential, entry_extensions=fixture.credential.entry_extensions)
+                end = 4 + int.from_bytes(response[1:4], "big")
+                identity = _parse_certificate(response[4:end])
+                self.assertEqual(5 in dict(identity.extensions[0]), accepted)
+                if accepted:
+                    self.assertTrue((await self.client.validate(response, validator)).authenticated)
+                else:
+                    with self.assertRaisesRegex(ProtocolError, "OCSP staple is absent"):
+                        await self.client.validate(response, validator)
+                    # A nonconforming peer can still sign a mismatched staple.
+                    # The receiver must independently enforce the actual offer.
+                    with patch("tls20_server.status_request.response_matches_request", return_value=True):
+                        malicious = self.server.authenticate(fixture.credential,
+                            entry_extensions=fixture.credential.entry_extensions)
+                    with self.assertRaisesRegex(ProtocolError, "actual authenticator request"):
+                        await self.client.validate(malicious, validator)
+
+    async def test_requested_ocsp_uses_empty_cr_framing_in_both_directions(self):
+        from tests.test_status_request import StatusRequestTests
+        from tls20_server.credential_evidence import CredentialEvidencePolicy
+        from tls20_server.application_auth import _frame
+        for role, verifier, prover in (("server", self.client, self.server), ("client", self.server, self.client)):
+            fixture = StatusRequestTests(); fixture.setUp()
+            if role == "client":
+                f = fixture.fixture
+                f.leaf = issue(f.key, f.ca_key, f.name, f.ca_name, eku=False,
+                    extra=[(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), False)])
+                response = f.make_ocsp()
+                staple = b"\x01" + len(response).to_bytes(3, "big") + response
+                fixture.credential = Credentials([der(f.leaf), der(f.root)], f.key,
+                    entry_extensions=(((5, staple),), ()))
+            policy = replace(fixture.fixture.policy, revocation_policy="require-evidence",
+                evidence_validator=CredentialEvidencePolicy(require_ocsp=True, offered_extensions=(5,)),
+                authorize_client=lambda material, evidence: True)
+            request = verifier.request(certificate_algorithms=(0x0403,), extra_extensions=((5, b""),))
+            response = prover.authenticate(fixture.credential, request=request,
+                                          entry_extensions=fixture.credential.entry_extensions)
+            self.assertTrue((await verifier.validate(response, credential_validator(
+                policy, role=role, authorize=lambda identity: True), request=request)).authenticated)
+            with self.assertRaisesRegex(ProtocolError, "status_request must be empty"):
+                verifier.request(extra_extensions=((5, fixture.request),))
+            raw = _frame(17 if role == "server" else 13, m._vec(b"bad status framing", 1) + m._vec(
+                m.extension(50, m._vec(b"\x04\x03", 2)) + m.extension(5, fixture.request)
+                + m.extension(0xff02 if role == "server" else 0xff03, c.public_bytes(self.share)), 2))
+            with self.assertRaisesRegex(ProtocolError, "status_request must be empty"):
+                prover.authenticate(request=raw)
+
     async def test_finished_independent_literal_oracle(self):
         request = self.client.request(context=b"oracle")
         response = self.server.authenticate(self.credentials, request=request)

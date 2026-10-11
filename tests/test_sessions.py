@@ -218,6 +218,45 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(channel.early_data_accepted)
         self.assertFalse(self.early)
 
+    async def test_rejected_early_probe_rejects_authenticated_malformed_records(self):
+        self.server_options["record_size_limit"] = 64
+        for plaintext, alert in ((None, None), (b"x\xff", 10), (b"\x00", 10),
+                                 (b"\x01\x15", 50), (b"x" * 64 + b"\x17", 22)):
+            with self.subTest(plaintext=plaintext):
+                self.cache, self.store = TicketCache(), TicketStore()
+                await self.connect(record_size_limit=64)
+                next(iter(self.store._tickets.values())).early_used = True
+                original, injected = Wire.send_frame, False
+                async def send(wire, message, state=None):
+                    nonlocal injected
+                    if wire.writer is self.writers[-1] and message[0] == 20:
+                        injected = True
+                        if plaintext is None:
+                            record = bytes.fromhex("1703030010") + bytes(16)
+                        else:
+                            header = b"\x17\x03\x03" + (len(plaintext) + state.suite.tag_length).to_bytes(2, "big")
+                            # Valid handshake-epoch AEAD, deliberately invalid
+                            # inner plaintext. A following valid CF must not
+                            # turn this into an ignorable stale early record.
+                            record = header + state._cipher.encrypt(
+                                c.nonce(state.iv, state.sequence), plaintext, header)
+                        wire.writer.write(record)
+                        await wire.writer.drain()
+                    return await original(wire, message, state)
+                with patch.object(Wire, "send_frame", send):
+                    if alert is not None:
+                        with self.assertRaises(PeerClosed) as failure:
+                            await self.connect(record_size_limit=64, early_data=b"rejected early bytes")
+                        self.assertEqual(failure.exception.alert, alert)
+                    else:
+                        channel = await self.connect(record_size_limit=64, early_data=b"rejected early bytes")
+                        self.assertTrue(channel.resumed)
+                        self.assertFalse(channel.early_data_accepted)
+                        await channel.send(b"valid after stale early records")
+                        self.assertEqual(await channel.recv(), b"valid after stale early records")
+                self.assertTrue(injected)
+                self.assertFalse(self.early)
+
     async def test_retry_rejects_early_data_without_forwarding(self):
         await self.connect()
         channel = await self.connect(early_data=b"do not forward", force_retry=True)

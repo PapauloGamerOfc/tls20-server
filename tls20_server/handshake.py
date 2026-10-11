@@ -3,7 +3,6 @@ This Python prototype cannot guarantee physical erasure of immutable secrets.
 """
 
 import asyncio
-import functools
 import hmac
 import inspect
 import math
@@ -29,6 +28,7 @@ from .credential_cache import (compress_certificate, decompress_certificate, mat
     cached_request_body, resolve_cached_request)
 from .handshake_options import client_controls, server_controls, client_control_selection
 from .exporter_access import expose as expose_exporter
+from .secret_lifecycle import HandshakeSecrets, handshake_boundary
 from .credential_selection import (encode_certificate_authorities, encode_oid_filters,
     preferred_credentials, match_credentials)
 from types import SimpleNamespace
@@ -239,8 +239,6 @@ class SecureChannel:
         self.schedule = c.KeySchedule(c.hash_context(self.suite.hash_name,native_provider))
         self.native_provider = native_provider
         self.confidential = self.suite.confidential
-        self.sender = c.RecordState(send_secret, "seal", cipher_suite, send_record_limit, provider=self.native_provider)
-        self.receiver = c.RecordState(receive_secret, "open", cipher_suite, receive_record_limit, provider=self.native_provider)
         from .optional_controls import Heartbeat
         if (heartbeat_local_mode is None) != (heartbeat_peer_mode is None):
             raise ValueError("heartbeat requires both negotiated modes")
@@ -276,6 +274,18 @@ class SecureChannel:
         self._active_client_auth = None
         self._seen_auth_contexts = set()
         self._key_update_requested = False
+        # Build owned record states last. Either constructor may fail, leaving
+        # a partial channel reachable through a retained traceback.
+        try:
+            self.sender = c.RecordState(send_secret, "seal", cipher_suite, send_record_limit, provider=self.native_provider)
+            self.receiver = c.RecordState(receive_secret, "open", cipher_suite, receive_record_limit, provider=self.native_provider)
+        except BaseException:
+            sender = getattr(self, "sender", None)
+            if sender is not None:
+                sender.close()
+            self.auth_share_secret = None
+            self.exporter_secret = self.resumption_secret = self.early_exporter_secret = None
+            raise
 
     def _clear_auth(self):
         for access in getattr(self, "_exporter_accesses", ()):
@@ -380,7 +390,8 @@ class SecureChannel:
         self._seen_auth_contexts.add(context)
         pool = ((self.client_credentials,) if self.client_credentials else ()) + self.client_credential_candidates
         candidates = preferred_credentials((value for value in pool
-            if value.credential_type == self.client_certificate_type), request_extensions)
+            if value.credential_type == self.client_certificate_type), request_extensions,
+            role="client", signature_provider=self.native_provider)
         credential = candidates[0] if candidates else None
         transcript = bytearray(self.handshake_transcript + request)
         async with self.send_lock:
@@ -1030,22 +1041,6 @@ def _check_peer_filters(chain, credential_type, offers):
         raise ProtocolError("client certificate does not satisfy requested OID filters", alert=43)
 
 
-def _close_on_error(method):
-    """Ownership of an opened stream includes failures during API validation."""
-    @functools.wraps(method)
-    async def guarded(reader, writer, *args, **kwargs):
-        try:
-            return await method(reader, writer, *args, **kwargs)
-        except BaseException:
-            if writer is not None:
-                try:
-                    writer.close()
-                except (OSError, AttributeError):
-                    pass  # Preserve the original failure, including invalid API arguments.
-            raise
-    return guarded
-
-
 def _signature_preferences(values, provider):
     """Explicit verifier capability policy; certificate and grant lists are independent."""
     supported = supported_certificate_algorithms(provider)
@@ -1058,7 +1053,7 @@ def _signature_preferences(values, provider):
     return values
 
 
-@_close_on_error
+@handshake_boundary
 async def server_handshake(reader, writer, credentials, server_name, timeout=10, *,
                            ticket_store=None, max_early_data=0, on_early_data=None,
                            client_auth_validator=None, require_client_auth=False,
@@ -1117,6 +1112,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
         raise ValueError("GOST suites require an explicit GOST provider")
     if native_provider is None and any(c.suite(value).hash_name == "sm3" for value in cipher_suites):
         raise ValueError("SM cipher suites require an explicitly selected native provider")
+    secrets = HandshakeSecrets()
     try:
         async with asyncio.timeout(timeout):
             if await wire.exact(len(c.PREFACE)) != c.PREFACE:
@@ -1142,7 +1138,8 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             offered_server_types = _certificate_types(ext_values[20]) if 20 in ext_values else (0,)
             candidates = ((credentials,) if credentials is not None else ()) + tuple(server_credential_candidates)
             candidates = preferred_credentials((value for value in candidates
-                if value.credential_type in offered_server_types), ext_values)
+                if value.credential_type in offered_server_types), ext_values,
+                role="server" if 50 in ext_values else None, signature_provider=native_provider)
             credentials = candidates[0] if candidates else None
             server_credential_type = credentials.credential_type if credentials else 0
             client_credential_type = next((value for value in client_certificate_types
@@ -1408,8 +1405,8 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             client_secret, server_secret = handshake_keys(traffic_root, transcript, schedule.hash_name)
             emit_diagnostic(diagnostics, "TLS20_CLIENT_HANDSHAKE_TRAFFIC_SECRET", hello.random, client_secret)
             emit_diagnostic(diagnostics, "TLS20_SERVER_HANDSHAKE_TRAFFIC_SECRET", hello.random, server_secret)
-            receiver = c.RecordState(client_secret, "open", selected_id, receive_limit, provider=native_provider)
-            sender = c.RecordState(server_secret, "seal", selected_id, send_limit, provider=native_provider)
+            receiver = secrets.record(client_secret, "open", selected_id, receive_limit, provider=native_provider)
+            sender = secrets.record(server_secret, "seal", selected_id, send_limit, provider=native_provider)
             await wire.send_frame(sh)
             if hello.session_id and not sent_ccs:
                 await wire.send_ccs()
@@ -1474,7 +1471,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             client_app, server_app = application_keys(traffic_root, transcript, schedule.hash_name)
             # Sending ServerFinished transitions our write epoch immediately,
             # including alerts emitted while waiting for ClientFinished.
-            sender = c.RecordState(server_app, "seal", selected_id, send_limit, provider=native_provider)
+            sender = secrets.record(server_app, "seal", selected_id, send_limit, provider=native_provider)
             exporter = schedule.derive_secret(schedule.master_secret(traffic_root), "exp master", transcript.snapshot())
             emit_diagnostic(diagnostics, "TLS20_CLIENT_TRAFFIC_SECRET_0", hello.random, client_app)
             emit_diagnostic(diagnostics, "TLS20_SERVER_TRAFFIC_SECRET_0", hello.random, server_app)
@@ -1489,7 +1486,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 await expose_exporter(on_early_exporter, early_exporter, exporter_accesses,
                                       stage="early", role="server", hash_name=schedule.hash_name)
             if hello.early_data:
-                early_receiver = (c.RecordState(schedule.derive_secret(c.extract(bytes(selected.hash_length), ticket.psk, schedule.hash_name),
+                early_receiver = (secrets.record(schedule.derive_secret(c.extract(bytes(selected.hash_length), ticket.psk, schedule.hash_name),
                     "c e traffic", c.PREFACE + ch), "open", selected_id, ticket.record_size_limit, provider=native_provider) if accepted else None)
                 if early_receiver is not None:
                     emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", hello.random, early_receiver.secret)
@@ -1609,6 +1606,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 bootstrap_binding=bootstrap_binding, bootstrap_authorization=bootstrap_authorization,
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode,
                 native_provider=native_provider)
+            secrets.establish(channel)
             channel.peer_authenticated = bool(ticket is not None or authenticated_client)
             channel.expected_ticket_count = controls.expected_tickets
             for access in exporter_accesses:
@@ -1628,7 +1626,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         native_provider=native_provider)
                     if message is not None:
                         await channel.send_handshake(message)
-            return channel
+            return secrets.release(channel)
     except ProtocolError as error:
         for access in exporter_accesses:
             access.close()
@@ -1642,9 +1640,11 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             access.close()
         writer.transport.abort()
         raise
+    finally:
+        secrets.close()
 
 
-@_close_on_error
+@handshake_boundary
 async def client_handshake(reader, writer, server_name, trust_roots, *, revocation_policy, timeout=10,
                            ticket_cache=None, early_data=b"", cache_context=b"",
                            traffic_group=0x001d, force_retry=False, client_credentials=None,
@@ -1827,6 +1827,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
         ticket = None  # Missing original DNS TTL is not authority for cached early data.
     credential_expires_at = ticket.credential_expires_at if ticket is not None else None
     traffic_private = None
+    secrets = HandshakeSecrets()
     try:
         async with asyncio.timeout(timeout):
             if ticket is not None and mixed_password and ticket.pake_identity:
@@ -1935,7 +1936,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             offer_early = bool(ticket and ticket.cipher_suite in cipher_suites and early_data
                                and len(early_data) <= ticket.max_early_data)
             auth_private = X25519PrivateKey.generate()
-            traffic_private, traffic_public = (None, b"") if psk_only else c.traffic_key(traffic_group, provider=native_provider)
+            traffic_private, traffic_public = (None, b"") if psk_only else secrets.traffic_key(traffic_group, provider=native_provider)
             auth_public = c.public_bytes(auth_private)
             if auth_public == c.traffic_auth_component(traffic_group, traffic_public):
                 raise ProtocolError("non-independent key shares")
@@ -1978,7 +1979,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 await expose_exporter(on_early_exporter, early_exporter, exporter_accesses,
                                       stage="early", role="client", hash_name=psk_hash)
             if offer_early:
-                early_sender = c.RecordState(c.derive_secret(early_root,
+                early_sender = secrets.record(c.derive_secret(early_root,
                     "c e traffic", transcript.snapshot(), psk_hash), "seal", ticket.cipher_suite,
                     ticket.record_size_limit, provider=native_provider)
                 emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", random, early_sender.secret)
@@ -2014,9 +2015,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     raise ProtocolError("useless HelloRetryRequest", alert=47)
                 transcript.retry(ch, sh, schedule.hash_name)
                 if group:
-                    if 34 <= traffic_group <= 41 and traffic_private is not None:
-                        traffic_private.close()
-                    traffic_private, traffic_public = c.traffic_key(group, provider=native_provider)
+                    secrets.close_key(traffic_private)
+                    traffic_private, traffic_public = secrets.traffic_key(group, provider=native_provider)
                     traffic_group = group
                 options.update(group=0 if psk_only else traffic_group,
                                empty_share=force_retry if not group else False,
@@ -2079,12 +2079,12 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             client_secret, server_secret = handshake_keys(traffic_root, transcript, schedule.hash_name)
             emit_diagnostic(diagnostics, "TLS20_CLIENT_HANDSHAKE_TRAFFIC_SECRET", random, client_secret)
             emit_diagnostic(diagnostics, "TLS20_SERVER_HANDSHAKE_TRAFFIC_SECRET", random, server_secret)
-            sender = c.RecordState(client_secret, "seal", selected_id, provider=native_provider)
+            sender = secrets.record(client_secret, "seal", selected_id, provider=native_provider)
             # Until EE confirms RSL, an unaware server may legally use the
             # protocol limit. Retain the largest decrypted record so an EE
             # that accepts RSL can also be checked retroactively, padding and
             # fragments included, before any credential/application processing.
-            receiver = c.RecordState(server_secret, "open", selected_id, provider=native_provider)
+            receiver = secrets.record(server_secret, "open", selected_id, provider=native_provider)
             ee = await wire.receive_frame(8, receiver)
             accepted, protocol, selected_extensions = m.parse_encrypted_extensions(ee[4:], application_protocols,
                                     offered_early=offer_early, with_extensions=True,
@@ -2225,7 +2225,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 context, share, algorithms, request_extensions = client_auth_request
                 candidates = preferred_credentials((value for value in (
                     (client_credentials,) if bootstrap_binding is not None else credential_candidates)
-                    if value.credential_type == client_type[0]), request_extensions)
+                    if value.credential_type == client_type[0]), request_extensions,
+                    role="client", signature_provider=native_provider)
                 client_credentials = candidates[0] if candidates else None
                 messages = _client_auth_messages(client_credentials, context, share,
                     algorithms, exporter, transcript.data, request_extensions=request_extensions.items(),
@@ -2234,7 +2235,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     await wire.send_frame(message, sender)
             cf = m.frame(20, schedule.finished(client_secret, transcript.snapshot()))
             await wire.send_frame(cf, sender)
-            sender = c.RecordState(client_app, "seal", selected_id, send_limit, provider=native_provider)
+            sender = secrets.record(client_app, "seal", selected_id, send_limit, provider=native_provider)
             if pin_attempt is not None:
                 pin_attempt.commit()
             transcript.add(cf)
@@ -2265,12 +2266,13 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 allowed_psk_modes=tuple(mode for mode in psk_modes if mode in (0, 1)),
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode,
                 peer_authenticated=not unauthenticated, native_provider=native_provider)
+            secrets.establish(channel)
             channel.client_credential_candidates = credential_candidates
             channel.expected_ticket_count = controls.expected_tickets
             for access in exporter_accesses:
                 access.complete(peer_authenticated=not unauthenticated)
             channel._exporter_accesses = tuple(exporter_accesses)
-            return channel
+            return secrets.release(channel)
     except ProtocolError as error:
         for access in exporter_accesses:
             access.close()
@@ -2282,5 +2284,4 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
         writer.transport.abort()
         raise
     finally:
-        if traffic_private is not None and 34 <= traffic_group <= 41:
-            traffic_private.close()
+        secrets.close()

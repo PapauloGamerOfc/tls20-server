@@ -113,6 +113,16 @@ direction remains available until local closure. Cancelling a read makes the
 stream unusable and retains only the sender needed for an authenticated close.
 These are tested object-lifecycle guarantees, not physical-memory-erasure claims.
 
+Initial ordinary and password handshakes also close their temporary record epochs
+and owned native ephemeral keys on success, rejection, timeout and cancellation.
+A successfully returned channel keeps its distinct application epochs and any
+authentication share needed by enabled application authenticators. A channel that
+fails before handoff is aborted. On failure, completed `tls20_server` traceback
+frames are cleared (including chained exceptions), retaining traceback locations
+but not protocol-local secret references. Application callback frames, explicitly
+retained callback values, shared credentials/providers and ticket caches are not
+wiped. Diagnostics must therefore not rely on protocol frame locals after failure.
+
 ## Resource limits and operational precautions
 
 Keep the listener on loopback for initial tests. Never serve the repository or

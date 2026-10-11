@@ -16,6 +16,7 @@ from .handshake_options import client_controls, server_controls, client_control_
 from .diagnostics import emit as emit_diagnostic
 from .exporter_access import expose as expose_exporter
 from .pake_native import GROUPS
+from .secret_lifecycle import HandshakeSecrets, handshake_boundary
 
 
 async def _native_work(operation, *, discard=None):
@@ -85,6 +86,7 @@ def _log(diagnostics, random, client, server, *, application=False):
     emit_diagnostic(diagnostics, "TLS20_SERVER_" + suffix, random, server)
 
 
+@handshake_boundary
 async def server(reader, writer, policy, *, timeout=10, application_protocols=(b"http/1.1",),
                  cipher_suites=SUITES, ticket_store=None, max_early_data=0, on_early_data=None,
                  record_size_limit=None, heartbeat_mode=None, ticket_count_limit=1, signaling=None,
@@ -108,6 +110,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
     sender = state = None
     exporter_accesses = []
     acquired = bootstrap = False
+    secrets = HandshakeSecrets()
     try:
         async with asyncio.timeout(timeout):
             if await wire.exact(len(c.PREFACE)) != c.PREFACE:
@@ -251,8 +254,8 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             transcript.add(sh)
             client_secret, server_secret = handshake_keys(root, transcript, selected.hash_name)
             _log(diagnostics, hello.random, client_secret, server_secret)
-            receiver = c.RecordState(client_secret, "open", selected_id, receive_limit)
-            sender = c.RecordState(server_secret, "seal", selected_id, send_limit)
+            receiver = secrets.record(client_secret, "open", selected_id, receive_limit)
+            sender = secrets.record(server_secret, "seal", selected_id, send_limit)
             await wire.send_frame(sh)
             if hello.session_id and (not pwd or not retry):
                 await wire.send_ccs()
@@ -271,7 +274,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             sf = m.frame(20, schedule.finished(server_secret, transcript.snapshot()))
             transcript.add(sf);await wire.send_frame(sf, sender)
             client_app, server_app = application_keys(root, transcript, selected.hash_name)
-            sender = c.RecordState(server_app, "seal", selected_id, send_limit)
+            sender = secrets.record(server_app, "seal", selected_id, send_limit)
             exporter = schedule.derive_secret(schedule.master_secret(root), "exp master", transcript.snapshot())
             _log(diagnostics, hello.random, client_app, server_app, application=True)
             emit_diagnostic(diagnostics, "TLS20_EXPORTER_SECRET", hello.random, exporter)
@@ -286,7 +289,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                     role="server",hash_name=selected.hash_name)
             if ticket and hello.early_data:
                 early_secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE + ch)
-                early_receiver = c.RecordState(early_secret, "open", selected_id, ticket.record_size_limit) if accepted else None
+                early_receiver = secrets.record(early_secret, "open", selected_id, ticket.record_size_limit) if accepted else None
                 if accepted:
                     emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", hello.random, early_secret)
                 total = discarded = 0
@@ -335,6 +338,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                 enable_authenticators=enable_authenticators,peer_auth_share=hello.A,peer_capabilities=hello.extension_values,
                 receive_record_limit=receive_limit, send_record_limit=send_limit,
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode)
+            secrets.establish(channel)
             channel.password_permissions = policy.accounts[identity].permissions
             channel.peer_authenticated = True
             channel.expected_ticket_count = controls.expected_tickets
@@ -351,7 +355,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                                                  allowed_psk_modes=successor_modes, record_size_limit=receive_limit)
                     if message:
                         await channel.send_handshake(message)
-            return channel
+            return secrets.release(channel)
     except ProtocolError as error:
         for access in exporter_accesses:access.close()
         if bootstrap:
@@ -363,12 +367,18 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
         for access in exporter_accesses:access.close()
         writer.transport.abort();raise
     finally:
-        if state is not None:
-            state.close()
-        if acquired:
-            policy.release()
+        try:
+            secrets.close()
+        finally:
+            try:
+                if state is not None:
+                    state.close()
+            finally:
+                if acquired:
+                    policy.release()
 
 
+@handshake_boundary
 async def client(reader, writer, credential, *, timeout=10, application_protocols=(b"http/1.1",),
                  cipher_suites=SUITES, groups=(23, 24, 25), ticket_cache=None, early_data=b"",
                  record_size_limit=None, heartbeat_mode=None, ticket_request=None, signaling=None, max_fragment_length=None,
@@ -390,6 +400,7 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
     auth_private = (_auth_share_secret or c.X25519PrivateKey.generate()) if enable_authenticators else None
     auth_public = c.public_bytes(auth_private) if auth_private is not None else b""
     exporter_accesses = []
+    secrets = HandshakeSecrets()
     context = (_ticket_context if _ticket_context is not None else
                credential.context() + (signaling.context() if signaling is not None else b""))
     protocol = application_protocols[0] if application_protocols else b""
@@ -420,7 +431,7 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
             if ticket:
                 offered_suites = (ticket.cipher_suite,)
                 group = 29
-                ordinary_private, public = c.traffic_key(group)
+                ordinary_private, public = secrets.traffic_key(group)
                 kwargs = dict(group=group, supported_groups=(29,23), identity=ticket.identity,
                     age=ticket.obfuscated_age(), binder=bytes(c.suite(ticket.cipher_suite).hash_length),
                     early_data=bool(early_data and ticket.max_early_data), psk_modes=(1,))
@@ -465,7 +476,7 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                     raise ProtocolError("password session early data exceeds allowance")
                 secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE+ch)
                 emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", random, secret)
-                early_sender = c.RecordState(secret,"seal",ticket.cipher_suite,ticket.record_size_limit)
+                early_sender = secrets.record(secret,"seal",ticket.cipher_suite,ticket.record_size_limit)
                 early_exporter = schedule.derive_secret(early_root,"e exp master",c.PREFACE+ch)
                 for offset in range(0,len(early_data),min(16384,ticket.record_size_limit-1)):
                     writer.write(early_sender.seal(early_data[offset:offset+min(16384,ticket.record_size_limit-1)],23))
@@ -507,7 +518,8 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                         early_sender = None
                     if selected_group:
                         group = selected_group
-                        ordinary_private, public = c.traffic_key(group)
+                        secrets.close_key(ordinary_private)
+                        ordinary_private, public = secrets.traffic_key(group)
                         kwargs["group"] = group
                     ch = make_hello(public)
                     size = selected.hash_length
@@ -525,8 +537,8 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
             root=c.handshake_secret(shared,ticket.psk if ticket else None,selected.hash_name)
             client_secret,server_secret=handshake_keys(root,transcript,selected.hash_name)
             _log(diagnostics,random,client_secret,server_secret)
-            sender=c.RecordState(client_secret,"seal",selected_id)
-            receiver=c.RecordState(server_secret,"open",selected_id)
+            sender=secrets.record(client_secret,"seal",selected_id)
+            receiver=secrets.record(server_secret,"open",selected_id)
             ee=await wire.receive_frame(8,receiver)
             accepted,protocol,chosen=m.parse_encrypted_extensions(ee[4:],application_protocols,
                 offered_early=early_sender is not None,allowed_extensions=tuple(k for k,_ in extra if k in (1,15,28,55,56,58)),
@@ -567,11 +579,12 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                 local_capabilities=m.parse_client_hello(ch[4:],password_authenticated=ticket is None).extension_values,
                 receive_record_limit=receive_limit,send_record_limit=send_limit,
                 heartbeat_local_mode=controls.heartbeat_local_mode,heartbeat_peer_mode=controls.heartbeat_peer_mode)
+            secrets.establish(channel)
             channel.peer_authenticated=True
             channel.expected_ticket_count=controls.expected_tickets
             for access in exporter_accesses:access.complete(peer_authenticated=True)
             channel._exporter_accesses=tuple(exporter_accesses)
-            return channel
+            return secrets.release(channel)
     except ProtocolError as error:
         for access in exporter_accesses:access.close()
         await wire.fatal(error,sender);raise
@@ -579,5 +592,8 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
         for access in exporter_accesses:access.close()
         writer.transport.abort();raise
     finally:
-        if state is not None:
-            state.close()
+        try:
+            secrets.close()
+        finally:
+            if state is not None:
+                state.close()
