@@ -31,11 +31,11 @@ def _vector(value: bytes, width: int) -> bytes:
 
 def _take(data: bytes, offset: int, width: int) -> tuple[bytes, int]:
     if offset + width > len(data):
-        raise ProtocolError("truncated certificate selection vector")
+        raise ProtocolError("truncated certificate selection vector", alert=50)
     size = int.from_bytes(data[offset:offset + width], "big")
     offset += width
     if size > len(data) - offset:
-        raise ProtocolError("truncated certificate selection vector")
+        raise ProtocolError("truncated certificate selection vector", alert=50)
     return data[offset:offset + size], offset + size
 
 
@@ -142,13 +142,18 @@ def _name(data: bytes) -> None:
 def parse_certificate_authorities(data: bytes) -> tuple[bytes, ...]:
     names, end = _take(data, 0, 2)
     if end != len(data) or len(names) < 3:
-        raise ProtocolError("invalid certificate_authorities list")
+        raise ProtocolError("invalid certificate_authorities list", alert=50)
     offset, output = 0, []
     while offset < len(names):
         value, offset = _take(names, offset, 2)
         if not value:
-            raise ProtocolError("empty authority name")
-        _name(value)
+            raise ProtocolError("empty authority name", alert=50)
+        try:
+            _name(value)
+        except ProtocolError as exc:
+            # This only validates the offered Name's DER syntax; trust and
+            # credential-selection policy are evaluated elsewhere.
+            raise ProtocolError("invalid certificate_authorities name encoding", alert=50) from exc
         output.append(value)
     return tuple(output)
 

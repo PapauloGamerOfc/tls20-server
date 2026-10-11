@@ -6,6 +6,13 @@ from tls20_server.errors import ProtocolError
 
 
 class CredentialCacheTests(unittest.TestCase):
+    def test_cached_entries_share_certificate_count_and_der_budgets(self):
+        for entries in ((b"x",) * 64, (b"x" * 65536,)):
+            self.assertTrue(cache.cached_material(entries))
+        for entries in ((b"x",) * 65, (b"x" * 65537,)):
+            with self.assertRaises(ProtocolError):
+                cache.cached_material(entries)
+
     def test_all_codecs_roundtrip_and_exact_declared_length(self):
         body = b"credential" * 2000
         for algorithm in cache.COMPRESSION_ALGORITHMS:

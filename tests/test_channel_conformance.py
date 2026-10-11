@@ -62,6 +62,45 @@ class RecordAlertTests(unittest.TestCase):
 
 
 class ChannelConformanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_key_update_body_alerts_on_authenticated_wire(self):
+        for body, alert in ((b"", 50), (b"\0\0", 50), (b"\x02", 47)):
+            with self.subTest(body=body):
+                channel = self.channel()
+                sender, receiver = c.RecordState(bytes(32), "seal"), c.RecordState(bytes(32), "open")
+                try:
+                    raw = b"\x18" + len(body).to_bytes(3, "big") + body
+                    channel.wire.reader.feed_data(sender.seal(raw, 22))
+                    with self.assertRaises(ProtocolError) as caught:
+                        await channel.recv()
+                    self.assertEqual(caught.exception.alert, alert)
+                    self.assertEqual(receiver.open(bytes(channel.wire.writer.data)), (bytes((2, alert)), 21))
+                    self.assertTrue(channel.closed)
+                finally:
+                    sender.close()
+                    receiver.close()
+                    channel.abort()
+
+    async def test_key_update_valid_request_values_advance_receive_epoch(self):
+        for body in (b"\0", b"\1"):
+            with self.subTest(body=body):
+                channel = self.channel()
+                sender, receiver = c.RecordState(bytes(32), "seal"), c.RecordState(bytes(32), "open")
+                try:
+                    channel.wire.reader.feed_data(sender.seal(m.frame(24, body), 22))
+                    sender.update()
+                    channel.wire.reader.feed_data(sender.seal(b"new epoch data", 23))
+                    self.assertEqual(await channel.recv(), b"new epoch data")
+                    self.assertEqual(channel.receiver.epoch, 1)
+                    if body == b"\1":
+                        self.assertEqual(receiver.open(bytes(channel.wire.writer.data)), (m.frame(24, b"\0"), 22))
+                        self.assertEqual(channel.sender.epoch, 1)
+                    else:
+                        self.assertFalse(channel.wire.writer.data)
+                finally:
+                    sender.close()
+                    receiver.close()
+                    channel.abort()
+
     def channel(self, writer=None, **options):
         reader, writer = asyncio.StreamReader(), writer or MemoryWriter()
         return SecureChannel(Wire(reader, writer), bytes(32), bytes(32), **options)

@@ -1993,7 +1993,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             ephemeral_public, sid, resumed, group, retry, cookie, selected_id = m.parse_server_hello(sh[4:], with_suite=True)
             retried = retry
             if selected_id not in cipher_suites:
-                raise ProtocolError("unoffered server cipher suite")
+                raise ProtocolError("unoffered server cipher suite", alert=47)
             selected = c.suite(selected_id)
             schedule = c.KeySchedule(c.hash_context(selected.hash_name,native_provider))
             if selected.password_authenticated:
@@ -2011,6 +2011,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     _first_flight=(wire,ch,sh),_ticket_context=roots_hash,
                     enable_authenticators=enable_authenticators,_auth_share_secret=auth_private)
             if retry:
+                if group and (psk_only or group not in enabled_groups):
+                    raise ProtocolError("unoffered HelloRetryRequest group", alert=47)
                 if sid or (group and not force_retry and group == traffic_group) or (not group and not cookie):
                     raise ProtocolError("useless HelloRetryRequest", alert=47)
                 transcript.retry(ch, sh, schedule.hash_name)
@@ -2027,11 +2029,12 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 await wire.send_frame(ch)
                 offer_early = False
                 sh = await wire.receive_frame(2, boundary=True)
-                ephemeral_public, sid, resumed, group, retry, cookie, final_suite = m.parse_server_hello(sh[4:], with_suite=True)
-                if final_suite != selected_id:
-                    raise ProtocolError("cipher suite changed after retry")
+                ephemeral_public, sid, resumed, group, retry, cookie, final_suite = m.parse_server_hello(
+                    sh[4:], with_suite=True, after_retry=True)
                 if retry:
-                    raise ProtocolError("second HelloRetryRequest")
+                    raise ProtocolError("second HelloRetryRequest", alert=10)
+                if final_suite != selected_id:
+                    raise ProtocolError("cipher suite changed after retry", alert=47)
             selection_extensions = m.server_hello_extensions(sh[4:])
             psk_index = int.from_bytes(selection_extensions[41], "big") if resumed else None
             if sid or resumed and (psk_index >= len(offered_psks)):

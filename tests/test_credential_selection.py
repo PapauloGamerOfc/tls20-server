@@ -156,6 +156,21 @@ class CredentialSelectionTests(unittest.TestCase):
             with self.subTest(encoded=encoded), self.assertRaises(ProtocolError):
                 parse_oid_filters(encoded)
 
+    def test_malformed_authorities_vectors_use_decode_error(self):
+        for encoded in (b"", b"\0", b"\0\0", b"\0\3\0\1",
+                        b"\0\4\0\2\x30\0x", b"\0\6\0\2\x30\0\0\0"):
+            with self.subTest(encoded=encoded), self.assertRaises(ProtocolError) as caught:
+                parse_certificate_authorities(encoded)
+            self.assertEqual(caught.exception.alert, 50)
+
+    def test_malformed_authorities_der_uses_decode_error(self):
+        for name_der in (b"\x31\0", b"\x30\x81\0", b"\x30\0x", b"\x30\x02\x31\0"):
+            encoded = len(name_der).to_bytes(2, "big") + name_der
+            encoded = len(encoded).to_bytes(2, "big") + encoded
+            with self.subTest(name_der=name_der), self.assertRaises(ProtocolError) as caught:
+                parse_certificate_authorities(encoded)
+            self.assertEqual(caught.exception.alert, 50)
+
     def test_oid_with_large_first_subidentifier_and_der_long_length(self):
         oid = "2.999.1234567890.7"
         extension = encode_oid_filters([(oid, b"ignored")])

@@ -484,11 +484,11 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
             sh = _first_flight[2] if _first_flight else await wire.receive_frame(2,boundary=True)
             public_peer,sid,resumed,selected_group,retry,cookie,selected_id=m.parse_server_hello(sh[4:],with_suite=True)
             if sid or selected_id not in offered_suites or cookie and not retry:
-                raise ProtocolError("invalid password handshake selection")
+                raise ProtocolError("invalid password handshake selection", alert=47)
             selected,schedule=c.suite(selected_id),c.KeySchedule(c.suite(selected_id).hash_name)
             if not ticket:
                 if not retry or resumed or selected_group not in groups or selected_id not in SUITES:
-                    raise ProtocolError("empty password share requires negotiated retry")
+                    raise ProtocolError("empty password share requires negotiated retry", alert=47)
                 extensions=m.server_hello_extensions(sh[4:])
                 salt=extensions[31][2:] if 31 in extensions else None
                 base=password_base(credential.username,credential.password,salt)
@@ -498,9 +498,12 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                 ch=make_hello(public,group=selected_group,empty_share=False,cookie=cookie)
                 await wire.send_frame(ch)
                 sh=await wire.receive_frame(2,boundary=True)
-                public_peer,sid,resumed,final_group,retry,cookie,final_suite=m.parse_server_hello(sh[4:],with_suite=True)
-                if sid or resumed or retry or cookie or final_group!=selected_group or final_suite!=selected_id:
-                    raise ProtocolError("inconsistent password retry selection")
+                public_peer,sid,resumed,final_group,retry,cookie,final_suite=m.parse_server_hello(
+                    sh[4:],with_suite=True,after_retry=True)
+                if retry:
+                    raise ProtocolError("second HelloRetryRequest", alert=10)
+                if sid or resumed or cookie or final_group!=selected_group or final_suite!=selected_id:
+                    raise ProtocolError("inconsistent password retry selection", alert=47)
                 shared=await _native_work(lambda: state.finish(public_peer));state=None
             else:
                 if retry:
@@ -527,7 +530,10 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                                                hash_name=selected.hash_name)
                     await wire.send_frame(ch)
                     sh = await wire.receive_frame(2, boundary=True)
-                    public_peer,sid,resumed,selected_group,retry,cookie,final_suite=m.parse_server_hello(sh[4:],with_suite=True)
+                    public_peer,sid,resumed,selected_group,retry,cookie,final_suite=m.parse_server_hello(
+                        sh[4:],with_suite=True,after_retry=True)
+                    if retry:
+                        raise ProtocolError("second HelloRetryRequest", alert=10)
                     if sid or cookie or final_suite != selected_id:
                         raise ProtocolError("inconsistent password successor retry", alert=47)
                 if retry or not resumed or selected_group!=group or int.from_bytes(m.server_hello_extensions(sh[4:]).get(41,b""),"big")!=0:

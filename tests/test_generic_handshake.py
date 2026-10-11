@@ -14,6 +14,17 @@ class GenericHandshakeTests(unittest.IsolatedAsyncioTestCase):
     handle = test_sessions.SessionTests.handle
     connect = test_sessions.SessionTests.connect
 
+    async def test_malformed_authorities_vector_sends_decode_error(self):
+        for value in (b"", b"\0", b"\0\0", b"\0\3\0\1", b"\0\4\0\2\x31\0"):
+            with self.subTest(value=value), self.assertRaises(ProtocolError) as caught:
+                await self.connect(certificate_evidence_extensions=((47, value),))
+            self.assertEqual(caught.exception.alert, 50)
+        self.assertFalse(self.channels)
+        # A well-framed empty Name is a valid hint, not a trust requirement.
+        channel = await self.connect(certificate_evidence_extensions=((47, b"\0\4\0\2\x30\0"),))
+        await channel.send(b"valid authority hint")
+        self.assertEqual(await channel.recv(), b"valid authority hint")
+
     async def test_psk_ke_ignores_groups_without_a_common_traffic_group(self):
         key = ExternalPSK(b"PSK-only groups", b"explicit public test fixture", "localhost")
         self.server_options = {"external_psks": (key,)}

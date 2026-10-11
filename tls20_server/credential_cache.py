@@ -12,9 +12,10 @@ import hmac
 import zlib
 
 from .errors import ProtocolError
+from .credential_limits import MAX_CERTIFICATES, MAX_CERT_DER, MAX_CERTIFICATE_BODY
 
 
-MAX_CREDENTIAL_BODY = 262144
+MAX_CREDENTIAL_BODY = MAX_CERTIFICATE_BODY
 COMPRESSION_ALGORITHMS = (1, 2, 3)
 
 
@@ -36,12 +37,12 @@ def _take(data: bytes, cursor: int, width: int):
 
 def cached_material(material, credential_type=0, *, max_size=MAX_CREDENTIAL_BODY):
     material = tuple(material)
-    if credential_type not in (0, 2) or not material or len(material) > 64:
+    if credential_type not in (0, 2) or not material or len(material) > MAX_CERTIFICATES:
         raise ProtocolError("unsupported or empty cached credential material")
     if credential_type == 2 and len(material) != 1:
         raise ProtocolError("raw public key material must contain one entry")
-    if any(not isinstance(entry, bytes) or not entry for entry in material):
-        raise ProtocolError("empty cached credential entry")
+    if any(not isinstance(entry, bytes) or not 1 <= len(entry) <= MAX_CERT_DER for entry in material):
+        raise ProtocolError("cached credential entry length")
     size = 3 + sum(3 + len(entry) for entry in material)
     if size > max_size:
         raise ProtocolError("cached credential exceeds local budget")

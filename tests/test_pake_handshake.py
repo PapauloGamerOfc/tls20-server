@@ -293,8 +293,9 @@ class PakeHandshakeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_successor_client_rejects_unoffered_redundant_and_repeated_group_retry(self):
         from tls20_server import messages as m
-        for selected_group, repeated in ((24, False), (29, False), (29, True)):
-            with self.subTest(selected_group=selected_group, repeated=repeated):
+        for selected_group, repeated, unknown_suite in ((24, False, False), (29, False, False),
+                (29, True, False), (0xfafa, True, False), (29, True, True)):
+            with self.subTest(selected_group=selected_group, repeated=repeated, unknown_suite=unknown_suite):
                 self.cache = TicketCache()
                 await self.connect()
                 original_hello, original_server = m.client_hello, m.server_hello
@@ -309,12 +310,73 @@ class PakeHandshakeTests(unittest.IsolatedAsyncioTestCase):
                     if kwargs.get("resumed"):
                         kwargs.update(retry=True, resumed=False, group=selected_group)
                         public = b""
-                    return original_server(public, random, **kwargs)
+                    reply = original_server(public, random, **kwargs)
+                    if unknown_suite and kwargs.get("retry") and count == 2:
+                        reply = reply[:39] + b"\xaa\xaa" + reply[41:]
+                    return reply
+                captured, original_fatal = [], Wire.fatal
+                async def capture_fatal(wire, error, state=None):
+                    if wire.writer.get_extra_info("peername")[1] != self.port:
+                        return await original_fatal(wire, error, state)
+                    self.assertIsNone(state)
+                    write = wire.writer.write
+                    def record(data):
+                        captured.append(data)
+                        return write(data)
+                    with patch.object(wire.writer, "write", record):
+                        return await original_fatal(wire, error, state)
                 with patch.object(m, "client_hello", client_hello), patch.object(m, "server_hello", server_hello):
-                    with self.assertRaises(ProtocolError):
+                    with patch.object(Wire, "fatal", capture_fatal), self.assertRaises(ProtocolError) as failure:
                         await self.connect()
+                alert = 10 if repeated else 47
+                self.assertEqual(failure.exception.alert, alert)
+                self.assertEqual(captured, [b"\x15\x03\x03\0\2" + bytes((2, alert))])
                 self.assertEqual(count, 2 if repeated else 1)
-        self.assertEqual(len(self.channels), 3)
+        self.assertEqual(len(self.channels), 5)
+
+    async def test_fresh_retry_selection_alerts_on_wire(self):
+        from tls20_server import messages as m
+        for mutation, alert in (("unoffered_group", 47), ("unoffered_suite", 47),
+                                ("repeated", 10), ("repeated_changed_suite", 10), ("changed_suite", 47),
+                                ("repeated_unknown_group", 10), ("repeated_unknown_suite", 10)):
+            with self.subTest(mutation=mutation):
+                self.cache = TicketCache()
+                original, calls = m.server_hello, 0
+                def server_hello(public, random, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1 and mutation == "unoffered_group":
+                        kwargs["group"] = 24
+                    if calls == 1 and mutation == "unoffered_suite":
+                        kwargs["cipher_suite"] = 0xc0b2
+                    if calls == 2:
+                        if mutation.startswith("repeated"):
+                            kwargs["retry"], public = True, b""
+                        if mutation in ("changed_suite", "repeated_changed_suite"):
+                            kwargs["cipher_suite"] = 0xc0b1
+                    reply = original(public, random, **kwargs)
+                    if calls == 2 and mutation == "repeated_unknown_group":
+                        reply = reply[:-2] + b"\xfa\xfa"
+                    elif calls == 2 and mutation == "repeated_unknown_suite":
+                        reply = reply[:39] + b"\xaa\xaa" + reply[41:]
+                    return reply
+                captured, original_fatal = [], Wire.fatal
+                async def capture_fatal(wire, error, state=None):
+                    if wire.writer.get_extra_info("peername")[1] != self.port:
+                        return await original_fatal(wire, error, state)
+                    self.assertIsNone(state)
+                    write = wire.writer.write
+                    def record(data):
+                        captured.append(data)
+                        return write(data)
+                    with patch.object(wire.writer, "write", record):
+                        return await original_fatal(wire, error, state)
+                with patch.object(m, "server_hello", server_hello), patch.object(Wire, "fatal", capture_fatal):
+                    with self.assertRaises(ProtocolError) as failure:
+                        await self.connect(groups=(23,), cipher_suites=(0xc0b0, 0xc0b1))
+                self.assertEqual(failure.exception.alert, alert)
+                self.assertEqual(captured, [b"\x15\x03\x03\0\2" + bytes((2, alert))])
+        self.assertFalse(self.channels)
 
     async def test_successor_early_epochs_handle_authenticated_alerts(self):
         from tls20_server.errors import PeerClosed

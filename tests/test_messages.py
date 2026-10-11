@@ -146,9 +146,9 @@ class MessageTests(unittest.TestCase):
             m.parse_encrypted_extensions(body, b"other")
 
     def test_certificate_envelope_limits(self):
-        for items in ([b"x"], [b"x", b"yz"], [b"x"] * 8, [b"x" * 65536]):
+        for items in ([b"x"], [b"x", b"yz"], [b"x"] * 9, [b"x"] * 64, [b"x" * 65536]):
             self.assertEqual(m.parse_certificate(m.certificate(items)[4:]), items)
-        for items in ([], [b""], [b"x"] * 9, [b"x" * 65537], [b"x" * 65536] * 4):
+        for items in ([], [b""], [b"x"] * 65, [b"x" * 65537], [b"x" * 65536] * 4):
             with self.assertRaises(ProtocolError):
                 m.certificate(items)
         # Request context, entries length, per-certificate length and extension
@@ -165,9 +165,26 @@ class MessageTests(unittest.TestCase):
         for bad in (body + b"x", b"\x00\x00\x00\x00", b"x" * (m.MAX_HANDSHAKE_BODY + 1)):
             with self.assertRaises(ProtocolError):
                 m.parse_certificate(bad)
-        nine = b"\x00\x00\x01x\x00\x00" * 9
+        too_many = b"\x00\x00\x01x\x00\x00" * 65
         with self.assertRaises(ProtocolError):
-            m.parse_certificate(b"\x00" + len(nine).to_bytes(3, "big") + nine)
+            m.parse_certificate(b"\x00" + len(too_many).to_bytes(3, "big") + too_many)
+
+    def test_certificate_body_budget_includes_context_and_entry_extensions(self):
+        for context, metadata in ((b"", ((),) * 4),
+                                  (b"PHA context", (((0xfefe, b"evidence"),), (), (), ()))):
+            overhead = 4 + len(context) + 4 * 5 + sum(
+                4 + len(value) for pairs in metadata for _, value in pairs)
+            items = [b"x" * 65536] * 3 + [b"y" * (m.MAX_CERTIFICATE_BODY - overhead - 3 * 65536)]
+            body = m.certificate(items, context=context, entry_extensions=metadata)[4:]
+            self.assertEqual(len(body), m.MAX_CERTIFICATE_BODY)
+            self.assertEqual(m.parse_certificate(body, context=context, details=True), (items, metadata))
+            with self.assertRaises(ProtocolError):
+                m.certificate(items[:-1] + [items[-1] + b"x"], context=context, entry_extensions=metadata)
+            # Build the over-budget body without using the bounded serializer.
+            entries = b"".join(m._vec(item, 3) + m._vec(b"".join(m.extension(k, v) for k, v in pairs), 2)
+                for item, pairs in zip(items[:-1] + [items[-1] + b"x"], metadata))
+            with self.assertRaises(ProtocolError):
+                m.parse_certificate(m._vec(context, 1) + m._vec(entries, 3), context=context, details=True)
 
     def test_handshake_frame_envelopes(self):
         self.assertEqual(m.decode_frame(self.ch), (1, self.ch[4:]))

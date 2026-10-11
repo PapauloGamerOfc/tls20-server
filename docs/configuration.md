@@ -116,6 +116,19 @@ checks including name constraints. No Common Name fallback is used. The final
 supplied issuer is only a local consistency anchor for loading the operator's
 own incomplete chain; it is never installed as a remote client's trust root.
 
+Local credential resource budgets are shared by the certificate wire codecs,
+credential loader and both PKIX/lab validators: at most 64 presented
+certificates, at most 65,536 DER bytes per certificate, and at most 262,144 bytes
+in a `Certificate` body. The body budget includes the request context, vector
+lengths and certificate-entry extensions (including stapled evidence); those
+extensions can reduce the available chain space. The loader checks that the
+chain fits with an empty context and no entry extensions. PEM input is separately
+limited to 2 MiB. A verified PKIX path may append one independently configured
+trust anchor, which is not charged to the transmitted chain. These are local
+memory/work budgets, not protocol-wide limits; no eight-certificate limit is
+applied. Cached/compressed credential reconstruction retains the same decoded
+body and certificate-entry budgets.
+
 The client receives its trust root separately using `--ca`; a root sent in the
 handshake never creates trust. The root certificate is normally omitted from
 `fullchain.pem`. A lab generated directly under a root therefore has only its

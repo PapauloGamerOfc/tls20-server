@@ -7,6 +7,7 @@ import ipaddress
 import re
 
 from .errors import ProtocolError
+from .credential_limits import MAX_CERTIFICATES, MAX_CERT_DER, MAX_CERTIFICATE_BODY
 from . import crypto as c
 from .credential_selection import parse_certificate_authorities, parse_oid_filters
 from .status_request import parse_status_request
@@ -117,8 +118,11 @@ def frame(kind: int, body: bytes) -> bytes:
         raise ProtocolError("MAC envelope", alert=50)
     if kind == 5 and body:
         raise ProtocolError("EndOfEarlyData must be empty", alert=50)
-    if kind == 24 and body not in (b"\x00", b"\x01"):
-        raise ProtocolError("KeyUpdate request value", alert=47)
+    if kind == 24:
+        if len(body) != 1:
+            raise ProtocolError("KeyUpdate body length", alert=50)
+        if body not in (b"\x00", b"\x01"):
+            raise ProtocolError("KeyUpdate request value", alert=47)
     return bytes((kind,)) + len(body).to_bytes(3, "big") + body
 
 
@@ -478,11 +482,16 @@ def server_hello(E: bytes, random: bytes, *, session_id: bytes = b"", resumed: b
                  + _vec(session_id, 1) + cipher_suite.to_bytes(2, "big") + b"\x00" + _vec(ext, 2))
 
 
-def parse_server_hello(body: bytes, *, details: bool = False, with_suite: bool = False):
+def parse_server_hello(body: bytes, *, details: bool = False, with_suite: bool = False,
+                       after_retry: bool = False):
     r = _Reader(body)
     if r.take(2) != b"\x03\x03":
         raise ProtocolError("invalid ServerHello legacy version", alert=70)
     random = r.take(32)
+    if after_retry and random == HRR_RANDOM:
+        # Reject the repeated message before considering a new suite/group.
+        # No second negotiation is permitted, even for unknown parameters.
+        raise ProtocolError("second HelloRetryRequest", alert=10)
     sid = r.vector(1)
     cipher_suite = int.from_bytes(r.take(2), "big")
     if len(sid) > 32 or cipher_suite not in c.CIPHER_SUITES or r.take(1) != b"\x00":
@@ -629,25 +638,36 @@ def parse_new_session_ticket(body: bytes):
 
 def certificate(chain_der: list[bytes], *, context: bytes = b"", allow_empty: bool = False,
                  entry_extensions=()) -> bytes:
-    if not (0 if allow_empty else 1) <= len(chain_der) <= 8:
+    if not (0 if allow_empty else 1) <= len(chain_der) <= MAX_CERTIFICATES:
         raise ProtocolError("certificate count")
     entries = []
     metadata = entry_extensions or ((),) * len(chain_der)
     if len(metadata) != len(chain_der):
         raise ProtocolError("certificate metadata count")
+    encoded_context = _vec(context, 1)
+    body_size = len(encoded_context) + 3
     for item, pairs in zip(chain_der, metadata):
-        if not 1 <= len(item) <= 65536:
+        if not 1 <= len(item) <= MAX_CERT_DER:
             raise ProtocolError("certificate length")
-        block = b"".join(extension(kind, value) for kind, value in pairs)
+        body_size += 5 + len(item)
+        if body_size > MAX_CERTIFICATE_BODY:
+            raise ProtocolError("Certificate body too large")
+        blocks = []
+        for kind, value in pairs:
+            body_size += 4 + len(value)
+            if body_size > MAX_CERTIFICATE_BODY:
+                raise ProtocolError("Certificate body too large")
+            blocks.append(extension(kind, value))
+        block = b"".join(blocks)
         extensions(block)
         entries.append(_vec(item, 3) + _vec(block, 2))
-    return frame(11, _vec(context, 1) + _vec(b"".join(entries), 3))
+    return frame(11, encoded_context + _vec(b"".join(entries), 3))
 
 
 def parse_certificate(body: bytes, *, context: bytes = b"", allow_empty: bool = False,
                        details=False) -> list[bytes]:
     """Decode the list envelope, not DER, certificate profiles or path trust."""
-    if len(body) > MAX_HANDSHAKE_BODY:
+    if len(body) > MAX_CERTIFICATE_BODY:
         raise ProtocolError("Certificate body too large")
     r = _Reader(body)
     if r.vector(1) != context:
@@ -657,7 +677,7 @@ def parse_certificate(body: bytes, *, context: bytes = b"", allow_empty: bool = 
     result, metadata = [], []
     while entries.position < len(entries.data):
         item = entries.vector(3)
-        if not 1 <= len(item) <= 65536 or len(result) >= 8:
+        if not 1 <= len(item) <= MAX_CERT_DER or len(result) >= MAX_CERTIFICATES:
             raise ProtocolError("certificate count or length", alert=50)
         block = entries.vector(2)
         values = extensions(block, context="CE")

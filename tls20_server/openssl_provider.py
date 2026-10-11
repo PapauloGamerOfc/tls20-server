@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from cryptography.exceptions import InvalidTag
 
 from .errors import ConfigurationError, ProtocolError
+from .credential_limits import MAX_CERTIFICATES, MAX_CERT_DER, MAX_CERTIFICATE_BODY
 
 
 P, I, Z, U = ct.c_void_p, ct.c_int, ct.c_size_t, ct.c_uint
@@ -143,6 +144,7 @@ class OpenSSLProvider:
             "X509_VERIFY_PARAM_set_time": (None, [P, ct.c_longlong if os.name == "nt" else ct.c_long]),
             "X509_VERIFY_PARAM_set1_host": (I, [P, ct.c_char_p, Z]),
             "X509_VERIFY_PARAM_set_hostflags": (None, [P, U]),
+            "X509_VERIFY_PARAM_set_depth": (None, [P, I]),
             "X509_VERIFY_PARAM_set1_ip_asc": (I, [P, ct.c_char_p]),
             "OPENSSL_sk_new_null": (P, []), "OPENSSL_sk_push": (I, [P, P]),
             "OPENSSL_sk_num": (I, [P]), "OPENSSL_sk_value": (P, [P, I]),
@@ -334,12 +336,13 @@ class OpenSSLProvider:
         self._ready()
         if purpose not in ("server", "client") or not chain_der or not roots_der:
             raise ProtocolError("explicit native certificate path policy required")
-        if len(chain_der) > 32 or len(roots_der) > 4096:
+        if (len(chain_der) > MAX_CERTIFICATES or len(roots_der) > 4096
+                or 4 + sum(5 + len(der) for der in chain_der) > MAX_CERTIFICATE_BODY):
             raise ProtocolError("native certificate path resource budget")
         certificates, store, stack, context, path = [], None, None, None, None
         try:
             for der in (*chain_der, *roots_der):
-                if not 1 <= len(der) <= 1 << 20:
+                if not 1 <= len(der) <= MAX_CERT_DER:
                     raise ProtocolError("native certificate size budget")
                 encoded = _buffer(der)
                 cursor = P(ct.addressof(encoded))
@@ -377,6 +380,8 @@ class OpenSSLProvider:
                 if hasattr(self, "_configure_certificate_verifier") else None)
             self._check(self.lib.X509_STORE_CTX_set_purpose(context, 2 if purpose == "server" else 1))
             param = self.lib.X509_STORE_CTX_get0_param(context)
+            # Depth counts intermediates, excluding the leaf and trust anchor.
+            self.lib.X509_VERIFY_PARAM_set_depth(param, MAX_CERTIFICATES - 1)
             self.lib.X509_VERIFY_PARAM_set_hostflags(param, 0x4 | 0x20)  # No partial wildcard or CN fallback.
             self._check(self.lib.X509_VERIFY_PARAM_set_flags(param, 0x20 | 0x80 | 0x8000 | (0x80000 if partial_chain else 0)))
             if now is not None:
@@ -394,17 +399,21 @@ class OpenSSLProvider:
             path = self.lib.X509_STORE_CTX_get1_chain(context)
             if not path:
                 raise ProtocolError("native verifier returned no authenticated path")
+            if not 1 <= self.lib.OPENSSL_sk_num(path) <= MAX_CERTIFICATES + 1:
+                raise ProtocolError("native verified path resource budget")
             result = []
             for index in range(self.lib.OPENSSL_sk_num(path)):
                 cert = self.lib.OPENSSL_sk_value(path, index)
                 length = self.lib.i2d_X509(cert, None)
-                if not 0 < length <= 1 << 20:
+                if not 0 < length <= MAX_CERT_DER:
                     raise ProtocolError("native verified certificate encoding failed")
                 output = ct.create_string_buffer(length)
                 cursor = P(ct.addressof(output))
                 if self.lib.i2d_X509(cert, ct.byref(cursor)) != length:
                     raise ProtocolError("native verified certificate encoding failed")
                 result.append(output.raw)
+            if sum(map(len, result)) > MAX_CERTIFICATE_BODY + MAX_CERT_DER:
+                raise ProtocolError("native verified path resource budget")
             return tuple(result)
         finally:
             if path:

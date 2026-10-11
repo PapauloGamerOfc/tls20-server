@@ -361,6 +361,35 @@ and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
 
+### Certificate budgets and request/retry alerts: 2026-10-11
+
+Credential loading, wire encoding/decoding, cached material and path validation
+now share the 64-presented-certificate budget. The separately configured trust
+anchor may extend a verified path to 65 entries; this does not extend the peer's
+wire budget. Per-certificate and aggregate byte budgets still apply, including
+Certificate contexts and entry extensions. Real chains of 9 and 64 certificates
+exercise configuration, initial authentication and post-handshake authentication;
+65 presented entries and byte-budget overflows are rejected.
+
+Malformed authority-name vectors and DER, malformed KeyUpdate lengths and
+invalid KeyUpdate enum values produce their specified fatal alerts. A second
+HelloRetryRequest is rejected as unexpected before processing its new selection,
+including unknown suite/group codes, in ordinary and password-authenticated
+handshakes. First invalid retries remain illegal-parameter errors. Positive
+controls retain valid KeyUpdate, initial retry and certificate requests.
+
+Local Windows validation on Python 3.11 and 3.12 each ran 656 server tests with
+optional native providers: 654 passed and two POSIX-specific checks were skipped.
+Minimal-provider runs on
+Python 3.11 and 3.12 each ran 656 tests with 92 explicit optional-provider/OS
+skips. Resource warnings were treated as errors. All 22 portable Phromium
+interoperability invocations and 19 optional-provider commands passed, including
+25 chain checks with seven actual connections. Documentation, module compilation,
+source/wheel builds and isolated wheel installation/CLI checks passed. Evidence
+is retained under `build/cert-conformance-*` and the browser's
+`out/httpps-native/cert-conformance-*`. These are local validation results,
+not a claim of completed remote Linux/macOS CI or a formal security audit.
+
 ### Password negotiation and early-record rejection validation: 2026-10-11
 
 Unknown cipher-suite codes (including GREASE) are ignored when classifying a

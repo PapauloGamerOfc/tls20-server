@@ -26,10 +26,11 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, paddin
 from cryptography.x509.oid import ExtendedKeyUsageOID, ExtensionOID
 
 from .errors import ConfigurationError, ProtocolError
+from .credential_limits import MAX_CERTIFICATES, MAX_CERT_DER, MAX_CERTIFICATE_BODY
 
 
-MAX_CERT = 65536
-MAX_CHAIN_BODY = 262144
+MAX_CERT = MAX_CERT_DER
+MAX_CHAIN_BODY = MAX_CERTIFICATE_BODY
 MAX_PEM_FILE = 2 * 1024 * 1024
 _PEM = re.compile(rb"-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\r\n\t ]+)\s*-----END CERTIFICATE-----")
 _KEY_PEM = re.compile(rb"\s*-----BEGIN PRIVATE KEY-----\s*([A-Za-z0-9+/=\r\n\t ]+)\s*-----END PRIVATE KEY-----\s*")
@@ -419,7 +420,8 @@ def validate_pkix_path(chain_der, trust_roots, *, now=None, partial_chain=False,
     credential bundles whose final issuer need not include its root. It is off
     for remote peer validation. Identity/role/revocation are separate checks.
     """
-    if not chain_der or len(chain_der) > 64 or sum(len(x) for x in chain_der) > MAX_CHAIN_BODY:
+    if (not chain_der or len(chain_der) > MAX_CERTIFICATES
+            or 4 + sum(5 + len(x) for x in chain_der) > MAX_CHAIN_BODY):
         raise ProtocolError("certificate chain exceeds local budget")
     if not trust_roots or len(trust_roots) > 256:
         raise ProtocolError("explicit bounded trust anchors are required")
@@ -432,7 +434,10 @@ def validate_pkix_path(chain_der, trust_roots, *, now=None, partial_chain=False,
         path = signature_provider.verify_certificate_path(tuple(chain_der),
             tuple(root.public_bytes(serialization.Encoding.DER) for root in trust_roots),
             now=now, partial_chain=partial_chain, purpose=purpose)
-        if (not path or len(path) > 64 or sum(len(value) for value in path) > MAX_CHAIN_BODY
+        # A full verified path may add its separately configured trust anchor;
+        # that anchor is not part of the peer's transmitted Certificate budget.
+        if (not path or len(path) > MAX_CERTIFICATES + 1
+                or sum(len(value) for value in path) > MAX_CHAIN_BODY + MAX_CERT
                 or path[0] != chain_der[0]):
             raise ProtocolError("PKIX provider returned an invalid verified path")
         return tuple(_load_pkix_der(value) for value in path)
@@ -792,8 +797,8 @@ def _verify_issuer(cert: x509.Certificate, issuer: x509.Certificate) -> None:
 
 
 def _chain(chain_der: list[bytes]) -> list[x509.Certificate]:
-    if not isinstance(chain_der, list) or not 1 <= len(chain_der) <= 8:
-        raise ProtocolError("certificate chain must contain 1 through 8 certificates")
+    if not isinstance(chain_der, list) or not 1 <= len(chain_der) <= MAX_CERTIFICATES:
+        raise ProtocolError(f"certificate chain must contain 1 through {MAX_CERTIFICATES} certificates")
     if 4 + sum(5 + len(der) for der in chain_der) > MAX_CHAIN_BODY:
         raise ProtocolError("certificate chain body exceeds limit")
     certs = [_parse_der(der) for der in chain_der]
@@ -921,7 +926,7 @@ def load_credentials(chain_path: Path, key_path: Path, server_name: str,
     fullchain files that omit their root; clients still require independent
     anchors and perform their own complete path/identity/evidence validation.
     """
-    certs = _pem_certificates(_read_file(Path(chain_path), MAX_PEM_FILE), 64, general_pkix=True)
+    certs = _pem_certificates(_read_file(Path(chain_path), MAX_PEM_FILE), MAX_CERTIFICATES, general_pkix=True)
     key_data = _read_file(Path(key_path), 16384, private=True)
     try:
         # Accept only one unencrypted PKCS#8 PEM object, never ignored trailing data.
