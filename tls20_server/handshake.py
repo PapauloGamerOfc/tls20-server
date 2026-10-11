@@ -151,6 +151,18 @@ class Wire:
         self.writer.write(b"\x14\x03\x03\x00\x01\x01")
         await self.writer.drain()
 
+    def process_alert(self, fragment):
+        """Handle a plaintext or authenticated handshake-epoch alert."""
+        if len(fragment) != 2:
+            raise ProtocolError("malformed alert", alert=50)
+        if fragment[1] not in (0, 90):
+            raise PeerClosed("peer aborted the handshake", alert=fragment[1])
+        if self.pending:
+            raise ProtocolError("alert interleaves a fragmented handshake", alert=10)
+        if fragment[1] == 0:
+            raise PeerClosed("peer closed the handshake", alert=0)
+        # user_canceled is advisory; keep reading for the peer's close_notify.
+
     async def receive_frame(self, expected, state=None, *, boundary=False):
         while True:
             self.check_deadline()
@@ -173,15 +185,8 @@ class Wire:
                     return message
             fragment, kind = await self.read_record(state)
             if kind == 21:
-                if len(fragment) != 2:
-                    raise ProtocolError("malformed alert", alert=50)
-                if fragment[1] not in (0, 90):
-                    raise PeerClosed("peer aborted the handshake", alert=fragment[1])
-                if self.pending:
-                    raise ProtocolError("alert interleaves a fragmented handshake", alert=10)
-                if fragment[1] == 90:
-                    continue  # advisory user_canceled; normally followed by close_notify
-                raise PeerClosed("peer closed or aborted the handshake", alert=fragment[1])
+                self.process_alert(fragment)
+                continue
             if kind != 22 or not fragment:
                 raise ProtocolError("application data before authentication", alert=10)
             if len(self.pending) + len(fragment) > MAX_BODY + 4 + 16384:
@@ -755,9 +760,10 @@ def _peer_fragment_limit(value):
     return _fragment_limit(value[0])
 
 
-def _check_certificate_offer(chain, offered, signature_provider=None, signature_issuers=()):
+def _check_certificate_offer(chain, offered, signature_provider=None, signature_issuers=(), *, require_match=True):
     if not offered:
         raise ProtocolError("missing signature_algorithms_cert", alert=109)
+    matches = True
     for index, der in enumerate(chain):
         cert = x509.load_der_x509_certificate(der)
         if index == len(chain) - 1 and cert.subject == cert.issuer:
@@ -778,18 +784,28 @@ def _check_certificate_offer(chain, offered, signature_provider=None, signature_
                   find_certificate_issuer(cert, signature_issuers, signature_provider=signature_provider))
         scheme = certificate_signature_scheme(cert, issuer)
         if scheme not in offered:
-            raise ProtocolError("certificate signature was not offered")
+            matches = False
+    if require_match and not matches:
+        raise ProtocolError("certificate signature was not offered")
+    return matches
 
 
-def _retry_psks_unchanged(first, second, hash_length=32):
-    """Only PSKs incompatible with the selected hash may disappear."""
+def _retry_psks_unchanged(first, second, hash_name="sha256", *, known_hashes=None):
+    """Retain known compatible PSKs without guessing the hash of opaque identities.
+
+    Different KDFs can have the same binder length. Unknown identities may be
+    removed because their incompatibility cannot be determined by this server.
+    Retained identities still preserve order and binder size; no additions are
+    allowed. The selected identity and its binder are checked separately.
+    """
+    known_hashes = known_hashes or {}
     cursor = 0
     for identity, _, binder in first.psk_offers:
         if cursor < len(second.psk_offers) and second.psk_offers[cursor][0] == identity:
             if len(second.psk_offers[cursor][2]) != len(binder):
                 return False
             cursor += 1
-        elif len(binder) == hash_length:
+        elif known_hashes.get(identity) == hash_name:
             return False
     return cursor == len(second.psk_offers)
 
@@ -1221,6 +1237,16 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 raise ProtocolError("no acceptable PSK-only selection or DHE share")
             retry_group = hello.group if not hello.B and not psk_only else 0
             if retry_group or retry_cookie_policy is not None:
+                known_psk_hashes = {}
+                for identity, _, _ in hello.psk_offers:
+                    hashes = {value.hash_name for value in provisioned
+                              if value.identity == identity and value.name == server_name
+                              and value.protocol == protocol}
+                    candidate = lookup_ticket(identity) if ticket_store is not None else None
+                    if candidate is not None:
+                        hashes.add(c.suite(candidate.cipher_suite).hash_name)
+                    if len(hashes) == 1:
+                        known_psk_hashes[identity] = hashes.pop()
                 retry_cookie = (retry_cookie_policy.issue(writer, ch, selected_id, retry_group)
                                 if retry_cookie_policy is not None else b"")
                 hrr = m.server_hello(b"", bytes(32), session_id=hello.session_id,
@@ -1256,7 +1282,8 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 stable = lambda h: {k: v for k, v in h.extension_values if k not in mutable}
                 if (second.fixed_hello != hello.fixed_hello or stable(second) != stable(hello)
                         or second.early_data
-                        or not _retry_psks_unchanged(hello, second, selected.hash_length)
+                        or not _retry_psks_unchanged(hello, second, selected.hash_name,
+                                                   known_hashes=known_psk_hashes)
                         or (retry_group and (not second.B or second.group != retry_group
                                              or second.share_groups != (retry_group,)))
                         or (not retry_group and dict(second.extension_values).get(51)
@@ -1475,6 +1502,9 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         if bootstrap_binding is not None:
                             current_bootstrap_bindings(bootstrap_binding, service=server_name)
                         content, kind = early_receiver.open(record)
+                        if kind == 21:
+                            wire.process_alert(content)
+                            continue
                         if kind == 22:
                             wire.pending.extend(content)
                             eoed = await wire.receive_frame(5, early_receiver, boundary=True)
@@ -1492,6 +1522,12 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         result = receiver.try_open(record)
                         if result is not None:
                             content, kind = result
+                            if kind == 21:
+                                wire.process_alert(content)
+                                # Authentication commits to the handshake
+                                # epoch even for advisory user_canceled. Never
+                                # discard subsequent decryption failures.
+                                break
                             if kind != 22 or not content:
                                 raise ProtocolError("expected authenticated handshake after early data")
                             wire.pending.extend(content)

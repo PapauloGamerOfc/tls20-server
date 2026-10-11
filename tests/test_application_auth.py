@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -154,6 +155,71 @@ class AuthenticatorTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ProtocolError):
                 await verifier.validate(response, self.policy, request=request)
         self.assertEqual(self.validations, 0)
+
+    async def test_path_algorithm_selection_refuses_incompatible_requested_identity(self):
+        for verifier, prover in ((self.client, self.server), (self.server, self.client)):
+            for algorithms, accepted in (((0x0807,), True), ((0x0403,), False), ((0xaaaa,), False)):
+                with self.subTest(role=prover.channel.role, algorithms=algorithms):
+                    request = verifier.request(certificate_algorithms=algorithms)
+                    response = prover.authenticate(self.credentials, request=request)
+                    self.assertEqual(response[0], 11 if accepted else 20)
+                    result = await verifier.validate(response, self.policy, request=request)
+                    self.assertEqual(result.authenticated, accepted)
+                    if not accepted:
+                        self.assertIsNone(result.identity)
+                        self.assertIsNone(result.certificate)
+                    with self.assertRaises(ProtocolError):
+                        await verifier.validate(response, self.policy, request=request)
+        self.assertEqual(self.validations, 2)
+        self.server_channel.peer_capabilities = ((50, m._vec(b"\x04\x03", 2)),)
+        with self.assertRaisesRegex(ProtocolError, "no acceptable spontaneous"):
+            self.server.authenticate(self.credentials)
+
+    async def test_delegated_selection_uses_independent_current_path_and_grant_offers(self):
+        from tests.test_credential_profiles import CredentialProfileTests
+        fixture = CredentialProfileTests(); fixture.setUp()
+        for role, verifier, prover in (("server", self.client, self.server), ("client", self.server, self.client)):
+            parent, grant = fixture.parent_and_grant(role=role)
+            credentials = Credentials([der(parent)], fixture.key)
+            entries = (((34, grant),),)
+            policy = replace(fixture.policy, authorize_client=lambda material, evidence: True)
+            validator = credential_validator(policy, role=role, authorize=lambda identity: True)
+            for path, signing, accepted in ((0x0403, 0x0807, True), (0x0807, 0x0807, False),
+                    (0x0403, 0x0403, False), (0x0403, 0xaaaa, False), (0x0403, None, False)):
+                with self.subTest(role=role, path=path, signing=signing):
+                    extra = () if signing is None else (
+                        (34, m._vec((0xfe00 if role == "server" else 0xfe01).to_bytes(2, "big"), 2)),
+                        (0xff04, m._vec(signing.to_bytes(2, "big"), 2)))
+                    request = verifier.request(certificate_algorithms=(path,), extra_extensions=extra)
+                    response = prover.authenticate(credentials, request=request, entry_extensions=entries)
+                    self.assertEqual(response[0], 11 if accepted else 20)
+                    result = await verifier.validate(response, validator, request=request)
+                    self.assertEqual(result.authenticated, accepted)
+            # Spontaneous identities obey current ClientHello offers too.
+            if role == "server":
+                prover.channel.peer_capabilities = ((50, m._vec(b"\x04\x03", 2)),
+                    (34, m._vec(b"\xfe\x00", 2)), (0xff04, m._vec(b"\x04\x03", 2)))
+                with self.assertRaisesRegex(ProtocolError, "no acceptable spontaneous"):
+                    prover.authenticate(credentials, entry_extensions=entries)
+            # A malformed grant is a local error, not an unsupported identity.
+            request = verifier.request(certificate_algorithms=(0x0403,))
+            with self.assertRaises(ProtocolError):
+                prover.authenticate(credentials, request=request, entry_extensions=(((34, grant[:-1]),),))
+
+    async def test_selection_does_not_relax_malformed_requests_or_receiver_validation(self):
+        from tls20_server.application_auth import _frame
+        policy = CredentialPolicy(trust_roots=(self.root_cert,), peer_name="localhost", revocation_policy="offline")
+        request = self.client.request(certificate_algorithms=(0x0403,))
+        with patch("tls20_server.application_auth._credential_matches_algorithms", return_value=True):
+            response = self.server.authenticate(self.credentials, request=request)
+        validator = credential_validator(policy, role="server", authorize=lambda identity: True)
+        with self.assertRaisesRegex(ProtocolError, "certificate signature was not offered"):
+            await self.client.validate(response, validator, request=request)
+        for algorithms in (b"\0\0", b"\0\x01\x08", b"\0\x02\xfe\0"):
+            malformed = _frame(17, m._vec(b"malformed", 1) + m._vec(
+                m.extension(50, algorithms) + m.extension(0xff02, c.public_bytes(self.share)), 2))
+            with self.assertRaises(ProtocolError):
+                self.server.authenticate(self.credentials, request=malformed)
 
     async def test_finished_independent_literal_oracle(self):
         request = self.client.request(context=b"oracle")

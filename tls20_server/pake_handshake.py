@@ -10,7 +10,7 @@ import hmac
 import os
 
 from . import crypto as c, messages as m
-from .errors import ProtocolError, PeerClosed
+from .errors import ProtocolError
 from .pake import PasswordCredential, PasswordServer, SUITES, RESUMPTION_SUITES, password_base
 from .handshake_options import client_controls, server_controls, client_control_selection
 from .diagnostics import emit as emit_diagnostic
@@ -69,12 +69,8 @@ async def _next_after_retry(wire, early):
         if record[0] == 20 and record[5:] == b"\x01":
             continue
         if record[0] == 21:
-            fragment = record[5:]
-            if len(fragment) != 2:
-                raise ProtocolError("malformed alert", alert=50)
-            if fragment[1] == 90:
-                continue
-            raise PeerClosed("peer closed or aborted the password retry", alert=fragment[1])
+            wire.process_alert(record[5:])
+            continue
         if record[0] == 22:
             wire.pending.extend(record[5:])
             return await wire.receive_frame(1, boundary=True)
@@ -189,27 +185,44 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                     stable = lambda value: {k: v for k, v in value.extension_values if k not in mutable}
                     if (second.fixed_hello != hello.fixed_hello or stable(second) != stable(hello)
                             or second.share_groups != (group,) or second.early_data
-                            or not _retry_psks_unchanged(hello, second, selected.hash_length)):
+                            or not _retry_psks_unchanged(hello, second, selected.hash_name)):
                         raise ProtocolError("forbidden PWD retry mutation", alert=47)
                     ch, hello = ch2, second
                 public, shared = await _native_work(lambda: _server_commit(policy.provider, account.base,
                     hello.random, group, selected.hash_name, hello.B))
             else:
-                if retry_cookie_policy is not None:
-                    retry_cookie = retry_cookie_policy.issue(writer, ch, selected_id, 0)
-                    hrr = m.server_hello(b"", bytes(32), retry=True, group=0,
+                # Successor tickets use ordinary PSK/DHE, not PWD commitment
+                # groups. Do not select groups that need an absent provider.
+                ordinary_groups = tuple(value for value in c.GROUP_LENGTHS if not 34 <= value <= 41)
+                hello = m.parse_client_hello(ch[4:], enabled_groups=ordinary_groups)
+                allowed_modes = set(ticket.allowed_psk_modes).intersection(hello.psk_modes)
+                use_dhe = 1 in allowed_modes and (bool(hello.B) or 0 not in allowed_modes)
+                if use_dhe and not hello.group:
+                    raise ProtocolError("password successor has no compatible traffic group")
+                retry_group = hello.group if use_dhe and not hello.B else 0
+                if retry_group or retry_cookie_policy is not None:
+                    retry_cookie = (retry_cookie_policy.issue(writer, ch, selected_id, retry_group)
+                                    if retry_cookie_policy is not None else b"")
+                    hrr = m.server_hello(b"", bytes(32), retry=True, group=retry_group,
                         cipher_suite=selected_id, session_id=hello.session_id, cookie=retry_cookie)
                     await wire.send_frame(hrr)
                     if hello.session_id:
                         await wire.send_ccs()
                     transcript.retry(ch, hrr, selected.hash_name)
                     ch2 = await _next_after_retry(wire, hello.early_data)
-                    second = m.parse_client_hello(ch2[4:])
+                    second = m.parse_client_hello(ch2[4:],
+                        enabled_groups=(retry_group,) if retry_group else ordinary_groups)
                     validate_retry_cookie(retry_cookie_policy, dict(second.extension_values), retry_cookie,
-                                          writer, ch, selected_id, 0)
-                    stable = lambda value: {k: v for k, v in value.extension_values if k not in {21, 41, 42, 44}}
+                                          writer, ch, selected_id, retry_group)
+                    mutable = {21, 41, 42, 44} | ({51} if retry_group else set())
+                    stable = lambda value: {k: v for k, v in value.extension_values if k not in mutable}
+                    known_hashes = {identity: c.suite(known.cipher_suite).hash_name
+                        for identity, _, _ in hello.psk_offers
+                        if (known := ticket_store.lookup(identity, policy.service, protocol, context)) is not None}
                     if (second.fixed_hello != hello.fixed_hello or stable(second) != stable(hello)
-                            or second.early_data or not _retry_psks_unchanged(hello, second, selected.hash_length)):
+                            or second.early_data or (retry_group and second.share_groups != (retry_group,))
+                            or not _retry_psks_unchanged(hello, second, selected.hash_name,
+                                known_hashes=known_hashes)):
                         raise ProtocolError("forbidden password resumption retry mutation", alert=47)
                     ch, hello = ch2, second
                     identity_index = next((index for index, offer in enumerate(hello.psk_offers)
@@ -283,6 +296,9 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                         continue
                     if accepted:
                         content, kind = early_receiver.open(record)
+                        if kind == 21:
+                            wire.process_alert(content)
+                            continue
                         if kind == 22:
                             wire.pending.extend(content)
                             eoed = await wire.receive_frame(5, early_receiver, boundary=True)
@@ -296,6 +312,9 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                         opened = receiver.try_open(record)
                         if opened is not None:
                             content, kind = opened
+                            if kind == 21:
+                                wire.process_alert(content)
+                                break  # Handshake epoch authenticated; no more early-data discard.
                             if kind != 22:
                                 raise ProtocolError("unexpected post-early epoch")
                             wire.pending.extend(content);break
@@ -474,11 +493,22 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                 shared=await _native_work(lambda: state.finish(public_peer));state=None
             else:
                 if retry:
-                    if selected_group or not cookie or resumed or selected_id != ticket.cipher_suite:
+                    first = m.parse_client_hello(ch[4:])
+                    if (resumed or selected_id != ticket.cipher_suite
+                            or selected_group and (selected_group not in first.groups or selected_group in first.share_groups)
+                            or not selected_group and not cookie):
                         raise ProtocolError("invalid password successor retry", alert=47)
                     transcript.retry(ch, sh, selected.hash_name)
                     kwargs["early_data"] = False
                     kwargs["cookie"] = cookie
+                    kwargs["age"] = ticket.obfuscated_age()
+                    if early_sender is not None:
+                        early_sender.close()
+                        early_sender = None
+                    if selected_group:
+                        group = selected_group
+                        ordinary_private, public = c.traffic_key(group)
+                        kwargs["group"] = group
                     ch = make_hello(public)
                     size = selected.hash_length
                     ch = ch[:-size] + c.binder(ticket.psk, transcript.snapshot() + ch[:-(size+3)],
@@ -488,9 +518,9 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                     public_peer,sid,resumed,selected_group,retry,cookie,final_suite=m.parse_server_hello(sh[4:],with_suite=True)
                     if sid or cookie or final_suite != selected_id:
                         raise ProtocolError("inconsistent password successor retry", alert=47)
-                if retry or not resumed or selected_group!=29 or int.from_bytes(m.server_hello_extensions(sh[4:]).get(41,b""),"big")!=0:
+                if retry or not resumed or selected_group!=group or int.from_bytes(m.server_hello_extensions(sh[4:]).get(41,b""),"big")!=0:
                     raise ProtocolError("password successor ticket was not selected; fresh connection required")
-                shared=c.traffic_dh(ordinary_private,29,public_peer)
+                shared=c.traffic_dh(ordinary_private,group,public_peer)
             transcript.add(ch);transcript.add(sh)
             root=c.handshake_secret(shared,ticket.psk if ticket else None,selected.hash_name)
             client_secret,server_secret=handshake_keys(root,transcript,selected.hash_name)

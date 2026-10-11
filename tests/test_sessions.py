@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from tls20_server import crypto as c
-from tls20_server.errors import ProtocolError
+from tls20_server.errors import PeerClosed, ProtocolError
 from tls20_server.handshake import Wire, client_handshake, server_handshake, _retry_psks_unchanged
 from tls20_server.messages import ClientHello
 from tls20_server import messages as m
@@ -136,6 +136,80 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         await replay.send(b"retry after rejection")
         self.assertEqual(await replay.recv(), b"retry after rejection")
 
+    async def test_early_epoch_alerts_use_normal_closure_semantics(self):
+        # Accepted early records use early keys; after rejection, authenticated
+        # alerts use handshake keys. Both paths must stop without replying to
+        # a peer's fatal alert, and ignore advisory user_canceled until closure.
+        for accepted in (False, True):
+            for descriptions in ((0,), (90, 0), (40,), (203,)):
+                with self.subTest(accepted=accepted, descriptions=descriptions):
+                    self.cache, self.store = TicketCache(), TicketStore()
+                    await self.connect()
+                    next(iter(self.store._tickets.values())).early_used = not accepted
+                    reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+                    self.writers.append(writer)
+                    original_send, original_fatal = Wire.send_frame, Wire.fatal
+                    observed, injected = [], False
+                    stopped = asyncio.Event()
+                    async def send(wire, message, state=None):
+                        nonlocal injected
+                        if wire.writer is writer:
+                            if not injected and message[0] == (5 if accepted else 20):
+                                injected = True
+                                for description in descriptions:
+                                    wire.writer.write(state.seal(bytes((1, description)), 21))
+                                await wire.writer.drain()
+                                return
+                            if injected and message[0] == 20:
+                                return  # This crafted client ended its sending flight.
+                        return await original_send(wire, message, state)
+                    async def fatal(wire, error, state=None):
+                        before = state.sequence if state else None
+                        await original_fatal(wire, error, state)
+                        if wire.writer is not writer:
+                            observed.append((error, before, state.sequence if state else None))
+                            stopped.set()
+                    with patch.object(Wire, "send_frame", send), patch.object(Wire, "fatal", fatal):
+                        channel = await client_handshake(reader, writer, "localhost", self.roots,
+                            revocation_policy="lab-offline", ticket_cache=self.cache, early_data=b"early")
+                        await asyncio.wait_for(stopped.wait(), 2)
+                        channel.abort()
+                    self.assertTrue(injected)
+                    self.assertEqual(len(observed), 1)
+                    error, before, after = observed[0]
+                    self.assertIsInstance(error, PeerClosed)
+                    self.assertEqual(error.alert, descriptions[-1])
+                    self.assertEqual(before, after, "peer closure must not emit another encrypted alert")
+
+    async def test_rejected_early_alert_commits_to_handshake_epoch(self):
+        for corrupt_after_alert in (False, True):
+            with self.subTest(corrupt_after_alert=corrupt_after_alert):
+                self.cache, self.store = TicketCache(), TicketStore()
+                await self.connect()
+                next(iter(self.store._tickets.values())).early_used = True
+                original = Wire.send_frame
+                async def send(wire, message, state=None):
+                    if wire.writer is self.writers[-1] and message[0] == 20:
+                        wire.writer.write(state.seal(b"\x01\x5a", 21))
+                        if corrupt_after_alert:
+                            # An injected bad record does not consume the
+                            # legitimate sender's next handshake sequence.
+                            wire.writer.write(bytes.fromhex("1703030010") + bytes(16))
+                        await wire.writer.drain()
+                    return await original(wire, message, state)
+                with patch.object(Wire, "send_frame", send):
+                    if corrupt_after_alert:
+                        with self.assertRaises(PeerClosed) as failure:
+                            await self.connect(early_data=b"rejected early bytes")
+                        self.assertEqual(failure.exception.alert, 20)
+                    else:
+                        channel = await self.connect(early_data=b"rejected early bytes")
+                        self.assertTrue(channel.resumed)
+                        self.assertFalse(channel.early_data_accepted)
+                        await channel.send(b"valid handshake after advisory alert")
+                        self.assertEqual(await channel.recv(), b"valid handshake after advisory alert")
+                self.assertFalse(self.early)
+
     async def test_restart_invalidates_tickets_and_discards_early_data(self):
         await self.connect()
         self.store = TicketStore()
@@ -262,13 +336,32 @@ class TicketBoundsTests(unittest.TestCase):
     def test_retry_psk_continuity(self):
         hello = ClientHello("localhost", b"http/1.1", b"a"*32, b"b"*32, bytes(32),
             psk_offers=((b"sha384", 1, bytes(48)), (b"sha256", 2, bytes(32)), (b"last", 3, bytes(32))))
+        known_hashes = {b"sha384": "sha384", b"sha256": "sha256", b"last": "sha256"}
         for offers in (hello.psk_offers, hello.psk_offers[1:],
                        ((b"sha384", 4, b"x"*48), (b"sha256", 5, b"y"*32), (b"last", 6, b"z"*32))):
-            self.assertTrue(_retry_psks_unchanged(hello, replace(hello, psk_offers=offers)))
+            self.assertTrue(_retry_psks_unchanged(hello, replace(hello, psk_offers=offers),
+                                                 known_hashes=known_hashes))
         for offers in (hello.psk_offers[:2], hello.psk_offers[::-1],
                        hello.psk_offers + ((b"new", 4, bytes(32)),),
                        ((b"sha384", 1, bytes(32)),) + hello.psk_offers[1:]):
-            self.assertFalse(_retry_psks_unchanged(hello, replace(hello, psk_offers=offers)))
+            self.assertFalse(_retry_psks_unchanged(hello, replace(hello, psk_offers=offers),
+                                                  known_hashes=known_hashes))
+
+    def test_retry_psk_continuity_does_not_infer_hash_from_binder_length(self):
+        hello = ClientHello("localhost", b"http/1.1", b"a"*32, b"b"*32, bytes(32),
+            psk_offers=((b"sm3", 1, bytes(32)), (b"selected", 2, bytes(32)), (b"opaque", 3, bytes(32))))
+        known_hashes = {b"sm3": "sm3", b"selected": "sha256"}
+        for offers in (hello.psk_offers[1:], hello.psk_offers[1:2]):
+            self.assertTrue(_retry_psks_unchanged(hello, replace(hello, psk_offers=offers),
+                                                 known_hashes=known_hashes))
+        for offers in (hello.psk_offers[:1], hello.psk_offers[::-1],
+                       ((b"selected", 2, bytes(48)),), ((b"new", 2, bytes(32)),)):
+            self.assertFalse(_retry_psks_unchanged(hello, replace(hello, psk_offers=offers),
+                                                  known_hashes=known_hashes))
+        # Without provisioning/lookup knowledge, any offered identity could
+        # belong to a different same-sized KDF; opacity is not an error.
+        self.assertTrue(_retry_psks_unchanged(hello, replace(hello, psk_offers=())))
+
     def test_lifetime_capacity_context_and_single_use(self):
         store = TicketStore(capacity=1)
         store.issue(bytes(32), "example", b"http/1.1", 16, b"credential")

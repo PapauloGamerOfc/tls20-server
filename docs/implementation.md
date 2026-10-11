@@ -69,6 +69,13 @@ Enabling it adds one RTT and rejects 0-RTT for that exchange; it is not enabled
 as a general performance optimization. The ordinary fast resumption/early-data
 path remains unchanged with the default.
 
+Password-authenticated successor tickets use ordinary traffic key agreement,
+including a group retry with or without a cookie. The retry updates the ticket
+age and binder, preserves the selected identity and rejects early data. PSK
+continuity distinguishes hash identities, not just binder lengths: SHA-256 and
+SM3 are different KDFs even though both produce 32-byte binders. A server cannot
+infer the hash of an unrecognized opaque PSK identity.
+
 `tls20_server.retry_cookie.RetryCookiePolicy` uses an OS-random 256-bit HMAC key,
 fixed-size opaque cookies and a bounded lifetime. It binds the cookie to the
 transport peer IP, exact initial ClientHello, selected suite and requested
@@ -91,6 +98,10 @@ the transcript and retry-continuity checks. Configuration names stay canonical.
 `user_canceled` is advisory between complete handshake messages, not permission
 to interleave an alert into a fragmented message. Received fatal alerts terminate
 the connection without an alert-response loop.
+These rules also apply to accepted and rejected 0-RTT. Once a rejected-early-data
+connection authenticates a handshake-key record, even an advisory alert, it
+leaves discard mode; later authentication failures cannot be skipped as early
+data.
 
 When both record-size extensions are offered, `record_size_limit` takes precedence
 and `max_fragment_length` is ignored, including an unrecognized MFL value.
@@ -302,6 +313,11 @@ both local credential selection and received authenticators, before application
 authorization. An unsuitable requested credential produces an authenticated
 refusal; a peer cannot bypass the filter with a valid MAC/Finished. CA-name lists
 remain selection preferences, not independent trust or authorization decisions.
+Local selection also checks certificate-path and delegation-grant signature
+offers independently, in both directions. An incompatible requested identity
+produces a Finished-only refusal; an incompatible spontaneous identity is a
+local error. Malformed requests or delegated credentials remain errors rather
+than being hidden by credential selection.
 
 ### Test-only diagnostic build
 
@@ -340,6 +356,26 @@ Client-MAC tests include independent spec-derived known answers, captured initia
 and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
+
+### Retry and authenticator conformance validation: 2026-10-11
+
+The Windows suite completed 598 tests with all optional native providers
+supplied; only two POSIX-specific checks were skipped. The minimal-provider run
+also completed 598 tests, with 82 optional-provider/OS skips. Resource warnings
+were treated as errors. New regressions cover independent authenticator
+path/grant offers, password-successor group/cookie retries and refreshed ages,
+same-length/different-hash PSKs, and accepted/rejected early-data alerts.
+An adversarial regression confirms that a forged record following an
+authenticated advisory alert is rejected, not discarded before a valid Finished.
+
+All 19 portable Phromium interoperability invocations and all 18 provider
+commands passed. The actual Windows browser passed 38 end-to-end assertions and
+34 profile cases under each of the default and explicitly enabled network-sandbox
+policies. Python compilation, documentation checks, source/wheel builds and an
+isolated wheel installation/CLI check passed. Logs are retained locally under
+`build/retry-conformance-*` and the browser's `out/*/retry-conformance-*`.
+These are local Windows results, not a claim that remote Linux/macOS CI or a
+formal security audit has completed.
 
 ### Conformance and secret-lifecycle validation: 2026-10-11
 

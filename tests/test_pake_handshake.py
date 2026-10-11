@@ -11,7 +11,7 @@ from tls20_server.errors import ProtocolError
 from tls20_server.openssl_provider import OpenSSLProvider
 from tls20_server.pake_native import PakeProvider
 from tls20_server.pake import PasswordCredential, PasswordAccount, PasswordServer, SUITES
-from tls20_server.tickets import TicketCache, TicketStore
+from tls20_server.tickets import SessionTicket, TicketCache, TicketStore
 from tls20_server.handshake import Wire
 
 
@@ -129,13 +129,174 @@ class PakeHandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.options["retry_cookie_policy"] = RetryCookiePolicy()
         first = await self.connect()
         self.assertFalse(first.resumed)
-        second = await self.connect(early_data=b"rejected after retry")
+        with patch.object(SessionTicket, "obfuscated_age", side_effect=(100, 200)) as ages:
+            second = await self.connect(early_data=b"rejected after retry")
+        self.assertEqual(ages.call_count, 2)
         self.assertTrue(second.resumed)
         self.assertFalse(second.early_data_accepted)
         await second.send(b"password cookie")
         self.assertEqual(await second.recv(), b"password cookie")
         self.assertFalse(self.early)
         self.assertFalse(self.errors)
+
+    async def test_successor_empty_share_group_retry_with_and_without_cookie(self):
+        from tls20_server import crypto as c, messages as m
+        from tls20_server.retry_cookie import RetryCookiePolicy
+        for suite in (0xc0b0, 0xc0b1):
+            for group in (29, 23):
+                for cookie in (False, True):
+                    with self.subTest(suite=hex(suite), group=group, cookie=cookie):
+                        self.cache = TicketCache()
+                        self.options = {"cipher_suites": (suite,)}
+                        await self.connect(cipher_suites=(suite,))
+                        if cookie:
+                            self.options["retry_cookie_policy"] = RetryCookiePolicy()
+                        original, captured = m.client_hello, []
+                        def empty_first(*args, **kwargs):
+                            kwargs["supported_groups"] = (group,)
+                            if not captured:
+                                kwargs["empty_share"] = True
+                                kwargs["group"] = group
+                            result = original(*args, **kwargs)
+                            captured.append(result)
+                            return result
+                        with patch.object(m, "client_hello", empty_first), patch.object(
+                                SessionTicket, "obfuscated_age", side_effect=(100, 200)):
+                            channel = await self.connect(cipher_suites=(suite,), early_data=b"rejected on group retry")
+                        self.assertTrue(channel.resumed)
+                        self.assertFalse(channel.early_data_accepted)
+                        self.assertEqual(len(captured), 2)
+                        first, second = (m.parse_client_hello(value[4:]) for value in captured)
+                        self.assertEqual(first.share_groups, ())
+                        self.assertEqual(second.share_groups, (group,))
+                        self.assertEqual((first.psk_offers[0][1], second.psk_offers[0][1]), (100, 200))
+                        self.assertFalse(second.early_data)
+                        self.assertEqual(44 in dict(second.extension_values), cookie)
+                        self.assertEqual(channel.exporter("group retry"), self.channels[-1].exporter("group retry"))
+                        self.assertEqual(c.suite(channel.cipher_suite).hash_name,
+                                         "sha384" if suite == 0xc0b1 else "sha256")
+                        await channel.send(b"resumed application")
+                        self.assertEqual(await channel.recv(), b"resumed application")
+        self.assertFalse(self.early)
+        self.assertFalse(self.errors)
+
+    async def test_successor_group_retry_rejects_ch2_mutations(self):
+        from tls20_server import messages as m
+        from tests.test_conformance import replace_extensions
+        for mutation, alert in (("groups", 47), ("share", 47), ("early", 47), ("binder", 51)):
+            with self.subTest(mutation=mutation):
+                self.cache = TicketCache()
+                await self.connect()
+                original_hello, original_send = m.client_hello, Wire.send_frame
+                count = 0
+                def empty_first(*args, **kwargs):
+                    if count == 0:
+                        kwargs["empty_share"] = True
+                    return original_hello(*args, **kwargs)
+                async def mutate(wire, message, state=None):
+                    nonlocal count
+                    if message[0] == 1:
+                        count += 1
+                        if count == 2:
+                            def change(ext):
+                                if mutation == "groups":
+                                    ext[10] = m._vec(b"\x00\x1d", 2)
+                                elif mutation == "share":
+                                    ext[51] = m._vec(b"", 2)
+                                elif mutation == "early":
+                                    ext[42] = b""
+                                else:
+                                    ext[41] = ext[41][:-1] + bytes((ext[41][-1] ^ 1,))
+                            message = replace_extensions(message, change)
+                    return await original_send(wire, message, state)
+                with patch.object(m, "client_hello", empty_first), patch.object(Wire, "send_frame", mutate):
+                    with self.assertRaises(ProtocolError) as failure:
+                        await self.connect()
+                self.assertEqual(count, 2)
+                self.assertEqual(failure.exception.alert, alert)
+        self.assertEqual(len(self.channels), 4)  # Only fresh password exchanges completed.
+
+    async def test_successor_client_rejects_unoffered_redundant_and_repeated_group_retry(self):
+        from tls20_server import messages as m
+        for selected_group, repeated in ((24, False), (29, False), (29, True)):
+            with self.subTest(selected_group=selected_group, repeated=repeated):
+                self.cache = TicketCache()
+                await self.connect()
+                original_hello, original_server = m.client_hello, m.server_hello
+                count = 0
+                def client_hello(*args, **kwargs):
+                    nonlocal count
+                    if repeated and not count:
+                        kwargs["empty_share"] = True
+                    count += 1
+                    return original_hello(*args, **kwargs)
+                def server_hello(public, random, **kwargs):
+                    if kwargs.get("resumed"):
+                        kwargs.update(retry=True, resumed=False, group=selected_group)
+                        public = b""
+                    return original_server(public, random, **kwargs)
+                with patch.object(m, "client_hello", client_hello), patch.object(m, "server_hello", server_hello):
+                    with self.assertRaises(ProtocolError):
+                        await self.connect()
+                self.assertEqual(count, 2 if repeated else 1)
+        self.assertEqual(len(self.channels), 3)
+
+    async def test_successor_early_epochs_handle_authenticated_alerts(self):
+        from tls20_server.errors import PeerClosed
+        for accepted in (True, False):
+            for alert in (90, 0, 47):
+                with self.subTest(accepted=accepted, alert=alert):
+                    self.cache = TicketCache()
+                    await self.connect()
+                    cached = next(iter(self.cache._tickets.values()))
+                    if not accepted:
+                        self.store._tickets[cached.identity].early_used = True
+                    original, injected = Wire.send_frame, False
+                    async def send(wire, message, state=None):
+                        nonlocal injected
+                        if (message[0] == (5 if accepted else 20)
+                                and wire.writer.get_extra_info("peername")[1] == self.port):
+                            injected = True
+                            wire.writer.write(state.seal(bytes((1, alert)), 21))
+                            await wire.writer.drain()
+                            if alert != 90:
+                                return  # A closed peer must not send Finished.
+                        return await original(wire, message, state)
+                    errors_before = len(self.errors)
+                    with patch.object(Wire, "send_frame", send):
+                        if alert == 90:
+                            channel = await self.connect(early_data=b"alert epoch")
+                            self.assertEqual(channel.early_data_accepted, accepted)
+                            self.assertEqual(len(self.errors), errors_before)
+                        else:
+                            with self.assertRaises(ProtocolError):
+                                await self.connect(early_data=b"alert epoch")
+                            self.assertEqual(len(self.errors), errors_before + 1)
+                            self.assertIsInstance(self.errors[-1], PeerClosed)
+                            self.assertEqual(self.errors[-1].alert, alert)
+                    self.assertTrue(injected)
+
+    async def test_successor_rejected_early_alert_commits_to_strict_handshake_epoch(self):
+        await self.connect()
+        cached = next(iter(self.cache._tickets.values()))
+        self.store._tickets[cached.identity].early_used = True
+        original, injected = Wire.send_frame, False
+        async def send(wire, message, state=None):
+            nonlocal injected
+            if message[0] == 20 and wire.writer.get_extra_info("peername")[1] == self.port:
+                injected = True
+                wire.writer.write(state.seal(bytes((1, 90)), 21))
+                # An authenticated handshake alert ends early-data discard.
+                # This invalid record must fail even though a valid CF follows.
+                wire.writer.write(bytes.fromhex("1703030010") + bytes(16))
+                await wire.writer.drain()
+            return await original(wire, message, state)
+        with patch.object(Wire, "send_frame", send), self.assertRaises(ProtocolError) as failure:
+            await self.connect(early_data=b"rejected early")
+        self.assertTrue(injected)
+        self.assertEqual(failure.exception.alert, 20)
+        self.assertEqual(self.errors[-1].alert, 20)
+        self.assertEqual(len(self.channels), 1)
 
     async def test_password_successor_bad_binder_has_exact_alert_before_or_after_retry(self):
         from tls20_server import messages as m

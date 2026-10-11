@@ -135,6 +135,23 @@ class SMNetworkTests(unittest.IsolatedAsyncioTestCase):
             await channel.send(b"PSK scope")
             self.assertEqual(await channel.recv(), b"PSK scope")
 
+    async def test_retry_removes_other_hash_with_same_sized_binder(self):
+        sha = ExternalPSK(b"SHA256 retry", b"sha fixture secret", "localhost")
+        sm = ExternalPSK(b"SM3 retry", b"sm fixture secret", "localhost", hash_name="sm3", cipher_suite=0xc6)
+        for selected, other in ((sha, sm), (sm, sha)):
+            for recognize_other in (False, True):
+                with self.subTest(hash=selected.hash_name, recognize_other=recognize_other):
+                    self.cache = TicketCache()
+                    self.server_options.update(cipher_suites=(selected.cipher_suite,),
+                        external_psks=(selected, other) if recognize_other else (selected,))
+                    channel = await self.connect(external_psks=(other, selected),
+                        cipher_suites=(other.cipher_suite, selected.cipher_suite), force_retry=True)
+                    self.assertEqual(channel.cipher_suite, selected.cipher_suite)
+                    self.assertEqual(channel.selected_external_psk_identity, selected.identity)
+                    await channel.send(b"retry kept the correct hash")
+                    self.assertEqual(await channel.recv(), b"retry kept the correct hash")
+        self.assertFalse(self.errors)
+
     async def test_pinning_uses_sm3_not_same_sized_sha256(self):
         from tls20_server.pinning import ServerPinning, PinningCache
         self.server_options.update(cipher_suites=(0xc6,),

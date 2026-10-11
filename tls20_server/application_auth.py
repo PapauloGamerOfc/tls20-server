@@ -192,6 +192,30 @@ def _check_certificate_filters(identity, offered):
         raise ProtocolError("authenticator certificate does not satisfy requested OID filters")
 
 
+def _credential_matches_algorithms(credentials, identity, offered, role, provider):
+    """Select with independent path/grant offers, without weakening validation."""
+    from .handshake import _check_certificate_offer
+    from .credential_profiles import validate_delegation
+    from .pki import supported_certificate_algorithms
+    matches = _check_certificate_offer(identity.chain, m._u16_list(offered[50]), provider,
+        credentials.signature_issuers, require_match=False)
+    grant = dict(identity.extensions[0]).get(34) if identity.chain else None
+    if grant is not None:
+        # Validate the local grant before treating an incompatible offer as a
+        # refusal. Malformed grants and wrong-role/key material remain errors.
+        key, _ = validate_delegation(identity.chain[0], grant, role=role,
+            grant_algorithms=supported_certificate_algorithms(provider),
+            delegated_schemes=(0xfe00 if role == "server" else 0xfe01,),
+            signature_provider=provider)
+        if not isinstance(credentials.private_key, X25519PrivateKey) or c.public_bytes(key) != c.public_bytes(credentials.private_key):
+            raise ProtocolError("authenticator delegated credential/key mismatch")
+        reader = m._Reader(grant)
+        reader.take(6); reader.vector(3)
+        scheme = int.from_bytes(reader.take(2), "big")
+        matches = matches and 34 in offered and scheme in m._u16_list(offered[0xff04])
+    return matches
+
+
 def _proof(finished_key, private, share, transcript, role, name):
     hashed = c.digest(transcript, name)
     root = c.extract(finished_key, c.dh(private, share), name)
@@ -286,18 +310,25 @@ class AuthenticatorManager:
             context = secrets.token_bytes(32) if context is None else context
             share, offers = self.channel.peer_auth_share, dict(self.channel.peer_capabilities)
             _offers(offers, "server")
-        if credentials is not None and not match_credentials(credentials, offers):
-            if request is None:
-                raise ProtocolError("no acceptable spontaneous authenticator credential")
-            # A requested identity that fails recognized KU/EKU constraints is
-            # an authenticated refusal, with no credential or entry metadata.
-            credentials, entry_extensions = None, None
-        self._claim(context)
-        handshake_context, finished_key = self._keys(role)
-        name = c.hash_context(c.suite(self.channel.cipher_suite).hash_name, self.channel.native_provider)
         certificate = _certificate([] if credentials is None else credentials.chain_der,
                                    context, entry_extensions)
         identity = _parse_certificate(certificate[4:])
+        # A local delegated identity can be unavailable because delegation was
+        # not offered; other unsolicited/misplaced entry extensions still fail.
+        _check_certificate_extensions(identity, {**offers, 34: offers.get(34, b"")})
+        if credentials is not None and (not _credential_matches_algorithms(
+                credentials, identity, offers, role, self.channel.native_provider)
+                or not match_credentials(credentials, offers)):
+            if request is None:
+                raise ProtocolError("no acceptable spontaneous authenticator credential")
+            # A valid identity outside the current request's path/grant or
+            # recognized KU/EKU constraints produces an authenticated refusal.
+            credentials, entry_extensions = None, None
+            certificate = _certificate([], context)
+            identity = _parse_certificate(certificate[4:])
+        self._claim(context)
+        handshake_context, finished_key = self._keys(role)
+        name = c.hash_context(c.suite(self.channel.cipher_suite).hash_name, self.channel.native_provider)
         _check_certificate_extensions(identity, offers)
         transcript = handshake_context + (request or b"") + certificate
         if credentials is None:
