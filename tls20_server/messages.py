@@ -437,7 +437,9 @@ def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticat
             if len(value) < 32:
                 raise ProtocolError("invalid binder size", alert=50)
             binders.append(value)
-        if not identities or len(identities) != len(binders):
+        if not identities or not binders:
+            raise ProtocolError("empty PSK identities or binders vector", alert=50)
+        if len(identities) != len(binders):
             raise ProtocolError("PSK identities and binders differ", alert=47)
         offers = [(value, obfuscated, proof) for (value, obfuscated), proof in zip(identities, binders)]
         identity, age, binder = offers[0]
@@ -644,7 +646,9 @@ def parse_new_session_ticket(body: bytes):
     lifetime = int.from_bytes(r.take(4), "big"); age_add = int.from_bytes(r.take(4), "big")
     nonce = r.vector(1); identity = r.vector(2); ext = extensions(r.vector(2)); r.end()
     validate_extension_context(ext, "NST")
-    if not identity or lifetime > 604800 or set(ext) & {43, 50, 0xff02, 0xff03}:
+    if not identity:
+        raise ProtocolError("empty NewSessionTicket identity", alert=50)
+    if lifetime > 604800 or set(ext) & {43, 50, 0xff02, 0xff03}:
         raise ProtocolError("invalid NewSessionTicket")
     if 42 in ext and len(ext[42]) != 4:
         raise ProtocolError("invalid ticket early-data limit", alert=50)

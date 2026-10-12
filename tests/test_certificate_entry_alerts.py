@@ -62,8 +62,12 @@ class CertificateEntryAlertTests(unittest.IsolatedAsyncioTestCase):
                         with patch.object(m, 'certificate', encode), patch.object(h, 'cached_certificate_body', reference), patch.object(h.Wire, 'fatal', observe):
                             with self.assertRaises(ProtocolError) as caught:
                                 await asyncio.wait_for(self.connect(**options), 3)
-                            self.assertEqual(caught.exception.alert, 110)
-                            self.assertEqual(emitted, [(True, 110)])
+                            # RFC 9345 specifies unexpected_message for an
+                            # unsolicited delegation, overriding the generic
+                            # CertificateEntry unsupported_extension alert.
+                            expected = 10 if code == 34 else 110
+                            self.assertEqual(caught.exception.alert, expected)
+                            self.assertEqual(emitted, [(True, expected)])
                             self.assertEqual(len(self.channels), before)
 
     async def test_initial_and_post_handshake_client_extensions(self):
@@ -104,8 +108,9 @@ class CertificateEntryAlertTests(unittest.IsolatedAsyncioTestCase):
                                     await client.send(b'drive PHA')
                                     while await asyncio.wait_for(client.recv(), 3) is not None:
                                         pass
-                            self.assertEqual(caught.exception.alert, 110)
-                            self.assertEqual(emitted, [(False, 110)])
+                            expected = 10 if code == 34 else 110
+                            self.assertEqual(caught.exception.alert, expected)
+                            self.assertEqual(emitted, [(False, expected)])
                             if pha:
                                 self.assertTrue(pending.cancelled())
                                 self.assertTrue(server.closed)

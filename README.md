@@ -177,6 +177,14 @@ CI tests Windows, Ubuntu
 and macOS and builds a Python wheel and source archive. These are Python
 packages, not standalone native executables or installers.
 
+The PSK boundary regressions cover password-session resumption when the server
+selects a later offered identity: early data is discarded, while authenticated
+1-RTT traffic remains usable. Ticket and delegated-credential regressions check
+the encrypted wire alerts as well as valid controls, independent parent trust,
+and disposal of temporary traffic states. The password tests require the
+explicit native-provider manifest described in the profile guide; ordinary
+test discovery reports their absence rather than claiming native coverage.
+
 ## Further documentation
 
 - [Configuration](docs/configuration.md)

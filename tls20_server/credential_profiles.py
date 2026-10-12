@@ -81,11 +81,11 @@ def parse_x25519_spki(value: bytes) -> x25519.X25519PublicKey:
 
 def _read_vector(data, cursor, width):
     if cursor + width > len(data):
-        raise ProtocolError("truncated credential vector")
+        raise ProtocolError("truncated credential vector", alert=50)
     size = int.from_bytes(data[cursor:cursor + width], "big")
     cursor += width
     if not size or cursor + size > len(data):
-        raise ProtocolError("invalid credential vector length")
+        raise ProtocolError("invalid credential vector length", alert=50)
     return data[cursor:cursor + size], cursor + size
 
 
@@ -102,11 +102,13 @@ def _entry_metadata(material, entry_extensions, offered_extensions, delegated_sc
             if kind == 17:
                 raise ProtocolError("status_request_v2 is forbidden in CertificateEntry")
             if kind in seen or not isinstance(value, bytes):
-                raise ProtocolError("duplicate or malformed certificate evidence")
+                raise ProtocolError("duplicate or malformed certificate evidence", alert=47 if kind == 34 else 40)
             seen.add(kind)
             if kind == 34:
-                if index != 0 or not delegated_schemes:
-                    raise ProtocolError("unsolicited or misplaced delegated credential")
+                if not delegated_schemes:
+                    raise ProtocolError("unsolicited delegated credential", alert=10)
+                if index != 0:
+                    raise ProtocolError("misplaced delegated credential", alert=47)
             elif kind not in offered_extensions:
                 raise ProtocolError("unsolicited certificate entry extension")
         output.append(pairs)
@@ -117,30 +119,34 @@ def validate_delegation(parent_der, grant, *, role, grant_algorithms,
                         delegated_schemes, now=None, max_lifetime_seconds=604800,
                         signature_provider=None):
     """Verify a grant only AFTER its parent path/identity has been validated."""
-    if role not in ("server", "client") or len(grant) < 13:
+    if role not in ("server", "client"):
         raise ProtocolError("invalid delegated credential")
+    if len(grant) < 13:
+        raise ProtocolError("truncated delegated credential", alert=50)
     expected_scheme = 0xfe00 if role == "server" else 0xfe01
     valid_time = int.from_bytes(grant[:4], "big")
     online_scheme = int.from_bytes(grant[4:6], "big")
     spki, offset = _read_vector(grant, 6, 3)
     if offset + 2 > len(grant):
-        raise ProtocolError("truncated delegation signature scheme")
+        raise ProtocolError("truncated delegation signature scheme", alert=50)
     signed = grant[:offset + 2]
     scheme = int.from_bytes(grant[offset:offset + 2], "big")
     signature, end = _read_vector(grant, offset + 2, 2)
-    if end != len(grant) or online_scheme != expected_scheme or online_scheme not in delegated_schemes:
-        raise ProtocolError("delegation direction or proof scheme mismatch")
+    if end != len(grant):
+        raise ProtocolError("trailing delegated credential bytes", alert=50)
+    if online_scheme != expected_scheme or online_scheme not in delegated_schemes:
+        raise ProtocolError("delegation direction or proof scheme mismatch", alert=47)
     if scheme not in grant_algorithms or scheme not in supported_certificate_algorithms(signature_provider):
-        raise ProtocolError("delegation signature scheme was not authorized")
+        raise ProtocolError("delegation signature scheme was not authorized", alert=47)
     parent = _load_pkix_der(parent_der)
     try:
         usage = certificate_extensions(parent).get_extension_for_oid(DELEGATION_USAGE)
         if usage.critical or not isinstance(usage.value, x509.UnrecognizedExtension) or usage.value.value != b"\x05\x00":
-            raise ProtocolError("invalid DelegationUsage extension")
+            raise ProtocolError("invalid DelegationUsage extension", alert=47)
         if not certificate_extensions(parent).get_extension_for_class(x509.KeyUsage).value.digital_signature:
-            raise ProtocolError("delegation parent cannot sign grants")
+            raise ProtocolError("delegation parent cannot sign grants", alert=47)
     except x509.ExtensionNotFound as exc:
-        raise ProtocolError("certificate does not authorize delegation") from exc
+        raise ProtocolError("certificate does not authorize delegation", alert=47) from exc
     moment = now or datetime.now(timezone.utc)
     if isinstance(max_lifetime_seconds, bool) or not isinstance(max_lifetime_seconds, int) or max_lifetime_seconds <= 0:
         raise ProtocolError("invalid delegated credential lifetime policy")
@@ -148,14 +154,23 @@ def validate_delegation(parent_der, grant, *, role, grant_algorithms,
     if (not parent.not_valid_before_utc <= moment <= expiry
             or expiry >= parent.not_valid_after_utc
             or expiry > moment + timedelta(seconds=max_lifetime_seconds)):
-        raise ProtocolError("delegated credential is outside its authorized lifetime")
+        raise ProtocolError("delegated credential is outside its authorized lifetime", alert=47)
     parent_oid = parent.public_key_algorithm_oid.dotted_string
     if ((scheme in (0x0804, 0x0805, 0x0806) and parent_oid != "1.2.840.113549.1.1.1")
             or (scheme in (0x0809, 0x080a, 0x080b) and parent_oid != "1.2.840.113549.1.1.10")):
-        raise ProtocolError("delegation signature family mismatches parent SPKI")
-    public_key = parse_x25519_spki(spki)
+        raise ProtocolError("delegation signature family mismatches parent SPKI", alert=47)
+    try:
+        public_key = parse_x25519_spki(spki)
+    except ProtocolError as exc:
+        raise ProtocolError("invalid delegated credential public key", alert=47) from exc
     message = b" " * 64 + f"TLS20 {role} delegated credentials".encode("ascii") + b"\x00" + parent_der + signed
-    verify_public_signature(certificate_public_key(parent, signature_provider=signature_provider), scheme, signature, message)
+    parent_key = certificate_public_key(parent, signature_provider=signature_provider)
+    try:
+        verify_public_signature(parent_key, scheme, signature, message)
+    except ProtocolError as exc:
+        # RFC 9345 gives grant validation its own alert. Do not change the
+        # generic verifier or mask a failure of the separately validated path.
+        raise ProtocolError("delegated credential signature validation failed", alert=47) from exc
     return public_key, expiry
 
 

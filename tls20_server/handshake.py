@@ -1099,7 +1099,7 @@ def _check_credential_extension_offers(metadata, offers):
     for index, pairs in enumerate(metadata):
         for kind, value in pairs:
             if kind not in offered:
-                raise ProtocolError("unsolicited CertificateEntry extension", alert=110)
+                raise ProtocolError("unsolicited CertificateEntry extension", alert=10 if kind == 34 else 110)
             if kind == 34 and index != 0:
                 raise ProtocolError("delegated credential is not on the leaf", alert=47)
             try:

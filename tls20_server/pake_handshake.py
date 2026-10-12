@@ -296,9 +296,13 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                 await expose_exporter(on_early_exporter,early_exporter,exporter_accesses,stage="early",
                     role="server",hash_name=selected.hash_name)
             if ticket and hello.early_data:
-                early_secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE + ch)
-                early_receiver = secrets.record(early_secret, "open", selected_id, ticket.record_size_limit) if accepted else None
+                early_receiver = None
                 if accepted:
+                    # Early records always use the first offered PSK. If a
+                    # later identity won, discard them without deriving keys
+                    # from the selected (unrelated) resumption PSK.
+                    early_secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE + ch)
+                    early_receiver = secrets.record(early_secret, "open", selected_id, ticket.record_size_limit)
                     emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", hello.random, early_secret)
                 total = discarded = 0
                 while True:
