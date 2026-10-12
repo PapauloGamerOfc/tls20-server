@@ -133,6 +133,65 @@ class DuplexControlTests(unittest.IsolatedAsyncioTestCase):
                 await upload
                 self.assertEqual([kind for kind, _ in self.decode(writer)], [23, 22, 22, 23, 23])
 
+    async def test_explicit_update_preserves_an_already_pending_peer_response(self):
+        for role in ("client", "server"):
+            for request_peer in (False, True):
+                with self.subTest(role=role, request_peer=request_peer):
+                    channel = self.channel(role)
+                    writer, peer = channel.wire.writer, c.RecordState(bytes(32), "seal")
+                    self.addCleanup(peer.close)
+                    # Hold the real send lock so recv() must defer its KU0.
+                    # The following authenticated application record proves
+                    # recv() consumed KU1 without waiting for the send lock.
+                    async with channel.send_lock:
+                        channel.wire.reader.feed_data(peer.seal(m.frame(24, b"\1"), 22))
+                        peer.update()
+                        channel.wire.reader.feed_data(peer.seal(b"peer data", 23))
+                        self.assertEqual(await asyncio.wait_for(channel.recv(), 1), b"peer data")
+                        self.assertTrue(channel._key_update_response_pending)
+                        self.assertFalse(writer.records)
+                    updating = self.task(channel.key_update(request_peer))
+                    await asyncio.wait_for(writer.entered[1].wait(), 1)
+                    self.assertEqual(self.decode(writer), [(22, m.frame(24, bytes((request_peer,))))])
+                    writer.release_all()
+                    await asyncio.wait_for(updating, 1)
+                    await channel.send(b"local data")
+                    expected = [(22, m.frame(24, bytes((request_peer,))))]
+                    if request_peer:
+                        # Our independent request is not the required response
+                        # to the peer's request (RFC 9846, Section 4.7.3).
+                        expected.append((22, m.frame(24, b"\0")))
+                    expected.append((23, b"local data"))
+                    self.assertEqual(self.decode(writer), expected)
+                    self.assertFalse(channel._key_update_response_pending)
+                    self.assertEqual(channel.sender.epoch, 2 if request_peer else 1)
+
+    async def test_peer_request_during_explicit_update_drain_is_answered_before_application(self):
+        for role in ("client", "server"):
+            for request_peer in (False, True):
+                with self.subTest(role=role, request_peer=request_peer):
+                    channel = self.channel(role)
+                    writer, peer = channel.wire.writer, c.RecordState(bytes(32), "seal")
+                    self.addCleanup(peer.close)
+                    updating = self.task(channel.key_update(request_peer))
+                    await asyncio.wait_for(writer.entered[1].wait(), 1)
+                    # KU is already visible to the peer, but drain() still owns
+                    # send_lock. A new request must survive that in-flight KU.
+                    channel.wire.reader.feed_data(peer.seal(m.frame(24, b"\1"), 22))
+                    peer.update()
+                    channel.wire.reader.feed_data(peer.seal(b"peer data", 23))
+                    self.assertEqual(await asyncio.wait_for(channel.recv(), 1), b"peer data")
+                    self.assertTrue(channel._key_update_response_pending)
+                    self.assertEqual(len(writer.records), 1)
+                    writer.release_all()
+                    await asyncio.wait_for(updating, 1)
+                    await channel.send(b"local data")
+                    self.assertEqual(self.decode(writer), [
+                        (22, m.frame(24, bytes((request_peer,)))),
+                        (22, m.frame(24, b"\0")), (23, b"local data")])
+                    self.assertFalse(channel._key_update_response_pending)
+                    self.assertEqual(channel.sender.epoch, 2)
+
     async def test_fatal_stops_active_and_queued_application_or_handshake_writes(self):
         for role in ("client", "server"):
             for remote in (False, True):
