@@ -36,14 +36,14 @@ def replace_signature(cert, signature):
 
 def issue(key, issuer_key, subject, issuer, *, ca=False, path_length=None,
           hostname="example.test", eku=True, bc_critical=True, key_usage=None,
-          validity=0, extra=None, algorithm=None):
+          validity=0, extra=None, algorithm=None, serial=None):
     now = datetime.now(timezone.utc)
     start = now - timedelta(minutes=5) if validity <= 0 else now + timedelta(days=1)
     end = now + timedelta(days=1) if validity >= 0 else now - timedelta(minutes=1)
     if validity < 0:
         start = now - timedelta(days=1)
     builder = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
-               .public_key(key.public_key()).serial_number(x509.random_serial_number())
+               .public_key(key.public_key()).serial_number(x509.random_serial_number() if serial is None else serial)
                .not_valid_before(start).not_valid_after(end if validity <= 0 else now + timedelta(days=2))
                .add_extension(x509.BasicConstraints(ca, path_length), critical=bc_critical)
                .add_extension(key_usage or x509.KeyUsage(False, False, False, False,

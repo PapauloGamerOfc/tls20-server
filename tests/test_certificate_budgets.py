@@ -1,6 +1,7 @@
 """Real certificate chains cross the same bounded loading and wire paths."""
 
 from pathlib import Path
+from itertools import chain, cycle
 import os
 import unittest
 from unittest.mock import Mock, patch
@@ -109,6 +110,10 @@ class CertificateBudgetTests(unittest.TestCase):
             if key is issuer_key:  # The separate trust anchor is not sent.
                 return original_issue(key, issuer_key, *args, **kwargs)
             extra = kwargs.pop("extra", [])
+            # Keep the same serial across the probe and final certificate.
+            # Ed25519 signatures have a fixed width, but a fresh random serial
+            # can change its DER INTEGER width and invalidate the measured size.
+            kwargs["serial"] = x509.random_serial_number()
             def build(size):
                 padding = x509.UnrecognizedExtension(x509.ObjectIdentifier("1.2.3.4"), b"p" * size)
                 return original_issue(key, issuer_key, *args, **kwargs, extra=[*extra, (padding, False)])
@@ -119,6 +124,15 @@ class CertificateBudgetTests(unittest.TestCase):
         self.assertEqual([len(der(cert)) for cert in certs], [65536] * 4)
         with self.assertRaises(ConfigurationError):
             load_material(certs, key)
+
+    def test_padded_fixture_keeps_size_when_random_serial_width_changes(self):
+        # These positive serials encode as 19 and 20 DER content bytes. Without
+        # retaining the probe's serial, every final certificate gains one byte
+        # and would exercise the per-certificate limit instead of body overhead.
+        small, large = 1 << 150, 1 << 158
+        serials = chain((large,), cycle((small, large)))
+        with patch("tests.test_pki.x509.random_serial_number", side_effect=serials):
+            self.test_loader_rejects_valid_der_chain_that_cannot_fit_wire_body()
 
 
 class CertificateChainHandshakeTests(unittest.IsolatedAsyncioTestCase):
