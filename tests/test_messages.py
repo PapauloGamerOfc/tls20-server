@@ -55,6 +55,18 @@ class MessageTests(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 m.validate_service_identity(offered.decode())
 
+    def test_server_name_parser_rejects_malformed_or_invalid_names(self):
+        entry = b"\x00" + m._vec(b"EXAMPLE.TeSt", 2)
+        encoded = m._vec(entry, 2)
+        invalid = (encoded[:-1], encoded + b"\x00", m._vec(entry + entry, 2),
+                   m._vec(b"\x01" + entry[1:], 2), m._vec(b"", 2))
+        invalid += tuple(m._vec(b"\x00" + m._vec(name, 2), 2) for name in
+                         (b"", b"EXAMPLE..TEST", b"EXAMPLE.TEST.", b"EXAMPLE\x00.TEST",
+                          b"EXAMPLE\xff.TEST", b"127.0.0.1", b"XN--.TEST"))
+        for value in invalid:
+            with self.subTest(sni=value), self.assertRaises(ProtocolError):
+                m.parse_server_name(value)
+
     def test_proactive_password_suite_classification_ignores_unknown_values(self):
         # This is a structurally valid P-256 commit; native point validation is
         # covered by the real password handshake regression.

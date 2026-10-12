@@ -62,6 +62,94 @@ class RecordAlertTests(unittest.TestCase):
 
 
 class ChannelConformanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unexpected_post_handshake_messages_have_exact_wire_alerts(self):
+        hello = m.client_hello(bytes(range(32)), bytes(range(32, 64)), "localhost", bytes(32))
+        request = m.certificate_request(b"request context", bytes(32))
+        cases = (("server", hello), ("client", m.frame(5, b"")),
+                 ("client", request), ("server", request),
+                 ("server", m.new_session_ticket(b"ticket", b"nonce", 60, 0, 0)),
+                 ("client", b"\x00\x00\x00\x00"))
+        from tls20_server.credential_cache import compress_certificate
+        certificate = m.certificate([], context=b"unsolicited", allow_empty=True)
+        cases += tuple((role, frame) for role in ("client", "server") for frame in
+            (certificate, m.certificate_verify(bytes(32), client=True), m.frame(20, bytes(32)),
+             m.frame(25, compress_certificate(certificate[4:], 1))))
+        for role, frame in cases:
+            with self.subTest(role=role, kind=frame[0]):
+                channel = self.channel(role=role)
+                peer = c.RecordState(bytes(32), "seal")
+                observer = c.RecordState(bytes(32), "open")
+                try:
+                    channel.wire.reader.feed_data(peer.seal(frame, 22))
+                    with self.assertRaises(ProtocolError) as failure:
+                        await channel.recv()
+                    self.assertEqual(failure.exception.alert, 10)
+                    self.assertEqual(observer.open(bytes(channel.wire.writer.data)), (b"\x02\x0a", 21))
+                    self.assertTrue(channel.closed)
+                    self.assertIsNone(channel.authenticated_client)
+                finally:
+                    peer.close()
+                    observer.close()
+                    channel.abort()
+
+    async def test_pending_pha_response_order_context_and_encoding_alerts(self):
+        for scenario, alert in (("proof_before_certificate", 10), ("finished_before_certificate", 10),
+                                ("proof_after_empty_certificate", 10), ("duplicate_certificate", 10),
+                                ("unknown_context", 47), ("empty_body", 50), ("truncated_context", 50),
+                                ("bad_finished", 51)):
+            with self.subTest(scenario=scenario):
+                channel, future, certificate, finished = await self.pha()
+                peer = c.RecordState(bytes(32), "seal")
+                observer = c.RecordState(bytes(32), "open")
+                observer.open(bytes(channel.wire.writer.data))  # Consume the request's record.
+                channel.wire.writer.data.clear()
+                proof = m.certificate_verify(bytes(32), client=True)
+                frames = {
+                    "proof_before_certificate": (proof,),
+                    "finished_before_certificate": (finished,),
+                    "proof_after_empty_certificate": (certificate, proof),
+                    "duplicate_certificate": (certificate, certificate),
+                    "unknown_context": (m.certificate([], context=b"unknown", allow_empty=True),),
+                    "empty_body": (m.frame(11, b""),),
+                    "truncated_context": (m.frame(11, b"\x04x"),),
+                    "bad_finished": (certificate, finished[:-1] + bytes((finished[-1] ^ 1,))),
+                }[scenario]
+                try:
+                    for frame in frames:
+                        channel.wire.reader.feed_data(peer.seal(frame, 22))
+                    with self.assertRaises(ProtocolError) as failure:
+                        await channel.recv()
+                    self.assertEqual(failure.exception.alert, alert)
+                    self.assertEqual(observer.open(bytes(channel.wire.writer.data)), (bytes((2, alert)), 21))
+                    self.assertTrue(channel.closed)
+                    self.assertTrue(future.cancelled())
+                    self.assertIsNone(channel.authenticated_client)
+                finally:
+                    peer.close()
+                    observer.close()
+                    channel.abort()
+
+    async def test_pha_context_errors_remain_distinct_from_unsolicited_requests(self):
+        for context, seen, alert in ((b"", (), 47), (b"duplicate", (b"duplicate",), 47),
+                                     (b"fresh", tuple(str(i).encode() for i in range(4096)), 40)):
+            with self.subTest(context=context, alert=alert):
+                channel = self.channel(local_post_handshake_auth=True)
+                channel._seen_auth_contexts.update(seen)
+                peer = c.RecordState(bytes(32), "seal")
+                observer = c.RecordState(bytes(32), "open")
+                try:
+                    frame = m.certificate_request(context, bytes(32))
+                    channel.wire.reader.feed_data(peer.seal(frame, 22))
+                    with self.assertRaises(ProtocolError) as failure:
+                        await channel.recv()
+                    self.assertEqual(failure.exception.alert, alert)
+                    self.assertEqual(observer.open(bytes(channel.wire.writer.data)), (bytes((2, alert)), 21))
+                    self.assertTrue(channel.closed)
+                finally:
+                    peer.close()
+                    observer.close()
+                    channel.abort()
+
     async def test_key_update_body_alerts_on_authenticated_wire(self):
         for body, alert in ((b"", 50), (b"\0\0", 50), (b"\x02", 47)):
             with self.subTest(body=body):

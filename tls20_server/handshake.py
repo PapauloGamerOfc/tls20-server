@@ -382,11 +382,14 @@ class SecureChannel:
         return future
 
     async def _answer_client_auth(self, request):
+        if not self.local_post_handshake_auth:
+            raise ProtocolError("unsolicited post-handshake client-auth request", alert=10)
         context, share, algorithms, request_extensions = _decode_request(request,
             cache_enabled=2 in self.cache_types, templates=self.cached_request_templates)
-        if (not self.local_post_handshake_auth or not context or context in self._seen_auth_contexts
-                or len(self._seen_auth_contexts) >= 4096):
-            raise ProtocolError("unsolicited, repeated or over-budget client-auth request")
+        if not context or context in self._seen_auth_contexts:
+            raise ProtocolError("empty or repeated post-handshake client-auth context", alert=47)
+        if len(self._seen_auth_contexts) >= 4096:
+            raise ProtocolError("local client-auth context budget exceeded")
         self._seen_auth_contexts.add(context)
         pool = ((self.client_credentials,) if self.client_credentials else ()) + self.client_credential_candidates
         candidates = preferred_credentials((value for value in pool
@@ -408,17 +411,20 @@ class SecureChannel:
 
     async def _receive_client_auth(self, frame):
         kind, body = m.decode_frame(frame)
+        if not self.pending_client_auth:
+            raise ProtocolError("unsolicited client authentication response", alert=10)
         if kind in (11, 25):
-            if self._active_client_auth is not None or not body:
-                raise ProtocolError("interleaved client authentication response")
+            if self._active_client_auth is not None:
+                raise ProtocolError("interleaved client authentication response", alert=10)
             parsed_body = decompress_certificate(body, _compression_offer(dict(self.client_auth_offers)[27])) if kind == 25 and 27 in dict(self.client_auth_offers) else body
             if kind == 25 and 27 not in dict(self.client_auth_offers):
-                raise ProtocolError("unoffered client certificate compression")
-            size = parsed_body[0]
-            context = parsed_body[1:1+size]
+                raise ProtocolError("unoffered client certificate compression", alert=47)
+            context = m._Reader(parsed_body).vector(1)
             state = self.pending_client_auth.get(context)
-            if state is None or state["stage"] != "certificate":
-                raise ProtocolError("unsolicited client authentication certificate")
+            if state is None:
+                raise ProtocolError("unknown client authentication context", alert=47)
+            if state["stage"] != "certificate":
+                raise ProtocolError("unexpected client authentication certificate", alert=10)
             state["chain"], state["metadata"] = m.parse_certificate(parsed_body, context=context, allow_empty=True, details=True)
             state["transcript"].extend(frame)
             self._active_client_auth = state
@@ -439,7 +445,7 @@ class SecureChannel:
             return
         state = self._active_client_auth
         if state is None:
-            raise ProtocolError("unsolicited client authentication proof")
+            raise ProtocolError("unsolicited client authentication proof", alert=10)
         if kind == 15 and state["stage"] == "proof":
             expected = self.schedule.client_proof(self.exporter_secret, state["private"],
                                      c.public_bytes(state["key"]), bytes(state["transcript"]))
@@ -459,7 +465,7 @@ class SecureChannel:
             if not state["future"].done():
                 state["future"].set_result(self.authenticated_client)
         else:
-            raise ProtocolError("unexpected client authentication message")
+            raise ProtocolError("unexpected client authentication message", alert=10)
 
     def exporter(self, label, context=b"", length=32):
         if self.exporter_secret is None:
@@ -579,6 +585,8 @@ class SecureChannel:
             if len(self.post_handshake) < size:
                 return
             frame = bytes(self.post_handshake[:size]); del self.post_handshake[:size]
+            if frame[0] not in (4, 11, 13, 15, 20, 24, 25, 252):
+                raise ProtocolError("unexpected post-handshake message", alert=10)
             kind, body = m.decode_frame(frame)
             if self._active_client_auth is not None and kind not in (15, 20):
                 raise ProtocolError("interleaved client authentication response", alert=10)
@@ -611,7 +619,7 @@ class SecureChannel:
                         allowed_psk_modes=self.allowed_psk_modes,
                         record_size_limit=self.sender.record_limit))
             else:
-                raise ProtocolError("unexpected post-handshake message")
+                raise ProtocolError("unexpected post-handshake message", alert=10)
 
     def abort(self):
         self.closed = True
@@ -881,10 +889,10 @@ def _credential_frame(credentials, *, context=b"", offer_extensions=(), role="se
         if (not isinstance(binding, tuple) or len(binding) != 2 or
                 type(binding[1]) is not int or not 1 <= binding[1] <= 65535):
             raise ProtocolError("local DNSSEC evidence requires a logical service binding")
-        name = m.validate_name(binding[0]).encode("ascii")
-        expected_sni = m._vec(b"\x00" + m._vec(name, 2), 2)
+        name = m.validate_name(binding[0])
+        offered_name = m.parse_server_name(offered[0]) if 0 in offered else ""
         DNSSECWireEvidence.parse(dict(metadata[0])[59])
-        if (offered.get(0) != expected_sni or offered.get(59) != binding[1].to_bytes(2, "big")):
+        if (offered_name != name or offered.get(59) != binding[1].to_bytes(2, "big")):
             # RFC9102: do not return an unrelated chain for an unsupported
             # name/port, including a peer which did not request this extension.
             metadata = tuple(tuple(pair for pair in pairs if pair[0] != 59) for pairs in metadata)
@@ -968,7 +976,7 @@ def _request_extension_block(request):
 def _decode_request(request, *, cache_enabled=False, templates=()):
     if request[0] == 252:
         if not cache_enabled:
-            raise ProtocolError("unselected cached certificate request")
+            raise ProtocolError("unselected cached certificate request", alert=10)
         context, block = resolve_cached_request(request[4:], templates)
         body = m._vec(context, 1) + m._vec(block, 2)
     else:

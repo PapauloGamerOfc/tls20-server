@@ -3,14 +3,17 @@ import hashlib
 from dataclasses import replace
 import unittest
 import time
+from unittest.mock import patch
 
 import dns.rrset
 from cryptography.hazmat.primitives import serialization
 
 from tests import test_dnssec_credentials, test_sessions
+from tls20_server import crypto as c, messages as m
 from tls20_server.credential_profiles import CredentialPolicy
 from tls20_server.dnssec_credentials import DANEPolicy, DNSSECWireEvidence
 from tls20_server.errors import ProtocolError
+from tls20_server.handshake import _credential_frame
 from tls20_server.pki import Credentials
 from tls20_server.tickets import TicketCache
 
@@ -61,6 +64,61 @@ class DNSSECHandshakeTests(unittest.IsolatedAsyncioTestCase):
                     policy = self.configure(kind, **options)
                     with self.assertRaises((ProtocolError, ConnectionError)):
                         await self.connect(credential_policy=policy, server_certificate_types=(kind,))
+
+    async def test_case_insensitive_sni_keeps_dane_evidence_and_actual_transcript(self):
+        original_credentials, client_hello = self.credentials, m.client_hello
+        for kind in (0, 2):
+            for name in (b"LOCALHOST", b"LoCaLhOsT"):
+                for retry, compression in ((False, ()), (True, (1,))):
+                    with self.subTest(kind=kind, name=name, retry=retry):
+                        self.credentials = original_credentials
+                        self.cache = TicketCache()
+                        policy = self.configure(kind)
+                        sent = []
+                        def offer(*args, **kwargs):
+                            hello = client_hello(*args, **kwargs)
+                            current = m.extension(0, m._vec(b"\x00" + m._vec(b"localhost", 2), 2))
+                            actual = m.extension(0, m._vec(b"\x00" + m._vec(name, 2), 2))
+                            self.assertIn(current, hello)
+                            hello = hello.replace(current, actual)
+                            sent.append(hello)
+                            return hello
+                        with patch.object(m, "client_hello", offer):
+                            channel = await self.connect(credential_policy=policy,
+                                server_certificate_types=(kind,), force_retry=retry,
+                                certificate_compression=compression)
+                        self.assertFalse(channel.resumed)
+                        self.assertTrue(channel.peer_authenticated)
+                        self.assertIn(59, dict(channel.certificate_extensions[0]))
+                        self.assertEqual(channel.handshake_transcript, self.channels[-1].handshake_transcript)
+                        self.assertEqual(len(sent), 2 if retry else 1)
+                        self.assertIn(sent[-1], channel.handshake_transcript)
+                        for hello in sent:
+                            parsed = m.parse_client_hello(hello[4:])
+                            self.assertEqual(parsed.name, "localhost")
+                            self.assertIn(name, dict(parsed.extension_values)[0])
+                        await channel.send(b"DANE authenticated application")
+                        self.assertEqual(await channel.recv(), b"DANE authenticated application")
+
+    async def test_dnssec_evidence_selection_preserves_service_and_sni_validation(self):
+        self.configure(2)
+        auth, traffic = c.X25519PrivateKey.generate(), c.X25519PrivateKey.generate()
+        hello = m.client_hello(c.public_bytes(auth), c.public_bytes(traffic), "localhost", bytes(32),
+            extra_extensions=((59, (343).to_bytes(2, "big")),))
+        offered = dict(m.parse_client_hello(hello[4:]).extension_values)
+        for changed, remove in (({0: m._vec(b"\x00" + m._vec(b"OTHER.TEST", 2), 2)}, None),
+                                ({59: (443).to_bytes(2, "big")}, None), ({}, 0), ({}, 59)):
+            with self.subTest(changed=changed, remove=remove):
+                values = {**offered, **changed}
+                if remove is not None:
+                    values.pop(remove)
+                response = _credential_frame(self.credentials, offer_extensions=values.items())
+                _, metadata = m.parse_certificate(response[4:], details=True)
+                self.assertNotIn(59, dict(metadata[0]))
+        for malformed in (offered[0][:-1], offered[0] + b"\0",
+                          m._vec(b"\x00" + m._vec(b"LOCALHOST\0", 2), 2)):
+            with self.subTest(malformed=malformed), self.assertRaises(ProtocolError):
+                _credential_frame(self.credentials, offer_extensions={**offered, 0: malformed}.items())
 
     async def test_request_port_must_match_policy_and_sni_cannot_be_omitted(self):
         policy = self.configure(2)

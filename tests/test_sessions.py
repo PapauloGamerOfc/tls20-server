@@ -2,8 +2,9 @@
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from tls20_server import crypto as c
 from tls20_server.errors import PeerClosed, ProtocolError
@@ -20,6 +21,9 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.roots = [root]
         self.store, self.cache = TicketStore(), TicketCache()
         self.tasks, self.channels, self.writers = set(), [], []
+        self.client_writers = set()
+        self.client_connected = asyncio.Event()
+        self.defer_server_writer_registration = False
         self.errors, self.early = [], []
         self.callback_event = asyncio.Event()
         self.server_options = {}
@@ -27,10 +31,17 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.port = self.listener.sockets[0].getsockname()[1]
 
     def accept(self, reader, writer):
-        task = asyncio.create_task(self.handle(reader, writer))
+        if getattr(self, "defer_server_writer_registration", False):
+            async def handle_after_client_registration():
+                await self.client_connected.wait()
+                self.writers.append(writer)
+                await self.handle(reader, writer)
+            task = asyncio.create_task(handle_after_client_registration())
+        else:
+            self.writers.append(writer)
+            task = asyncio.create_task(self.handle(reader, writer))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
-        self.writers.append(writer)
 
     async def handle(self, reader, writer):
         async def early(data):
@@ -53,8 +64,13 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 writer.close()
 
     async def connect(self, **options):
+        self.client_connected.clear()
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
         self.writers.append(writer)
+        # The accepted server writer can be registered before OR after this
+        # continuation. Identify the injection endpoint by role, not list order.
+        self.client_writers.add(writer)
+        self.client_connected.set()
         channel = await client_handshake(reader, writer, "localhost", self.roots,
             revocation_policy="lab-offline", ticket_cache=self.cache, **options)
         self.assertEqual(await asyncio.wait_for(channel.recv(), 2), b"ready", self.errors)
@@ -189,7 +205,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 next(iter(self.store._tickets.values())).early_used = True
                 original = Wire.send_frame
                 async def send(wire, message, state=None):
-                    if wire.writer is self.writers[-1] and message[0] == 20:
+                    if wire.writer in self.client_writers and message[0] == 20:
                         wire.writer.write(state.seal(b"\x01\x5a", 21))
                         if corrupt_after_alert:
                             # An injected bad record does not consume the
@@ -229,7 +245,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 original, injected = Wire.send_frame, False
                 async def send(wire, message, state=None):
                     nonlocal injected
-                    if wire.writer is self.writers[-1] and message[0] == 20:
+                    if wire.writer in self.client_writers and message[0] == 20:
                         injected = True
                         if plaintext is None:
                             record = bytes.fromhex("1703030010") + bytes(16)
@@ -256,6 +272,14 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(await channel.recv(), b"valid after stale early records")
                 self.assertTrue(injected)
                 self.assertFalse(self.early)
+
+    async def test_early_record_injection_with_server_writer_registered_last(self):
+        # Force the ordering observed by the macOS event loop without sleeps.
+        # Both malformed-record hooks must still target only Client Finished.
+        self.defer_server_writer_registration = True
+        await self.test_rejected_early_alert_commits_to_handshake_epoch()
+        await self.test_rejected_early_probe_rejects_authenticated_malformed_records()
+        self.assertNotIn(self.writers[-1], self.client_writers)
 
     async def test_retry_rejects_early_data_without_forwarding(self):
         await self.connect()
@@ -421,6 +445,17 @@ class TicketBoundsTests(unittest.TestCase):
         sender.update(); receiver.update()
         self.assertEqual(sender.sequence, 0)
         self.assertEqual(receiver.open(sender.seal(b"new key", 23)), (b"new key", 23))
+
+
+class SessionFixtureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_accept_without_optional_ordering_fixture(self):
+        # Optional-provider fixtures reuse accept with their own setup.
+        fixture = SimpleNamespace(handle=AsyncMock(), tasks=set(), writers=[])
+        reader, writer = object(), object()
+        SessionTests.accept(fixture, reader, writer)
+        self.assertEqual(fixture.writers, [writer])
+        await asyncio.gather(*fixture.tasks)
+        fixture.handle.assert_awaited_once_with(reader, writer)
 
 
 if __name__ == "__main__":

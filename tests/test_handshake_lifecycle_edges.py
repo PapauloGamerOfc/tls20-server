@@ -156,7 +156,7 @@ class HandshakeLifecycleEdges(unittest.IsolatedAsyncioTestCase):
                     next(iter(self.case.store._tickets.values())).early_used = not accepted
                     original = Wire.send_frame
                     async def send(wire, message, state=None):
-                        if fail_finished and wire.writer is self.case.writers[-1] and message[0] == 20:
+                        if fail_finished and wire.writer in self.case.client_writers and message[0] == 20:
                             message = message[:-1] + bytes((message[-1] ^ 1,))
                         return await original(wire, message, state)
                     with self.tracked_handshakes() as channels, patch.object(Wire, "send_frame", send):
@@ -180,6 +180,11 @@ class HandshakeLifecycleEdges(unittest.IsolatedAsyncioTestCase):
                             self.assertFalse(live.receiver.failed)
                         await channel.send(b"application survives transient cleanup")
                         self.assertEqual(await channel.recv(), b"application survives transient cleanup")
+
+    async def test_early_epoch_cleanup_with_server_writer_registered_last(self):
+        self.case.defer_server_writer_registration = True
+        await self.test_successful_and_failed_early_epochs_release_all_transient_states()
+        self.assertNotIn(self.case.writers[-1], self.case.client_writers)
 
 
 if __name__ == "__main__":

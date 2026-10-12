@@ -361,6 +361,34 @@ and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
 
+### DANE names, post-handshake alerts and deterministic fixtures: 2026-10-12
+
+DANE evidence selection uses the same strict, case-insensitive DNS-name parser
+as ClientHello lookup. The original SNI extension bytes remain in transcripts
+and retry checks. Authenticated X.509 and raw-key tests cover uppercase and
+mixed-case names, retry/compression, wrong names/ports and malformed encodings.
+
+Unsolicited and out-of-order post-handshake messages emit `unexpected_message`.
+PHA context errors, malformed framing and invalid Finished values retain their
+distinct alerts. Encrypted-wire tests verify both the alert and connection
+closure rather than only the raised Python exception.
+
+Early-record and cleanup fixtures identify client writers by role, not callback
+ordering. Event-gated tests force the server writer to register last without
+sleeps. The regression rejects the old ordering-dependent implementation and
+passes 20 repeated runs. A provider-independent test also covers reuse of the
+accept helper by fixtures with their own setup.
+
+Final Windows runs on Python 3.11 and 3.12 each completed 666 tests with native
+providers: 664 passed and two POSIX-only checks were skipped. Minimal-provider
+runs on both versions completed 666 tests with 92 explicit provider/OS skips.
+Resource warnings were errors. An initial native run caught a missing default
+in the shared ITS fixture; it was corrected before both complete final reruns.
+Source/wheel packaging, isolated wheel/CLI checks, module compilation and local
+documentation links passed. Logs are under `build/request-conformance-*`.
+These local results do not claim remote Linux/macOS CI completion or a formal
+security audit.
+
 ### Certificate budgets and request/retry alerts: 2026-10-11
 
 Credential loading, wire encoding/decoding, cached material and path validation

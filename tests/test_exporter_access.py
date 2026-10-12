@@ -57,7 +57,13 @@ class ExporterAccessTests(unittest.IsolatedAsyncioTestCase):
             await self.connect(on_exporter=fail)
         self.assertEqual(len(handles), 1)
         self.assertFalse(handles[0].active)
-        self.assertTrue(self.writers[-1].is_closing())
+        self.assertEqual(len(self.client_writers), 1)
+        self.assertTrue(next(iter(self.client_writers)).is_closing())
+
+    async def test_callback_failure_with_server_writer_registered_last(self):
+        self.defer_server_writer_registration = True
+        await self.test_callback_failure_revokes_handle_and_closes_transport()
+        self.assertNotIn(self.writers[-1], self.client_writers)
 
     async def test_retry_revokes_initial_early_exporter(self):
         await self.connect()

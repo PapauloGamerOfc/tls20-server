@@ -229,6 +229,23 @@ def _u16_list(data: bytes) -> tuple[int, ...]:
     return tuple(int.from_bytes(value[i:i + 2], "big") for i in range(0, len(value), 2))
 
 
+def parse_server_name(data: bytes) -> str:
+    """Validate the complete SNI offer and return its canonical DNS lookup name.
+
+    Callers retain the original extension bytes for transcripts and retry checks.
+    """
+    outer = _Reader(data); names = _Reader(outer.vector(2)); outer.end()
+    if names.take(1) != b"\x00":
+        raise ProtocolError("unsupported name type", alert=47)
+    try:
+        name = names.vector(2).decode("ascii").lower()
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("non-ASCII server name", alert=47) from exc
+    validate_name(name)
+    names.end()
+    return name
+
+
 def pwd_share_valid(group, share):
     if group in c.ffdhe.SIZES:
         width=c.ffdhe.SIZES[group]
@@ -381,20 +398,7 @@ def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticat
         raise ProtocolError("invalid authentication share length", alert=50)
     if A and B and A == c.traffic_auth_component(group, B):
         raise ProtocolError("invalid independent key shares", alert=47)
-    name = ""
-    if 0 in ext:
-        nr = _Reader(ext[0]); names = _Reader(nr.vector(2)); nr.end()
-        if names.take(1) != b"\x00":
-            raise ProtocolError("unsupported name type", alert=47)
-        try:
-            # DNS SNI is case-insensitive. Only normalize the lookup value;
-            # extension_values retains the original bytes for the transcript
-            # and the byte-for-byte ClientHello retry continuity checks.
-            name = names.vector(2).decode("ascii").lower()
-        except UnicodeDecodeError as exc:
-            raise ProtocolError("non-ASCII server name", alert=47) from exc
-        validate_name(name)
-        names.end()
+    name = parse_server_name(ext[0]) if 0 in ext else ""
     if 59 in ext and (0 not in ext or len(ext[59]) != 2 or ext[59] == b"\x00\x00"):
         raise ProtocolError("DNSSEC chain requires DNS SNI and an exact nonzero service port", alert=50)
     offered = []
