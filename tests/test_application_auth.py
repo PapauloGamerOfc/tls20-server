@@ -36,6 +36,29 @@ def endpoint(role, root, private, peer, suite=0x1301):
     )
 
 
+def malformed_server_names():
+    def name(value):
+        return m._vec(b"\0" + m._vec(value, 2), 2)
+    valid = name(b"localhost")
+    entry = b"\0" + m._vec(b"localhost", 2)
+    return (
+        ("empty", ((0, b""),)),
+        ("empty-list", ((0, b"\0\0"),)),
+        ("truncated-list", ((0, valid[:-1]),)),
+        ("truncated-name", ((0, b"\0\1\0"),)),
+        ("empty-name", ((0, name(b"")),)),
+        ("trailing-extension-byte", ((0, valid + b"x"),)),
+        ("trailing-list-byte", ((0, m._vec(entry + b"x", 2)),)),
+        ("duplicate-host-name", ((0, m._vec(entry + entry, 2)),)),
+        ("duplicate-extension", ((0, valid), (0, valid))),
+        ("unsupported-name-type", ((0, m._vec(b"\1" + m._vec(b"localhost", 2), 2)),)),
+        ("invalid-label", ((0, name(b"bad_name.example")),)),
+        ("non-ascii", ((0, name(b"b\xfccher.example")),)),
+        ("invalid-a-label", ((0, name(b"xn--.example")),)),
+        ("ip-literal", ((0, name(b"127.0.0.1")),)),
+    )
+
+
 class AuthenticatorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.credentials, self.root_cert = generate_lab_credentials("localhost")
@@ -110,6 +133,88 @@ class AuthenticatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.server.validate(response, self.policy)).authenticated)
         with self.assertRaises(ProtocolError):
             self.server.authenticate(self.credentials, request=request)
+
+    async def test_server_name_generation_rejects_malformed_preferences_before_claiming_context(self):
+        other = self.client.request(context=b"unrelated pending request")
+        before = dict(self.client._pending)
+        for label, extra in malformed_server_names():
+            with self.subTest(case=label):
+                context = label.encode("ascii")
+                with self.assertRaises(ProtocolError):
+                    self.client.request(context=context, extra_extensions=extra)
+                self.assertNotIn(context, self.client._used)
+                self.assertEqual(self.client._pending, before)
+                # A failed encoding must not burn the caller's context or
+                # invalidate an independent pending verifier's private key.
+                corrected = self.client.request(context=context)
+                response = self.server.authenticate(self.credentials, request=corrected)
+                self.assertTrue((await self.client.validate(response, self.policy)).authenticated)
+        response = self.server.authenticate(self.credentials, request=other)
+        self.assertTrue((await self.client.validate(response, self.policy)).authenticated)
+
+    async def test_server_name_receiving_rejects_malformed_requests_before_authentication_or_refusal(self):
+        other = self.server.request(context=b"independent server request")
+        pending, used = dict(self.server._pending), set(self.server._used)
+        for label, extra in malformed_server_names():
+            for credentials in (None, self.credentials):
+                with self.subTest(case=label, refusal=credentials is None):
+                    context = label.encode("ascii") + (b"-refusal" if credentials is None else b"-identity")
+                    extensions = ((0xff02, c.public_bytes(self.share)), (50, m._vec(b"\x08\x07", 2)), *extra)
+                    # A peer can bypass our local request encoder. Both output
+                    # paths must reject the same bytes before claiming context.
+                    wire = _frame(17, m._vec(context, 1) + m._vec(
+                        b"".join(m.extension(kind, value) for kind, value in extensions), 2))
+                    with self.assertRaises(ProtocolError):
+                        parse_request(wire)
+                    with self.assertRaises(ProtocolError):
+                        self.server.authenticate(credentials, request=wire)
+                    self.assertEqual(self.server._pending, pending)
+                    self.assertEqual(self.server._used, used)
+                    corrected = self.client.request(context=context)
+                    response = self.server.authenticate(credentials, request=corrected)
+                    result = await self.client.validate(response, self.policy, request=corrected)
+                    self.assertEqual(result.authenticated, credentials is not None)
+                    used.add(context)
+        response = self.client.authenticate(self.credentials, request=other)
+        self.assertTrue((await self.server.validate(response, self.policy)).authenticated)
+
+    async def test_server_name_preferences_preserve_bytes_and_do_not_replace_authorization(self):
+        for hostname in (None, b"localhost", b"LOCALHOST", b"XN--BCHER-KVA.EXAMPLE"):
+            for credentials in (None, self.credentials):
+                with self.subTest(hostname=hostname, refusal=credentials is None):
+                    value = None if hostname is None else m._vec(b"\0" + m._vec(hostname, 2), 2)
+                    request = self.client.request(extra_extensions=() if value is None else ((0, value),))
+                    parsed = parse_request(request)
+                    self.assertEqual(parsed.wire, request)
+                    self.assertEqual(dict(parsed.extensions).get(0), value)
+                    response = self.server.authenticate(credentials, request=request)
+                    result = await self.client.validate(response, self.policy, request=request)
+                    self.assertEqual(result.authenticated, credentials is not None)
+        # A well-formed name is merely a credential-selection preference. It
+        # cannot repair a caller's independent trust/name/authorization policy.
+        request = self.client.request(extra_extensions=((0, m._vec(b"\0" + m._vec(b"localhost", 2), 2)),))
+        response = self.server.authenticate(self.credentials, request=request)
+        policy = CredentialPolicy(trust_roots=(self.root_cert,), peer_name="other.example", revocation_policy="offline")
+        with self.assertRaises(ProtocolError):
+            await self.client.validate(response, credential_validator(policy, role="server", authorize=lambda _: True))
+
+    async def test_malformed_supplied_server_name_does_not_consume_retained_verifier(self):
+        for label, extra in malformed_server_names():
+            for credentials in (None, self.credentials):
+                with self.subTest(case=label, refusal=credentials is None):
+                    request = self.client.request()
+                    parsed = parse_request(request)
+                    response = self.server.authenticate(credentials, request=request)
+                    extensions = (*parsed.extensions, *extra)
+                    malformed = _frame(17, m._vec(parsed.context, 1) + m._vec(
+                        b"".join(m.extension(kind, value) for kind, value in extensions), 2))
+                    pending = self.client._pending[parsed.context]
+                    with self.assertRaises(ProtocolError):
+                        await self.client.validate(response, self.policy, request=malformed)
+                    self.assertIs(self.client._pending[parsed.context], pending)
+                    self.assertFalse(self.client._inflight)
+                    result = await self.client.validate(response, self.policy, request=request)
+                    self.assertEqual(result.authenticated, credentials is not None)
 
     async def test_filter_syntax_is_checked_before_empty_authenticator_refusal(self):
         oid = _oid_der("2.5.29.15")

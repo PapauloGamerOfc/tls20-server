@@ -204,6 +204,10 @@ def parse_request(wire):
         raise ProtocolError("misplaced application authenticator extension")
     if role == "client" and 0 in extensions:
         raise ProtocolError("server_name is only allowed in a client-generated request")
+    if 0 in extensions:
+        # Validate the recognized preference, but retain its exact wire bytes
+        # in the transcript. It does not replace credential/application policy.
+        m.parse_server_name(extensions[0])
     _offers(extensions, role)
     _status_request(extensions, requested=True)
     # Validate recognized filters even when no local credential exists. An
