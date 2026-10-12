@@ -37,6 +37,17 @@ before sending a new request does not destroy independent pending requests.
 This is managed-reference cleanup, not guaranteed erasure of Python memory;
 see [SECURITY.md](../SECURITY.md).
 
+Temporary authentication agreements and proof roots are released immediately
+after deriving or checking the proof, before subsequent network or exporter
+callback waits. Traffic private keys are closed after their agreement has been
+consumed, including mixed-password handoff and password-session resumption.
+The client retains its authentication share only when later exported
+authenticators are explicitly enabled. These are managed-reference/handle
+ownership guarantees, not physical erasure of immutable Python allocations.
+Accepted 0-RTT payloads that exceed the advertised allowance terminate with
+`unexpected_message` (10), in both ordinary and password-session handshakes;
+the exact allowance remains usable.
+
 1. The dedicated listener checks the bootstrap and parses TLS-style Hello
    messages and extensions, selecting only version `0x0400`. It rejects
    `signature_algorithms`; certificate signature preferences are separate.
@@ -421,6 +432,29 @@ Client-MAC tests include independent spec-derived known answers, captured initia
 and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
+
+### Handshake-stage ownership and early-payload limits: 2026-10-12
+
+Regression tests suspend real exporter callbacks before handshake completion
+and verify that proof-only agreements and consumed traffic-key handles have
+already been released. They cover full/resumed ordinary and password flows,
+mixed-password handoff, an explicit native SM2 handle, and positive controls
+that still use requested/spontaneous exported authenticators. Early-data tests
+accept exactly 65,536 bytes and reject one or a full record more, checking the
+authenticated `unexpected_message` alert and absence of a successful
+EndOfEarlyData notification.
+
+Local Windows runs completed 816 tests on Python 3.11 and 3.12 with all optional
+native providers supplied; each skipped only two platform-specific checks.
+The minimal-provider run also completed 816 tests (107 optional/platform
+skips), with resource warnings treated as errors. The 100-test focused suite
+passed with both Selector and Proactor event loops on both Python versions.
+Six negative controls reproduce the previous implementation's failures.
+Package build, isolated wheel installation/CLI checks, Python compilation and
+documentation links passed. Logs use `build/stage-sm3-425-*` and
+`build/audit-next-stage-*`. These are local results, not remote CI or a formal
+security proof; the Python memory-erasure limits in [SECURITY.md](../SECURITY.md)
+continue to apply.
 
 ### Duplex control ordering and CertificateEntry path binding: 2026-10-12
 

@@ -259,6 +259,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                     raise ProtocolError("password successor requires a compatible PSK mode")
             transcript.add(ch)
             root = c.handshake_secret(shared, ticket.psk if ticket else None, selected.hash_name)
+            shared = None
             sh = m.server_hello(public, os.urandom(32), session_id=hello.session_id, cipher_suite=selected_id,
                                 group=group, resumed=ticket is not None, selected_identity=identity_index)
             transcript.add(sh)
@@ -327,7 +328,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                             raise ProtocolError("unexpected password session early record type", alert=10)
                         total += len(content)
                         if total > min(max_early_data, ticket.max_early_data):
-                            raise ProtocolError("invalid password session early data")
+                            raise ProtocolError("invalid password session early data", alert=10)
                         if content:
                             await on_early_data(content)
                     else:
@@ -572,8 +573,11 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                 if selected_group != group or int.from_bytes(m.server_hello_extensions(sh[4:])[41], "big") != 0:
                     raise ProtocolError("inconsistent password successor PSK or key share", alert=47)
                 shared=c.traffic_dh(ordinary_private,group,public_peer)
+                secrets.close_key(ordinary_private)
+                ordinary_private = None
             transcript.add(ch);transcript.add(sh)
             root=c.handshake_secret(shared,ticket.psk if ticket else None,selected.hash_name)
+            shared = None
             client_secret,server_secret=handshake_keys(root,transcript,selected.hash_name)
             _log(diagnostics,random,client_secret,server_secret)
             sender=secrets.record(client_secret,"seal",selected_id)

@@ -1594,6 +1594,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             # Reject both zero agreements before sending a server flight.
             traffic_root = c.handshake_secret(traffic_shared,
                                               ticket.psk if ticket else None, schedule.hash_name)
+            traffic_shared = None  # The handshake root now owns the traffic agreement.
             auth_shared = c.dh(credentials.private_key, hello.A) if credential_auth else None
             sh = m.server_hello(ephemeral_public, os.urandom(32),
                                 session_id=hello.session_id, resumed=ticket is not None,
@@ -1661,7 +1662,9 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 await wire.send_frame(message, sender)
             if credential_auth:
                 auth_root = schedule.authentication_root(traffic_root, auth_shared, transcript.snapshot())
+                auth_shared = None
                 cv = m.certificate_verify(schedule.server_proof(auth_root, transcript.snapshot()))
+                auth_root = None  # Never retain proof-only secrets across network/callback awaits.
                 transcript.add(cv)
                 await wire.send_frame(cv, sender)
             sf = m.frame(20, schedule.finished(server_secret, transcript.snapshot()))
@@ -1714,7 +1717,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                             raise ProtocolError("early epoch carries only application data", alert=10)
                         total += len(content)
                         if total > min(max_early_data, ticket.max_early_data):
-                            raise ProtocolError("early data limit exceeded")
+                            raise ProtocolError("early data limit exceeded", alert=10)
                         if content:
                             await on_early_data(content)
                     else:
@@ -1767,6 +1770,8 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                     if cv[4:6] != b"\xfe\x01" or not hmac.compare_digest(expected, cv[8:]):
                         raise ProtocolError("initial client MAC verification failed", alert=51)
                     transcript.add(cv)
+            client_mac_verified = client_auth_private is not None
+            client_auth_private = None
             cf = await wire.receive_frame(20, receiver, boundary=True)
             if not schedule.verify_finished(client_secret, transcript.snapshot(), cf[4:]):
                 raise ProtocolError("client Finished verification failed", alert=51)
@@ -1779,7 +1784,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 if external is not None:
                     from .bootstrap_credentials import authorize_bootstrap_client
                     bootstrap_authorization = authorize_bootstrap_client(bootstrap_binding, client_chain,
-                        credential_type=client_credential_type, client_mac_verified=client_auth_private is not None,
+                        credential_type=client_credential_type, client_mac_verified=client_mac_verified,
                         client_finished_verified=True)
                 else:
                     bootstrap_authorization = {"profile": "tls20-pok", "scope": bootstrap_binding.scope,
@@ -2220,6 +2225,12 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 if not mixed_password or not retry or resumed or ticket is not None:
                     raise ProtocolError("unsolicited password authentication selection")
                 from .pake_handshake import client as password_client
+                # This flight's ordinary traffic key is not used by the PWD
+                # exchange. Do not keep it alive in this suspended outer frame.
+                secrets.close_key(traffic_private)
+                traffic_private = None
+                if not enable_authenticators:
+                    auth_private = None
                 return await password_client(reader,writer,password_credential,timeout=timeout,
                     application_protocols=application_protocols,cipher_suites=cipher_suites,
                     groups=tuple(value for value in enabled_groups if value in PASSWORD_GROUPS),
@@ -2310,6 +2321,10 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             traffic_root = c.handshake_secret(c.traffic_dh(traffic_private, group, ephemeral_public, provider=native_provider)
                                               if group else bytes(selected.hash_length),
                                               ticket.psk if resumed else None, schedule.hash_name)
+            secrets.close_key(traffic_private)
+            traffic_private = None
+            if resumed and not selected_combined and not enable_authenticators:
+                auth_private = None
             client_secret, server_secret = handshake_keys(traffic_root, transcript, schedule.hash_name)
             emit_diagnostic(diagnostics, "TLS20_CLIENT_HANDSHAKE_TRAFFIC_SECRET", random, client_secret)
             emit_diagnostic(diagnostics, "TLS20_SERVER_HANDSHAKE_TRAFFIC_SECRET", random, server_secret)
@@ -2447,8 +2462,12 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     raise ProtocolError("non-independent certified key")
                 transcript.add(cert)
                 auth_root = schedule.authentication_root(traffic_root, c.dh(auth_private, static_public), transcript.snapshot())
+                if not enable_authenticators:
+                    auth_private = None
                 cv = await wire.receive_frame(15, receiver)
-                if cv[4:6] != b"\xfe\x00" or not schedule.verify_proof(auth_root, transcript.snapshot(), cv[8:]):
+                verified = cv[4:6] == b"\xfe\x00" and schedule.verify_proof(auth_root, transcript.snapshot(), cv[8:])
+                auth_root = None
+                if not verified:
                     raise ProtocolError("server authentication verification failed", alert=51)
                 transcript.add(cv)
             sf = await wire.receive_frame(20, receiver, boundary=True)
