@@ -86,7 +86,7 @@ def _vec(data: bytes, width: int) -> bytes:
 
 def _protocol(protocol: bytes) -> None:
     if not isinstance(protocol, bytes) or not 1 <= len(protocol) <= 255:
-        raise ProtocolError("application protocol length")
+        raise ProtocolError("application protocol length", alert=50)
 
 
 class _Reader:

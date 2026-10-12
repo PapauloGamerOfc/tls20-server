@@ -450,7 +450,8 @@ building; supplied evidence is never silently moved or discarded.
 TLS response extensions are checked against the actual handshake offer before
 credential policy evaluation, including initial and post-handshake client
 authentication and cached/compressed Certificate messages. Unsolicited
-CertificateEntry extensions produce `unsupported_extension`; malformed fixed
+CertificateEntry extensions normally produce `unsupported_extension`; RFC 9345
+specifically requires `unexpected_message` for unsolicited delegation. Malformed fixed
 width control fields and OCSP/SCT vectors produce `decode_error`, while validly
 encoded unsupported scalar values remain `illegal_parameter`. Optional CT policy
 may ignore an unknown SCT version, but cannot turn an empty or truncated SCT list
@@ -461,6 +462,25 @@ requests remain usable. CT v2 permits an empty `transparency_info` response body
 (RFC 9162 section 6.5), not a present but empty/truncated `TransItemList` vector.
 The empty response supplies no log vote or mandatory TLS Feature evidence; its
 exception does not extend to embedded certificate or OCSP list carriers.
+
+### Early-exporter lineage and extension syntax
+
+Early exporters and their diagnostic labels remain associated with the first
+PSK in the original ClientHello. Removing an incompatible PSK after a retry
+must not promote a different PSK into that early-key lineage merely because it
+now occupies index zero. Regressions exercise ordinary external PSKs and
+password-session successor tickets, including hash changes, valid 1-RTT
+continuation and capability cleanup. This implementation revokes early-exporter
+capabilities on HelloRetryRequest, consistently in both roles and password
+sessions; this is its API availability policy, not a claim that the RFC forbids
+every early-exporter use after a retry. Without a retry, availability does not
+require a nonempty early payload or successful 0-RTT admission.
+
+Malformed ALPN protocol-name lengths, OID-filter vectors and OCSP request DER
+produce `decode_error` (50). Repeated OID filters and well-formed forbidden
+selection values retain `illegal_parameter` (47). These parsing checks do not
+replace certificate, grant, responder-trust or application-authorization checks;
+the shared DER helpers retain their existing defaults for other consumers.
 
 Password retries may carry only a salt after a proactive ClientHello with one
 password key share: the group remains unchanged and the commitment is recomputed.

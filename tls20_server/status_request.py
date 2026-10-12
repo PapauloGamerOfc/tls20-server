@@ -41,40 +41,40 @@ def parse_status_request(value, *, certificate_request=False):
     ids, cursor = [], 0
     while cursor < len(identifiers):
         encoded, cursor = _take(identifiers, cursor, 2)
-        tag, content, end = _der(encoded)
+        tag, content, end = _der(encoded, alert=50)
         if end != len(encoded) or tag not in (0xa1, 0xa2):
             raise ProtocolError("invalid OCSP ResponderID", alert=50)
         if tag == 0xa1:
-            _name(content)
-        elif len(_single_der(content, 4)) != 20:
+            _name(content, alert=50)
+        elif len(_single_der(content, 4, alert=50)) != 20:
             raise ProtocolError("invalid OCSP responder key hash", alert=50)
         ids.append(encoded)
     nonce, critical, seen = None, False, set()
     if extensions:
-        sequence = _single_der(extensions, 48)
+        sequence = _single_der(extensions, 48, alert=50)
         if not sequence:
             raise ProtocolError("empty DER OCSP Extensions", alert=50)
         cursor = 0
         while cursor < len(sequence):
-            tag, extension, cursor = _der(sequence, cursor)
+            tag, extension, cursor = _der(sequence, cursor, alert=50)
             if tag != 48:
                 raise ProtocolError("invalid OCSP request extension", alert=50)
-            _, _, end = _der(extension)
-            oid = _oid(extension[:end])
+            _, _, end = _der(extension, alert=50)
+            oid = _oid(extension[:end], alert=50)
             if oid in seen:
                 raise ProtocolError("duplicate OCSP request extension", alert=47)
             seen.add(oid)
-            tag, contents, pos = _der(extension, end)
+            tag, contents, pos = _der(extension, end, alert=50)
             is_critical = False
             if tag == 1:
                 if contents != b"\xff":
                     raise ProtocolError("noncanonical OCSP critical flag", alert=50)
                 is_critical = True
-                tag, contents, pos = _der(extension, pos)
+                tag, contents, pos = _der(extension, pos, alert=50)
             if tag != 4 or pos != len(extension):
                 raise ProtocolError("invalid OCSP request extension value", alert=50)
             if oid == NONCE_OID:
-                nonce = _single_der(contents, 4)
+                nonce = _single_der(contents, 4, alert=50)
                 if not 1 <= len(nonce) <= 128:
                     raise ProtocolError("invalid OCSP nonce length", alert=50)
             elif is_critical:

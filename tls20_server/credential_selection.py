@@ -39,49 +39,53 @@ def _take(data: bytes, offset: int, width: int) -> tuple[bytes, int]:
     return data[offset:offset + size], offset + size
 
 
-def _der(data: bytes, offset: int = 0) -> tuple[int, bytes, int]:
-    """Minimal definite-length DER envelope, bounded by the enclosing vector."""
+def _der(data: bytes, offset: int = 0, *, alert: int = 40) -> tuple[int, bytes, int]:
+    """Minimal definite-length DER envelope, bounded by the enclosing vector.
+
+    Wire-extension parsers select decode_error explicitly. Other consumers,
+    including certificate evidence validation, retain their existing defaults.
+    """
     if offset + 2 > len(data):
-        raise ProtocolError("truncated selection DER")
+        raise ProtocolError("truncated selection DER", alert=alert)
     tag, size = data[offset:offset + 2]
     offset += 2
     if tag & 31 == 31:
-        raise ProtocolError("unsupported selection DER tag")
+        raise ProtocolError("unsupported selection DER tag", alert=alert)
     if size & 128:
         count = size & 127
         if not count or count > 3 or offset + count > len(data) or data[offset] == 0:
-            raise ProtocolError("invalid selection DER length")
+            raise ProtocolError("invalid selection DER length", alert=alert)
         size = int.from_bytes(data[offset:offset + count], "big")
         offset += count
         if size < 128:
-            raise ProtocolError("non-minimal selection DER length")
+            raise ProtocolError("non-minimal selection DER length", alert=alert)
     if size > len(data) - offset:
-        raise ProtocolError("truncated selection DER value")
+        raise ProtocolError("truncated selection DER value", alert=alert)
     return tag, data[offset:offset + size], offset + size
 
 
-def _single_der(data: bytes, tag: int) -> bytes:
-    actual, value, end = _der(data)
+def _single_der(data: bytes, tag: int, *, alert: int = 40) -> bytes:
+    actual, value, end = _der(data, alert=alert)
     if actual != tag or end != len(data):
-        raise ProtocolError("unexpected selection DER structure")
+        raise ProtocolError("unexpected selection DER structure", alert=alert)
     return value
 
 
-def _oid(data: bytes) -> str:
-    raw = _single_der(data, 6)
+def _oid(data: bytes, *, alert: int = 40) -> str:
+    raw = _single_der(data, 6, alert=alert)
     if not raw:
-        raise ProtocolError("empty selection OID")
+        raise ProtocolError("empty selection OID", alert=alert)
     arcs, value, start = [], 0, True
     for item in raw:
         if start and item == 128:
-            raise ProtocolError("non-minimal selection OID")
+            raise ProtocolError("non-minimal selection OID", alert=alert)
         value = (value << 7) | (item & 127)
         start = not bool(item & 128)
         if start:
             arcs.append(value)
             value = 0
     if not start:
-        raise ProtocolError("truncated selection OID")
+        raise ProtocolError("truncated selection OID", alert=alert)
     first = min(arcs[0] // 40, 2)
     return ".".join(str(item) for item in (first, arcs[0] - 40 * first, *arcs[1:]))
 
@@ -116,27 +120,27 @@ def _oid_der(value) -> bytes:
     return encoded
 
 
-def _name(data: bytes) -> None:
+def _name(data: bytes, *, alert: int = 40) -> None:
     """Check DER Name framing without interpreting its authorization meaning."""
-    sequence = _single_der(data, 48)
+    sequence = _single_der(data, 48, alert=alert)
     offset = 0
     while offset < len(sequence):
-        tag, rdn, offset = _der(sequence, offset)
+        tag, rdn, offset = _der(sequence, offset, alert=alert)
         if tag != 49 or not rdn:
-            raise ProtocolError("invalid authority RDN")
+            raise ProtocolError("invalid authority RDN", alert=alert)
         cursor, previous = 0, b""
         while cursor < len(rdn):
             start = cursor
-            tag, attribute, cursor = _der(rdn, cursor)
+            tag, attribute, cursor = _der(rdn, cursor, alert=alert)
             encoded = rdn[start:cursor]
             if tag != 48 or (previous and encoded < previous):
-                raise ProtocolError("invalid authority attribute or DER ordering")
+                raise ProtocolError("invalid authority attribute or DER ordering", alert=alert)
             previous = encoded
-            _, _, oid_end = _der(attribute)
-            _oid(attribute[:oid_end])
-            _, _, end = _der(attribute, oid_end)
+            _, _, oid_end = _der(attribute, alert=alert)
+            _oid(attribute[:oid_end], alert=alert)
+            _, _, end = _der(attribute, oid_end, alert=alert)
             if end != len(attribute):
-                raise ProtocolError("trailing authority attribute data")
+                raise ProtocolError("trailing authority attribute data", alert=alert)
 
 
 def parse_certificate_authorities(data: bytes) -> tuple[bytes, ...]:
@@ -166,31 +170,31 @@ def encode_certificate_authorities(names) -> bytes:
 
 
 def _requested_usage(value: bytes) -> frozenset[int]:
-    bits = _single_der(value, 3)
+    bits = _single_der(value, 3, alert=50)
     if not bits or bits[0] > 7 or (len(bits) == 1 and bits[0]) or len(bits) > 3:
-        raise ProtocolError("invalid keyUsage filter")
+        raise ProtocolError("invalid keyUsage filter", alert=50)
     unused, raw = bits[0], bits[1:]
     if raw and (raw[-1] & ((1 << unused) - 1) or raw[-1] == 0):
-        raise ProtocolError("non-minimal keyUsage filter")
+        raise ProtocolError("non-minimal keyUsage filter", alert=50)
     if raw and unused != (raw[-1] & -raw[-1]).bit_length() - 1:
-        raise ProtocolError("non-minimal keyUsage filter bit length")
+        raise ProtocolError("non-minimal keyUsage filter bit length", alert=50)
     count = len(raw) * 8 - unused
     if count > 9:
-        raise ProtocolError("undefined keyUsage filter bit")
+        raise ProtocolError("undefined keyUsage filter bit", alert=47)
     return frozenset(index for index in range(count) if raw[index // 8] & (128 >> (index % 8)))
 
 
 def _requested_eku(value: bytes) -> frozenset[str]:
-    body = _single_der(value, 48)
+    body = _single_der(value, 48, alert=50)
     if not body:
-        raise ProtocolError("empty encoded extendedKeyUsage filter")
+        raise ProtocolError("empty encoded extendedKeyUsage filter", alert=50)
     output, offset = set(), 0
     while offset < len(body):
         start = offset
-        _, _, offset = _der(body, offset)
-        oid = _oid(body[start:offset])
+        _, _, offset = _der(body, offset, alert=50)
+        oid = _oid(body[start:offset], alert=50)
         if oid == ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE.dotted_string:
-            raise ProtocolError("anyExtendedKeyUsage is forbidden in an OID filter")
+            raise ProtocolError("anyExtendedKeyUsage is forbidden in an OID filter", alert=47)
         output.add(oid)
     return frozenset(output)
 
@@ -198,14 +202,14 @@ def _requested_eku(value: bytes) -> frozenset[str]:
 def parse_oid_filters(data: bytes) -> tuple[tuple[str, bytes], ...]:
     body, end = _take(data, 0, 2)
     if end != len(data):
-        raise ProtocolError("trailing oid_filters data")
+        raise ProtocolError("trailing oid_filters data", alert=50)
     output, seen, offset = [], set(), 0
     while offset < len(body):
         encoded_oid, offset = _take(body, offset, 1)
         value, offset = _take(body, offset, 2)
-        oid = _oid(encoded_oid)
+        oid = _oid(encoded_oid, alert=50)
         if oid in seen:
-            raise ProtocolError("duplicate certificate extension OID filter")
+            raise ProtocolError("duplicate certificate extension OID filter", alert=47)
         seen.add(oid)
         if value and oid == _KU:
             _requested_usage(value)

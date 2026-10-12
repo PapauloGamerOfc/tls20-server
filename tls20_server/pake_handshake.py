@@ -137,6 +137,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             context = policy.context(protocol) + (signaling.context() if signaling is not None else b"")
             ticket = None
             identity_index = 0
+            retried = False
             pwd = bool({29, 30} & set(ext))
             if pwd:
                 selected_id = next((value for value in cipher_suites if value in hello.cipher_suites and value in SUITES), None)
@@ -212,6 +213,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                     raise ProtocolError("password successor has no compatible traffic group")
                 retry_group = hello.group if use_dhe and not hello.B else 0
                 if retry_group or retry_cookie_policy is not None:
+                    retried = True
                     retry_cookie = (retry_cookie_policy.issue(writer, ch, selected_id, retry_group)
                                     if retry_cookie_policy is not None else b"")
                     hrr = m.server_hello(b"", bytes(32), retry=True, group=retry_group,
@@ -289,7 +291,10 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             await expose_exporter(on_exporter,exporter,exporter_accesses,stage="server-finished",
                 role="server",hash_name=selected.hash_name)
             early_exporter = None
-            if ticket and identity_index == 0:
+            # Match the ordinary API's HRR revocation policy. CH2 identity
+            # zero may have belonged to a later PSK in CH1, so it cannot be
+            # used to create a new early-exporter lineage over initial_ch.
+            if ticket and identity_index == 0 and not retried:
                 early_root = c.extract(bytes(selected.hash_length), ticket.psk, selected.hash_name)
                 early_exporter = schedule.derive_secret(early_root, "e exp master", c.PREFACE + initial_ch)
                 emit_diagnostic(diagnostics,"TLS20_EARLY_EXPORTER_SECRET",hello.random,early_exporter)
@@ -532,6 +537,12 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                             or selected_group and (selected_group not in first.groups or selected_group in first.share_groups)
                             or not selected_group and not cookie):
                         raise ProtocolError("invalid password successor retry", alert=47)
+                    # The API revokes the initial early capability on HRR,
+                    # even when the same successor PSK remains selected.
+                    early_exporter = None
+                    for access in exporter_accesses:
+                        if access.stage == "early":
+                            access.close()
                     transcript.retry(ch, sh, selected.hash_name)
                     kwargs["early_data"] = False
                     kwargs["cookie"] = cookie

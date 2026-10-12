@@ -1425,7 +1425,8 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             if not hello.group and not psk_only:
                 raise ProtocolError("no acceptable PSK-only selection or DHE share")
             retry_group = hello.group if not hello.B and not psk_only else 0
-            if retry_group or retry_cookie_policy is not None:
+            retried = bool(retry_group or retry_cookie_policy is not None)
+            if retried:
                 known_psk_hashes = {}
                 for identity, _, _ in hello.psk_offers:
                     hashes = {value.hash_name for value in provisioned
@@ -1677,7 +1678,10 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             await expose_exporter(on_exporter, exporter, exporter_accesses,
                                   stage="server-finished", role="server", hash_name=schedule.hash_name)
             early_exporter = None
-            if ticket is not None and selected_identity == 0:
+            # The API revokes early-exporter access on HRR, like its client.
+            # CH2 may remove incompatible PSKs: its identity zero must never
+            # be substituted for CH1's early PSK when deriving over CH1.
+            if ticket is not None and selected_identity == 0 and not retried:
                 early_root = c.extract(bytes(selected.hash_length), ticket.psk, schedule.hash_name)
                 early_exporter = schedule.derive_secret(early_root, "e exp master", c.PREFACE + initial_ch)
                 emit_diagnostic(diagnostics, "TLS20_EARLY_EXPORTER_SECRET", hello.random, early_exporter)
@@ -2231,6 +2235,13 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     raise ProtocolError("unoffered HelloRetryRequest group", alert=47)
                 if sid or (group and not force_retry and group == traffic_group) or (not group and not cookie):
                     raise ProtocolError("useless HelloRetryRequest", alert=47)
+                # Connection-scoped API policy, not a prohibition on deriving
+                # early exporters in every protocol that uses HRR. Revoke now,
+                # before an awaited CH2/ServerHello can expose a stale handle.
+                early_exporter = None
+                for access in exporter_accesses:
+                    if access.stage == "early":
+                        access.close()
                 transcript.retry(ch, sh, schedule.hash_name)
                 if group:
                     secrets.close_key(traffic_private)
