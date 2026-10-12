@@ -40,6 +40,10 @@ MAX_HANDSHAKE_RECORDS = 4096
 APPLICATION_PROTOCOL = b"http/1.1"
 
 
+class _WriteStopped(ProtocolError):
+    """A terminal event revoked writes; its owner completes alert/cleanup."""
+
+
 class Transcript:
     def __init__(self):
         self.data = bytearray(c.PREFACE)
@@ -66,6 +70,7 @@ class Wire:
         self.handshake = True
         self.deadline = None
         self.allow_ccs = False
+        self.write_guard = None
 
     def check_deadline(self):
         if self.deadline is not None and asyncio.get_running_loop().time() >= self.deadline:
@@ -119,6 +124,8 @@ class Wire:
         maximum = min(16384, state.record_limit - 1) if state else 16384
         for offset in range(0, len(message), maximum):
             self.check_deadline()
+            if self.write_guard is not None:
+                self.write_guard()
             fragment = message[offset:offset + maximum]
             self.count()
             if state is None:
@@ -277,6 +284,8 @@ class SecureChannel:
         self._active_client_auth = None
         self._seen_auth_contexts = set()
         self._key_update_requested = False
+        self._key_update_response_pending = False
+        self._fatal_alert_done = None
         # Build owned record states last. Either constructor may fail, leaving
         # a partial channel reachable through a retained traceback.
         try:
@@ -289,6 +298,11 @@ class SecureChannel:
             self.auth_share_secret = None
             self.exporter_secret = self.resumption_secret = self.early_exporter_secret = None
             raise
+        self.wire.write_guard = self._check_write_open
+
+    def _check_write_open(self):
+        if self.closed or self.sent_close or self.read_cancelled:
+            raise _WriteStopped("connection is closing")
 
     def _clear_auth(self):
         for access in getattr(self, "_exporter_accesses", ()):
@@ -315,6 +329,7 @@ class SecureChannel:
         An interrupted read retains only the sending state needed to flush an
         authenticated close_notify. Python cannot guarantee physical erasure.
         """
+        self._key_update_response_pending = False
         self._clear_auth()
         self.receiver.close()
         if not keep_sender:
@@ -386,6 +401,8 @@ class SecureChannel:
         self.pending_client_auth[context] = state
         try:
             await self.send_handshake(request)
+        except _WriteStopped:
+            raise
         except BaseException:
             self.abort()
             raise
@@ -436,6 +453,7 @@ class SecureChannel:
             if state["stage"] != "certificate":
                 raise ProtocolError("unexpected client authentication certificate", alert=10)
             state["chain"], state["metadata"] = m.parse_certificate(parsed_body, context=context, allow_empty=True, details=True)
+            _check_credential_extension_offers(state["metadata"], state["offers"])
             state["transcript"].extend(frame)
             self._active_client_auth = state
             if state["chain"]:
@@ -503,9 +521,12 @@ class SecureChannel:
 
     async def _send_heartbeat_locked(self, content):
         # One complete heartbeat per record, never a handshake-type24 frame.
+        self._check_write_open()
+        await self._flush_key_update_response_locked()
         if (self.sender.sequence >= c.MAX_RECORDS - 1
                 or self.sender.content_bytes + len(content) + 5 > c.MAX_CONTENT_BYTES):
             await self._key_update_locked(False)
+        self._check_write_open()
         self.wire.writer.write(self.sender.seal(content, 24))
         await self.wire.writer.drain()
 
@@ -530,6 +551,8 @@ class SecureChannel:
             future.add_done_callback(cancelled)
             try:
                 await self._send_heartbeat_locked(content)
+            except _WriteStopped:
+                raise
             except BaseException:
                 self.abort()
                 raise
@@ -550,10 +573,11 @@ class SecureChannel:
 
     async def send_handshake(self, message):
         async with self.send_lock:
-            if self.closed or self.sent_close or self.read_cancelled:
-                raise ProtocolError("connection is closing")
+            self._check_write_open()
             try:
                 await self.wire.send_frame(message, self.sender)
+            except _WriteStopped:
+                raise
             except BaseException:
                 self.abort()
                 raise
@@ -577,14 +601,32 @@ class SecureChannel:
         # would desynchronize the peer. The caller owns send_lock.
         if self.sender.epoch >= c.MAX_SEND_EPOCH:
             raise ProtocolError("sending key-update epoch exhausted", alert=80)
+        self._check_write_open()
         if request_peer:
             if self._key_update_requested:
                 raise ProtocolError("a peer key update is already pending")
             # drain() can yield to a simultaneous peer response; record the
             # request before yielding so that response can clear it safely.
             self._key_update_requested = True
-        await self.wire.send_frame(m.frame(24, bytes((int(request_peer),))), self.sender)
-        self.sender.update()
+        else:
+            # Commit the response before drain can yield to another request.
+            # A later request then remains pending for a later response.
+            self._key_update_response_pending = False
+        try:
+            await self.wire.send_frame(m.frame(24, bytes((int(request_peer),))), self.sender)
+            self.sender.update()
+        except BaseException:
+            # The peer may already have consumed the KeyUpdate even if our
+            # drain was interrupted. Do not retain an ambiguous sending epoch.
+            self.abort()
+            raise
+
+    async def _flush_key_update_response_locked(self):
+        while self._key_update_response_pending:
+            if self.sender.epoch >= c.MAX_SEND_EPOCH:
+                self._key_update_response_pending = False
+            else:
+                await self._key_update_locked(False)
 
     async def _post_handshake(self, content):
         self.post_handshake.extend(content)
@@ -608,7 +650,13 @@ class SecureChannel:
                 self.receiver.update()
                 self._key_update_requested = False
                 if body == b"\x01" and self.sender.epoch < c.MAX_SEND_EPOCH:
-                    await self.key_update(False)
+                    self._key_update_response_pending = True
+                    # A concurrent upload owns send_lock across drain(). Do
+                    # not stall the receive stream behind it: that writer must
+                    # service this flag before its next application record.
+                    if not self.send_lock.locked():
+                        async with self.send_lock:
+                            await self._flush_key_update_response_locked()
             elif kind in (13, 252):
                 await self._answer_client_auth(frame)
             elif kind in (11, 15, 20, 25):
@@ -693,15 +741,30 @@ class SecureChannel:
                     self._clear_connection_secrets(keep_sender=True)
                 raise
             except ProtocolError as error:
+                # Seal the connection before awaiting its writer. Otherwise an
+                # upload blocked in drain can keep emitting application or
+                # fragmented handshake records after this fatal condition.
+                self.closed = True
+                self._clear_connection_secrets(keep_sender=True)
+                if not isinstance(error, PeerClosed):
+                    self._fatal_alert_done = asyncio.Event()
                 try:
-                    async with self.send_lock:
-                        await self.wire.fatal(error, self.sender)
+                    if isinstance(error, PeerClosed):
+                        self.abort()  # A peer fatal alert needs no response.
+                    else:
+                        async with asyncio.timeout(0.5):
+                            async with self.send_lock:
+                                await self.wire.fatal(error, self.sender)
+                except (OSError, TimeoutError):
+                    self.abort()
                 except BaseException:
                     self.abort()
                     raise
                 finally:
                     self.closed = True
                     self._clear_connection_secrets()
+                    if self._fatal_alert_done is not None:
+                        self._fatal_alert_done.set()
                 raise
             except BaseException:
                 self.abort()
@@ -709,17 +772,23 @@ class SecureChannel:
 
     async def send(self, content):
         async with self.send_lock:
-            if self.closed or self.sent_close or self.read_cancelled:
-                raise ProtocolError("connection is closing")
+            self._check_write_open()
             try:
                 maximum = min(16384, self.sender.record_limit - 1)
                 chunks = (content[i:i + maximum] for i in range(0, len(content), maximum))
                 for chunk in chunks:
+                    self._check_write_open()
+                    await self._flush_key_update_response_locked()
                     if (self.sender.sequence >= c.MAX_RECORDS - 1
                             or self.sender.content_bytes + len(chunk) + 5 > c.MAX_CONTENT_BYTES):
                         await self._key_update_locked(False)
+                    self._check_write_open()
                     self.wire.writer.write(self.sender.seal(chunk, 23))
                     await self.wire.writer.drain()
+            except _WriteStopped:
+                # recv() may still need this sending epoch for a local fatal
+                # alert. Do not abort it merely because its write gate closed.
+                raise
             except BaseException:
                 self.abort()
                 raise
@@ -735,6 +804,16 @@ class SecureChannel:
         except (OSError, ProtocolError, TimeoutError):
             pass
         finally:
+            # A local fatal reader may be waiting for this method's drain/lock.
+            # After releasing it, let that reader emit its alert in the current
+            # epoch before normal close destroys the last sending state.
+            if self._fatal_alert_done is not None and not self._fatal_alert_done.is_set():
+                try:
+                    async with asyncio.timeout(1):
+                        await self._fatal_alert_done.wait()
+                except BaseException:
+                    self.abort()
+                    raise
             # Preserve queued close_notify on the normal path; force-abort only
             # if flushing/closing does not finish within the bounded deadline.
             self.closed = True
@@ -777,7 +856,9 @@ def _record_limit(value):
 
 
 def _peer_record_limit(value, *, server=False):
-    if len(value) != 2 or not 64 <= int.from_bytes(value, "big") <= (65535 if server else 16385):
+    if len(value) != 2:
+        raise ProtocolError("malformed record_size_limit", alert=50)
+    if not 64 <= int.from_bytes(value, "big") <= (65535 if server else 16385):
         raise ProtocolError("invalid record_size_limit", alert=47)
     return min(16385, int.from_bytes(value, "big"))
 
@@ -789,7 +870,9 @@ def _fragment_limit(value):
 
 
 def _peer_fragment_limit(value):
-    if len(value) != 1 or value[0] not in (1, 2, 3, 4):
+    if len(value) != 1:
+        raise ProtocolError("malformed max_fragment_length", alert=50)
+    if value[0] not in (1, 2, 3, 4):
         raise ProtocolError("invalid max_fragment_length", alert=47)
     return _fragment_limit(value[0])
 
@@ -1007,9 +1090,28 @@ def _decode_request(request, *, cache_enabled=False, templates=()):
     return m.parse_certificate_request(body, details=True)
 
 
+def _check_credential_extension_offers(metadata, offers):
+    from .credential_evidence import EvidenceEnvelopeError, check_evidence_envelope
+    # This is a TLS wire rule, independent of credential trust policy. Keep it
+    # at the handshake boundary: exported authenticators use resolve_peer too,
+    # but their application framing must not manufacture a TLS fatal alert.
+    offered = dict(offers)
+    for index, pairs in enumerate(metadata):
+        for kind, value in pairs:
+            if kind not in offered:
+                raise ProtocolError("unsolicited CertificateEntry extension", alert=110)
+            if kind == 34 and index != 0:
+                raise ProtocolError("delegated credential is not on the leaf", alert=47)
+            try:
+                check_evidence_envelope(kind, value)
+            except EvidenceEnvelopeError as exc:
+                raise ProtocolError(str(exc), alert=47 if exc.invalid_value else 50) from exc
+
+
 def _resolve_credential(chain, metadata, *, role, credential_type, policy, offers,
                         negotiated_extensions=(), feature_offers=None):
     offered = dict(offers)
+    _check_credential_extension_offers(metadata, offered)
     if 5 in offered:
         from .status_request import parse_status_request, response_matches_request
         from .credential_evidence import _status_response
@@ -1347,8 +1449,10 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 discarded = 0
                 while True:
                     record = await wire.raw_record()
-                    if record[0] == 20 and record[5:] == b"\x01":
-                        continue
+                    if record[0] == 20:
+                        if record[5:] == b"\x01":
+                            continue
+                        raise ProtocolError("invalid dummy ChangeCipherSpec after retry", alert=10)
                     if record[0] == 21:
                         fragment = record[5:]
                         if len(fragment) != 2:
@@ -1359,8 +1463,10 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                     if record[0] == 22:
                         wire.pending.extend(record[5:]); break
                     discarded += len(record)
-                    if not hello.early_data or record[0] != 23 or discarded > 1048576:
-                        raise ProtocolError("unexpected record after retry")
+                    if not hello.early_data or record[0] != 23:
+                        raise ProtocolError("unexpected record after retry", alert=10)
+                    if discarded > 1048576:
+                        raise ProtocolError("rejected early data discard limit after retry")
                 ch2 = await wire.receive_frame(1, boundary=True)
                 second = m.parse_client_hello(ch2[4:], enabled_groups=enabled_groups, password_authenticated=False)
                 validate_retry_cookie(retry_cookie_policy, dict(second.extension_values), retry_cookie,
@@ -1601,7 +1707,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                             await on_early_data(b"")
                             break
                         if kind != 23:
-                            raise ProtocolError("early epoch carries only application data")
+                            raise ProtocolError("early epoch carries only application data", alert=10)
                         total += len(content)
                         if total > min(max_early_data, ticket.max_early_data):
                             raise ProtocolError("early data limit exceeded")
@@ -1618,7 +1724,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                                 # discard subsequent decryption failures.
                                 break
                             if kind != 22 or not content:
-                                raise ProtocolError("expected authenticated handshake after early data")
+                                raise ProtocolError("expected authenticated handshake after early data", alert=10)
                             wire.pending.extend(content)
                             break
                         discarded += len(record)
@@ -1632,6 +1738,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                 cert = await wire.receive_frame((11, 25), receiver)
                 client_chain, client_metadata = _decode_credential(cert, allow_empty=True,
                                                                   offered_compression=certificate_compression)
+                _check_credential_extension_offers(client_metadata, client_auth_offers)
                 transcript.add(cert)
                 if client_chain:
                     _check_peer_filters(client_chain, client_credential_type, client_auth_offers)
@@ -2146,8 +2253,12 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     raise ProtocolError("cipher suite changed after retry", alert=47)
             selection_extensions = m.server_hello_extensions(sh[4:])
             psk_index = int.from_bytes(selection_extensions[41], "big") if resumed else None
-            if sid or resumed and (psk_index >= len(offered_psks)):
-                raise ProtocolError("unsolicited session selection")
+            if sid:
+                raise ProtocolError("server did not echo the legacy session id", alert=47)
+            if resumed and not offered_psks:
+                raise ProtocolError("unsolicited PSK selection", alert=110)
+            if resumed and psk_index >= len(offered_psks):
+                raise ProtocolError("PSK selection is outside the offered identities", alert=47)
             if resumed:
                 ticket = offered_psks[psk_index]
                 external = ticket if isinstance(ticket, ExternalPSK) else None
@@ -2173,13 +2284,13 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 provisioning_trust = bootstrap_binding.trust_mode == "provisioning-trust"
                 roots_hash = client_ticket_context(bootstrap_binding, protocol)
             if resumed and c.suite(ticket.cipher_suite).hash_name != selected.hash_name:
-                raise ProtocolError("PSK is incompatible with selected hash")
+                raise ProtocolError("PSK is incompatible with selected hash", alert=47)
             if resumed and c.suite(ticket.cipher_suite).confidential != selected.confidential:
                 raise ProtocolError("PSK confidentiality policy cannot change")
             if (not group and (not resumed or 0 not in psk_modes)) or (group and 1 not in psk_modes and resumed):
-                raise ProtocolError("unoffered PSK key exchange mode")
+                raise ProtocolError("unoffered PSK key exchange mode", alert=47)
             if group and group != traffic_group:
-                raise ProtocolError("server selected an unoffered share")
+                raise ProtocolError("server selected an unoffered share", alert=47)
             if c.traffic_auth_component(group, ephemeral_public) and c.traffic_auth_component(group, ephemeral_public) in (
                     auth_public, c.traffic_auth_component(traffic_group, traffic_public)):
                 raise ProtocolError("non-independent key shares")
@@ -2206,9 +2317,10 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             send_limit = _peer_record_limit(selected_extensions[28]) if 28 in selected_extensions else 16385
             receive_limit = local_limit if 28 in selected_extensions else 16385
             if 1 in selected_extensions:
-                if 28 in selected_extensions or selected_extensions[1] != bytes((max_fragment_length,)):
+                fragment_limit = _peer_fragment_limit(selected_extensions[1])
+                if 28 in selected_extensions or max_fragment_length is None or selected_extensions[1] != bytes((max_fragment_length,)):
                     raise ProtocolError("invalid maximum fragment selection", alert=47)
-                send_limit = receive_limit = _peer_fragment_limit(selected_extensions[1])
+                send_limit = receive_limit = fragment_limit
             if receiver.max_opened_plaintext > receive_limit:
                 raise ProtocolError("EncryptedExtensions record exceeds negotiated limit", alert=22)
             sender.record_limit, receiver.record_limit = send_limit, receive_limit
@@ -2222,11 +2334,15 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                         or 1 in cache_selected and resumed and not selected_combined):
                     raise ProtocolError("invalid cached object selection", alert=47)
             certificate_type = selected_extensions.get(20, b"\x00")
-            if len(certificate_type) != 1 or (not resumed or selected_combined) and certificate_type[0] not in server_certificate_types:
+            if len(certificate_type) != 1:
+                raise ProtocolError("malformed server credential type", alert=50)
+            if (not resumed or selected_combined) and certificate_type[0] not in server_certificate_types:
                 raise ProtocolError("unoffered server credential type", alert=47)
             certificate_type = certificate_type[0]
             client_type = selected_extensions.get(19, b"\x00")
-            if len(client_type) != 1 or 19 in selected_extensions and client_type[0] not in offered_client_types:
+            if len(client_type) != 1:
+                raise ProtocolError("malformed client credential type", alert=50)
+            if 19 in selected_extensions and client_type[0] not in offered_client_types:
                 raise ProtocolError("unoffered client credential type", alert=47)
             if resumed and external is None:
                 client_type = bytes((ticket.client_certificate_type,))
@@ -2242,7 +2358,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             if bootstrap_binding is not None:
                 roots_hash = client_ticket_context(bootstrap_binding, protocol)
             if accepted and (not resumed or psk_index != 0 or ticket.cipher_suite != selected_id):
-                raise ProtocolError("early data requires selected PSK")
+                raise ProtocolError("early data requires selected PSK", alert=47)
             transcript.add(ee)
             # Use the final, serialized ClientHello (including HRR changes),
             # not the subset of extras assembled for certificate evidence.
@@ -2280,6 +2396,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     cert = await wire.receive_frame((11, 25, 253), receiver)
                 chain_der, certificate_metadata = _decode_credential(cert, offered_compression=certificate_compression,
                     cached=1 in cache_selected, snapshots=snapshots, credential_type=certificate_type)
+                _check_credential_extension_offers(certificate_metadata, credential_offers)
                 certificate_features = _certificate_feature_state(credential_offers, feature_selections,
                     certificate_message=cert[0], certificate_metadata=certificate_metadata,
                     authenticated_by_mac=True)

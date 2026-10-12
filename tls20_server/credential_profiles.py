@@ -25,6 +25,7 @@ from .pki import (SUPPORTED_CERTIFICATE_ALGORITHMS, _load_pkix_der,
                   certificate_extensions,
                   certificate_public_key, certificate_signature_scheme,
                   find_certificate_issuer,
+                  evidence_for_validated_path,
                   supported_certificate_algorithms, SM2_CERTIFICATE_IDENTIFIER,
                   validate_identity, verify_public_signature)
 
@@ -287,18 +288,7 @@ def resolve_peer(material, credential_type=0, role="server", *, policy,
                 # The validated path can add a DNS-published or local trust
                 # anchor and can reorder supplied intermediates. Preserve each
                 # entry's evidence binding instead of shifting it by position.
-                encoded_path = tuple(cert.public_bytes(serialization.Encoding.DER) for cert in path)
-                if any(values and cert not in encoded_path for cert, values in zip(material, evidence)):
-                    raise ProtocolError("DANE evidence entry is absent from the validated path")
-                by_certificate = {}
-                for certificate, values in zip(material, evidence):
-                    if certificate in by_certificate and by_certificate[certificate] != values:
-                        # A path builder may accept repeated certificates. A
-                        # later copy must not erase or replace evidence that
-                        # was supplied (and must be checked) on the first one.
-                        raise ProtocolError("ambiguous duplicate DANE certificate evidence")
-                    by_certificate[certificate] = values
-                path_evidence = tuple(by_certificate.get(cert, ()) for cert in encoded_path)
+                path_evidence = evidence_for_validated_path(material, evidence, path)
             # In particular DANE-EE authenticates the endpoint, not arbitrary
             # issuer certificates appended by its peer. OCSP/CT policy must not
             # accept an attacker-selected issuer key merely because it occupies

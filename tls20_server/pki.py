@@ -459,6 +459,33 @@ def validate_pkix_path(chain_der, trust_roots, *, now=None, partial_chain=False,
         raise ProtocolError("PKIX certificate path validation failed") from exc
 
 
+def evidence_for_validated_path(chain_der, evidence, path):
+    """Keep CertificateEntry metadata attached to its exact original DER.
+
+    Path building can reorder entries, omit unrelated material or add locally
+    trusted issuers. None of those operations can move a staple to a different
+    certificate, silently discard supplied evidence, or synthesize new evidence.
+    """
+    if not evidence:
+        return ()
+    material, evidence = tuple(chain_der), tuple(evidence)
+    if len(evidence) > len(material):
+        raise ProtocolError("certificate evidence count exceeds supplied material")
+    evidence += ((),) * (len(material) - len(evidence))
+    encoded_path = tuple(cert.public_bytes(serialization.Encoding.DER) for cert in path)
+    if not material or not encoded_path or encoded_path[0] != material[0]:
+        raise ProtocolError("certificate evidence path does not retain the endpoint")
+    by_certificate = {}
+    for certificate, values in zip(material, evidence):
+        values = tuple(values.items()) if isinstance(values, dict) else tuple(values)
+        if values and certificate not in encoded_path:
+            raise ProtocolError("certificate evidence entry is absent from the validated path")
+        if certificate in by_certificate and by_certificate[certificate] != values:
+            raise ProtocolError("ambiguous duplicate certificate evidence")
+        by_certificate[certificate] = values
+    return tuple(by_certificate.get(cert, ()) for cert in encoded_path)
+
+
 def validate_identity(chain_der, *, trust_roots, role, name=None,
                       offered_certificate_algorithms=SUPPORTED_CERTIFICATE_ALGORITHMS,
                       revocation_policy="offline", evidence_validator=None,
@@ -539,7 +566,8 @@ def validate_identity(chain_der, *, trust_roots, role, name=None,
         except ValueError as exc:
             raise ProtocolError("invalid X25519 identity key") from exc
     if evidence_validator is not None:
-        if evidence_validator(path, role, evidence, moment) is not True:
+        path_evidence = evidence_for_validated_path(chain_der, evidence, path)
+        if evidence_validator(path, role, path_evidence, moment) is not True:
             raise ProtocolError("credential evidence was not authorized")
     elif revocation_policy == "require-evidence":
         raise ProtocolError("required credential evidence validator is unavailable")

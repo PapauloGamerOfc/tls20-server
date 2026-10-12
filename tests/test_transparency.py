@@ -162,6 +162,25 @@ class TransparencyTests(unittest.TestCase):
                     policy((self.cert,self.root),'server',(((feature,b'\0\0'),),),moment)
                 self.assertTrue(policy((self.cert,self.root),'server',(((feature,good),),),moment))
 
+    def test_empty_ct_v2_response_is_not_an_empty_embedded_list_or_log_vote(self):
+        moment = datetime.fromtimestamp(self.now / 1000, timezone.utc)
+        policy = CredentialEvidencePolicy(trusted_logs_v2={self.log_v2.log_id:self.log_v2},
+                                          offered_extensions=(5,52))
+        # RFC9162 section6.5 permits an empty TLS response, not an encoded
+        # TransItemList nor the OCTET STRING list carrier of section7.1.
+        self.assertTrue(policy((self.cert,self.root), 'server', (((52,b''),),), moment))
+        with patch('tls20_server.credential_evidence.embedded_transparency', return_value={52:b''}):
+            with self.assertRaises(ProtocolError):
+                policy((self.cert,self.root), 'server', (), moment)
+        from dataclasses import replace
+        with self.assertRaises(ProtocolError):
+            replace(policy, minimum_ct_v2_logs=1)((self.cert,self.root), 'server', (((52,b''),),), moment)
+        self.cert = issue(x25519.X25519PrivateKey.generate(), self.ca_key,
+            self.root.subject, self.root.subject, extra=[(x509.UnrecognizedExtension(
+                x509.ObjectIdentifier('1.3.6.1.5.5.7.1.24'), b'\x30\x03\x02\x01\x34'), False)])
+        with self.assertRaisesRegex(ProtocolError, 'no verified log evidence'):
+            policy((self.cert,self.root), 'server', (((52,b''),),), moment)
+
 
 if __name__ == '__main__':
     unittest.main()

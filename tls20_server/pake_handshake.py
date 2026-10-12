@@ -67,8 +67,10 @@ async def _next_after_retry(wire, early):
     discarded = 0
     while True:
         record = await wire.raw_record()
-        if record[0] == 20 and record[5:] == b"\x01":
-            continue
+        if record[0] == 20:
+            if record[5:] == b"\x01":
+                continue
+            raise ProtocolError("invalid dummy ChangeCipherSpec after PWD retry", alert=10)
         if record[0] == 21:
             wire.process_alert(record[5:])
             continue
@@ -76,8 +78,10 @@ async def _next_after_retry(wire, early):
             wire.pending.extend(record[5:])
             return await wire.receive_frame(1, boundary=True)
         discarded += len(record)
-        if not early or record[0] != 23 or discarded > 1048576:
-            raise ProtocolError("unexpected record after PWD retry")
+        if not early or record[0] != 23:
+            raise ProtocolError("unexpected record after PWD retry", alert=10)
+        if discarded > 1048576:
+            raise ProtocolError("rejected early data discard limit after PWD retry")
 
 
 def _log(diagnostics, random, client, server, *, application=False):
@@ -173,7 +177,11 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                 if retry:
                     retry_cookie = (retry_cookie_policy.issue(writer, ch, selected_id, group)
                                     if retry_cookie_policy is not None else b"")
-                    hrr = m.server_hello(b"", bytes(32), retry=True, group=group,
+                    # RFC8492 salt recomputes the existing commitment. It
+                    # does not require selecting that same group again.
+                    retry_group = (0 if account.salt is not None and hello.B
+                                   and hello.share_groups == (group,) else group)
+                    hrr = m.server_hello(b"", bytes(32), retry=True, group=retry_group,
                         cipher_suite=selected_id, session_id=hello.session_id, password_salt=account.salt,
                         cookie=retry_cookie)
                     await wire.send_frame(hrr)
@@ -306,8 +314,10 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                             wire.pending.extend(content)
                             eoed = await wire.receive_frame(5, early_receiver, boundary=True)
                             transcript.add(eoed);await on_early_data(b"");break
+                        if kind != 23:
+                            raise ProtocolError("unexpected password session early record type", alert=10)
                         total += len(content)
-                        if kind != 23 or total > min(max_early_data, ticket.max_early_data):
+                        if total > min(max_early_data, ticket.max_early_data):
                             raise ProtocolError("invalid password session early data")
                         if content:
                             await on_early_data(content)
@@ -319,7 +329,7 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                                 wire.process_alert(content)
                                 break  # Handshake epoch authenticated; no more early-data discard.
                             if kind != 22:
-                                raise ProtocolError("unexpected post-early epoch")
+                                raise ProtocolError("unexpected post-early epoch", alert=10)
                             wire.pending.extend(content);break
                         discarded += len(record)
                         if discarded > 1048576:
@@ -487,9 +497,15 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                 raise ProtocolError("invalid password handshake selection", alert=47)
             selected,schedule=c.suite(selected_id),c.KeySchedule(c.suite(selected_id).hash_name)
             if not ticket:
+                extensions=m.server_hello_extensions(sh[4:])
+                if retry and not selected_group and 31 in extensions:
+                    # A salt-only retry retains the proactive group's choice.
+                    # Empty/mixed offers still need an explicit selected group.
+                    initial = m.parse_client_hello(ch[4:])
+                    if initial.B and len(initial.share_groups) == 1:
+                        selected_group = initial.share_groups[0]
                 if not retry or resumed or selected_group not in groups or selected_id not in SUITES:
                     raise ProtocolError("empty password share requires negotiated retry", alert=47)
-                extensions=m.server_hello_extensions(sh[4:])
                 salt=extensions[31][2:] if 31 in extensions else None
                 base=password_base(credential.username,credential.password,salt)
                 state, public = await _native_work(lambda: _client_commit(credential.provider, base,
@@ -536,8 +552,10 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                         raise ProtocolError("second HelloRetryRequest", alert=10)
                     if sid or cookie or final_suite != selected_id:
                         raise ProtocolError("inconsistent password successor retry", alert=47)
-                if retry or not resumed or selected_group!=group or int.from_bytes(m.server_hello_extensions(sh[4:]).get(41,b""),"big")!=0:
+                if not resumed:
                     raise ProtocolError("password successor ticket was not selected; fresh connection required")
+                if selected_group != group or int.from_bytes(m.server_hello_extensions(sh[4:])[41], "big") != 0:
+                    raise ProtocolError("inconsistent password successor PSK or key share", alert=47)
                 shared=c.traffic_dh(ordinary_private,group,public_peer)
             transcript.add(ch);transcript.add(sh)
             root=c.handshake_secret(shared,ticket.psk if ticket else None,selected.hash_name)

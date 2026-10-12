@@ -19,9 +19,49 @@ from .transparency import (CT_V2_OID, SCT_V1_OID, embedded_transparency,
                            validate_ct_v2_list, validate_sct_v1_list, _items, _vec)
 
 
+class EvidenceEnvelopeError(ValueError):
+    """Syntax error without imposing a TLS alert on application protocols."""
+
+    def __init__(self, message, *, invalid_value=False):
+        super().__init__(message)
+        self.invalid_value = invalid_value
+
+
+def check_evidence_envelope(kind, value):
+    """Check CertificateEntry framing independently of optional trust policy.
+
+    Unknown, well-framed SCT/TransItem versions remain policy input, not proof
+    of a log vote. RFC 9162 section 6.5 permits an empty TLS response; a present
+    TransItemList still has the nonempty vector framing of section 6.3.
+    """
+    if kind == 5:
+        if not value:
+            raise EvidenceEnvelopeError("missing CertificateStatus type")
+        if value[0] != 1:
+            raise EvidenceEnvelopeError("unsupported CertificateStatus type", invalid_value=True)
+        if len(value) < 5 or int.from_bytes(value[1:4], "big") != len(value) - 4:
+            raise EvidenceEnvelopeError("malformed CertificateStatus response vector")
+    elif kind in (18, 52):
+        if kind == 52 and not value:
+            return  # Empty transparency_info response, not an encoded list.
+        if len(value) < 2 or int.from_bytes(value[:2], "big") != len(value) - 2 or len(value) == 2:
+            raise EvidenceEnvelopeError("malformed or empty transparency list")
+        position = 2
+        while position < len(value):
+            if position + 2 > len(value):
+                raise EvidenceEnvelopeError("truncated transparency item length")
+            size = int.from_bytes(value[position:position + 2], "big")
+            position += 2
+            if size < (2 if kind == 52 else 1) or size > len(value) - position:
+                raise EvidenceEnvelopeError("malformed transparency item vector")
+            position += size
+
+
 def _status_response(value):
-    if len(value) < 4 or value[0] != 1 or int.from_bytes(value[1:4], 'big') != len(value) - 4:
-        raise ProtocolError("malformed TLS certificate status response")
+    try:
+        check_evidence_envelope(5, value)
+    except EvidenceEnvelopeError as exc:
+        raise ProtocolError(str(exc)) from exc
     return value[4:]
 
 
@@ -142,7 +182,7 @@ class CredentialEvidencePolicy:
                         if source is leaf:
                             tls_v1.update(item.log_id for item in result)
                         break
-            if 52 in source and self.trusted_logs_v2:
+            if 52 in source and self.trusted_logs_v2 and not (source is leaf and not source[52]):
                 if len(encoded) < 2:
                     raise ProtocolError("CT v2 requires the validated certificate issuer")
                 result = validate_ct_v2_list(source[52], encoded[0], encoded[1], self.trusted_logs_v2,

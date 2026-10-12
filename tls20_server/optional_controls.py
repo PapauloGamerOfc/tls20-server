@@ -15,6 +15,8 @@ from .errors import ProtocolError
 
 
 def heartbeat_mode(encoded):
+    if len(encoded) != 1:
+        raise ProtocolError("malformed heartbeat mode", alert=50)
     if encoded not in (b"\x01", b"\x02"):
         raise ProtocolError("invalid heartbeat mode", alert=47)
     return encoded[0]

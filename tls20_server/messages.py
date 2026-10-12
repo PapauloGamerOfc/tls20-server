@@ -442,11 +442,15 @@ def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticat
         offers = [(value, obfuscated, proof) for (value, obfuscated), proof in zip(identities, binders)]
         identity, age, binder = offers[0]
         binder_size = 2 + len(bs.data)
-    if 42 in ext and (ext[42] or not identity):
+    if 42 in ext and ext[42]:
+        raise ProtocolError("malformed early_data offer", alert=50)
+    if 42 in ext and not identity:
         raise ProtocolError("invalid early_data offer", alert=47)
     if (not identity or 0 not in modes) and (10 not in ext or 51 not in ext):
         raise ProtocolError("DHE requires supported_groups and key_share", alert=109)
-    if 33 in ext and (ext[33] or not identity or 1 not in modes or 42 in ext):
+    if 33 in ext and ext[33]:
+        raise ProtocolError("malformed combined PSK offer", alert=50)
+    if 33 in ext and (not identity or 1 not in modes or 42 in ext):
         raise ProtocolError("invalid combined PSK offer", alert=47)
     return ClientHello(name, protocol, A, B, random, sid, cert_algs,
                        identity, age, binder, 42 in ext, tuple(ext), group, groups,
@@ -466,7 +470,7 @@ def server_hello(E: bytes, random: bytes, *, session_id: bytes = b"", resumed: b
     ext = extension(43, VERSION)
     if group:
         ext += extension(51, group.to_bytes(2, "big") + (b"" if retry else _vec(E, 2)))
-    elif E or (retry and not cookie) or (not retry and not resumed):
+    elif E or (retry and not cookie and not (pwd and password_salt is not None)) or (not retry and not resumed):
         raise ProtocolError("absent key share requires PSK-only selection")
     if cookie:
         if not retry:
@@ -498,7 +502,9 @@ def parse_server_hello(body: bytes, *, details: bool = False, with_suite: bool =
         raise ProtocolError("second HelloRetryRequest", alert=10)
     sid = r.vector(1)
     cipher_suite = int.from_bytes(r.take(2), "big")
-    if len(sid) > 32 or cipher_suite not in c.CIPHER_SUITES or r.take(1) != b"\x00":
+    if len(sid) > 32:
+        raise ProtocolError("legacy session id echo length", alert=50)
+    if cipher_suite not in c.CIPHER_SUITES or r.take(1) != b"\x00":
         raise ProtocolError("invalid ServerHello", alert=47)
     ext = extensions(r.vector(2)); r.end()
     retry = random == HRR_RANDOM
@@ -519,16 +525,22 @@ def parse_server_hello(body: bytes, *, details: bool = False, with_suite: bool =
         valid_share = pwd_share_valid(group, E) if pwd else len(E) == c.SERVER_GROUP_LENGTHS.get(group)
         if group not in c.GROUP_LENGTHS or not retry and not valid_share:
             raise ProtocolError("invalid server traffic share", alert=47)
-    elif (retry and 44 not in ext) or (not retry and 41 not in ext):
-        raise ProtocolError("missing server traffic share or useful retry", alert=109)
+    elif retry and 44 not in ext and not (pwd and 31 in ext):
+        raise ProtocolError("HelloRetryRequest cannot change ClientHello", alert=47)
+    elif not retry and 41 not in ext:
+        raise ProtocolError("missing server traffic share", alert=109)
     if 41 in ext and len(ext[41]) != 2:
         raise ProtocolError("invalid PSK selected identity", alert=50)
-    if 33 in ext and (ext[33] or 41 not in ext or not group):
+    if 33 in ext and ext[33]:
+        raise ProtocolError("malformed combined PSK selection", alert=50)
+    if 33 in ext and (41 not in ext or not group):
         raise ProtocolError("invalid combined PSK selection", alert=47)
     if pwd and (41 in ext or 33 in ext):
         raise ProtocolError("fresh PWD cannot select a PSK", alert=47)
-    if 31 in ext and (len(ext[31]) != 34 or ext[31][:2] != b"\x00\x20"):
-        raise ProtocolError("invalid PWD salt", alert=50)
+    if 31 in ext:
+        salt_reader = _Reader(ext[31]); salt = salt_reader.vector(2); salt_reader.end()
+        if len(salt) != 32:
+            raise ProtocolError("invalid PWD salt length", alert=47)
     cookie = b""
     if 44 in ext:
         cr = _Reader(ext[44]); cookie = cr.vector(2); cr.end()

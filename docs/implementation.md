@@ -422,6 +422,52 @@ and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
 
+### Duplex control ordering and CertificateEntry path binding: 2026-10-12
+
+A requested KeyUpdate is serviced before the next application record even when
+an upload is paused in transport backpressure. Fatal input revokes subsequent
+writes immediately, without waiting for the send lock. A locally generated fatal
+alert retains only the sending epoch needed for its bounded delivery; a received
+fatal alert does not cause a response loop. If a KeyUpdate was already emitted,
+the alert uses the new sending epoch. Cancellation and actual transport failures
+still abort ambiguous record states; a peer's clean half-close still allows the
+independent send direction to finish.
+
+Event-gated duplex regressions exercise both roles, queued writers, repeated
+updates, fatal errors during application/handshake/update/close writes and
+cleanup. Retry regressions cover valid dummy CCS, malformed CCS and other
+unexpected record types with ordinary and password handshakes, including accepted
+and rejected early data. Protocol errors remain distinct from local byte budgets.
+
+CertificateEntry evidence is matched by the exact original certificate DER when
+the PKIX validator reorders intermediates or adds a local trust anchor. A staple
+cannot shift to a different certificate because its position in the validated
+path changed. Full, resumed, early-data and cached/compressed handshakes exercise
+this binding, including misplaced, revoked and incorrectly signed evidence.
+Unused extra certificates without evidence remain subject to ordinary path
+building; supplied evidence is never silently moved or discarded.
+
+TLS response extensions are checked against the actual handshake offer before
+credential policy evaluation, including initial and post-handshake client
+authentication and cached/compressed Certificate messages. Unsolicited
+CertificateEntry extensions produce `unsupported_extension`; malformed fixed
+width control fields and OCSP/SCT vectors produce `decode_error`, while validly
+encoded unsupported scalar values remain `illegal_parameter`. Optional CT policy
+may ignore an unknown SCT version, but cannot turn an empty or truncated SCT list
+into a valid extension. Shared envelope checks also reject malformed evidence in
+exported authenticators at the application layer: only that request context is
+consumed, its private verifier reference is released, and TLS traffic and other
+requests remain usable. CT v2 permits an empty `transparency_info` response body
+(RFC 9162 section 6.5), not a present but empty/truncated `TransItemList` vector.
+The empty response supplies no log vote or mandatory TLS Feature evidence; its
+exception does not extend to embedded certificate or OCSP list carriers.
+
+Password retries may carry only a salt after a proactive ClientHello with one
+password key share: the group remains unchanged and the commitment is recomputed.
+Empty or mixed initial offers still require an explicit group selection. The
+browser uses that latter mode; both paths distinguish malformed salt vectors from
+well-formed salts of an invalid length.
+
 ### Authenticator teardown and DANE/OCSP policy: 2026-10-12
 
 Regressions cover immediate capability/connection cleanup during stalled or

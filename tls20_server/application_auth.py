@@ -239,12 +239,19 @@ def _parse_certificate(body):
 
 
 def _check_certificate_extensions(identity, offered):
+    from .credential_evidence import EvidenceEnvelopeError, check_evidence_envelope
     # EA always carries X.509 Certificate entries. It does not inherit an RPK
     # representation from the original handshake and never echoes request ff04.
     for index, entries in enumerate(identity.extensions):
-        for kind, _value in entries:
+        for kind, value in entries:
             if kind not in offered or kind not in (5, 18, 34, 52, 59) or (kind == 34 and index):
                 raise ProtocolError("unsolicited or misplaced authenticator certificate extension")
+            try:
+                check_evidence_envelope(kind, value)
+            except EvidenceEnvelopeError as exc:
+                # Authenticator failure consumes its context, not the TLS
+                # connection. No wire-alert semantics belong in this API.
+                raise ProtocolError(str(exc)) from exc
 
 
 def _check_certificate_filters(identity, offered):
