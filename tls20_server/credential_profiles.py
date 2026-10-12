@@ -24,6 +24,7 @@ from .errors import ProtocolError
 from .pki import (SUPPORTED_CERTIFICATE_ALGORITHMS, _load_pkix_der,
                   certificate_extensions,
                   certificate_public_key, certificate_signature_scheme,
+                  find_certificate_issuer,
                   supported_certificate_algorithms, SM2_CERTIFICATE_IDENTIFIER,
                   validate_identity, verify_public_signature)
 
@@ -208,6 +209,9 @@ def resolve_peer(material, credential_type=0, role="server", *, policy,
     if not material or len(material) > 64 or sum(len(x) for x in material) > 262144:
         raise ProtocolError("credential material exceeds local budget")
     evidence = _entry_metadata(material, entry_extensions, offered_extensions, delegated_schemes)
+    if credential_type == 0 and (not certificate_algorithms or any(value in (
+            0xfe00, 0xfe01, 0x0420, 0x0520, 0x0620) for value in certificate_algorithms)):
+        raise ProtocolError("invalid certificate signature offer")
     identity = policy.peer_name or ""
     dane_usage, dane_expiry = None, None
     dane_path = ()
@@ -215,8 +219,29 @@ def resolve_peer(material, credential_type=0, role="server", *, policy,
         from .dnssec_credentials import DANEPolicy
         if role != "server" or not isinstance(policy.dane_policy, DANEPolicy):
             raise ProtocolError("DNSSEC credential binding requires an explicit server DANE policy")
+        def path_constraints(path, anchor):
+            # Check actual path signatures, not the provider's global supported
+            # list or the independent delegated-grant offer. Do this before a
+            # TLSA candidate is selected so another authorized path can succeed.
+            if path:
+                pairs = zip(path, path[1:])  # The trust anchor's signature is exempt.
+            else:
+                # Legacy boolean callbacks expose no path. Conservatively check
+                # supplied certificates against cryptographically matching known
+                # issuers, exempting only the exact authenticated DANE anchor.
+                certificates = tuple(_load_pkix_der(value) for value in material)
+                encoded_anchor = anchor.public_bytes(serialization.Encoding.DER)
+                issuers = tuple(dict.fromkeys((*material, encoded_anchor)))
+                pairs = ((cert, find_certificate_issuer(cert, issuers,
+                    signature_provider=policy.signature_provider)) for cert in certificates
+                    if cert.public_bytes(serialization.Encoding.DER) != encoded_anchor)
+            for cert, issuer in pairs:
+                if issuer is None or certificate_signature_scheme(cert, issuer) not in certificate_algorithms:
+                    raise ProtocolError("certificate signature was not offered")
+            return True
         authorization = policy.dane_policy.authorize(material, credential_type,
-            identity, evidence, now=policy.now, return_authorization=True)
+            identity, evidence, now=policy.now, return_authorization=True,
+            path_constraints=path_constraints if credential_type == 0 else None)
         dane_usage, dane_expiry = authorization.usage, authorization.expires_at
         dane_path = authorization.validated_path
     if credential_type == 2:
@@ -337,13 +362,25 @@ def validate_ocsp_response(response_der, certificate, issuer, *, now=None,
         for extension in response.extensions:
             if extension.critical and not isinstance(extension.value, x509.OCSPNonce):
                 raise ProtocolError("unrecognized critical OCSP response extension")
-        candidates = [issuer, *response.certificates]
-        signer = None
-        for candidate in candidates:
-            # The responderKeyHash is SHA-1 over subjectPublicKey bits.
-            key_hash = x509.SubjectKeyIdentifier.from_public_key(candidate.public_key()).digest
-            if ((response.responder_name is not None and response.responder_name == candidate.subject)
-                    or (response.responder_key_hash is not None and hmac.compare_digest(response.responder_key_hash, key_hash))):
+        algorithm = response.signature_hash_algorithm
+        if algorithm is not None and algorithm.name not in ("sha256", "sha384", "sha512"):
+            raise ProtocolError("OCSP signature is disallowed by local algorithm policy")
+        for candidate in [issuer, *response.certificates]:
+            # ResponderID locates candidates, not a unique authorized signer:
+            # key rollover can produce several certificates with the same DN.
+            # Do not commit to a candidate until its signature also verifies.
+            try:
+                signer = candidate.public_key()
+                if response.responder_name is not None:
+                    if response.responder_name != candidate.subject:
+                        continue
+                elif response.responder_key_hash is not None:
+                    # The responderKeyHash is SHA-1 over subjectPublicKey bits.
+                    key_hash = x509.SubjectKeyIdentifier.from_public_key(signer).digest
+                    if not hmac.compare_digest(response.responder_key_hash, key_hash):
+                        continue
+                else:
+                    continue
                 if candidate.public_bytes(serialization.Encoding.DER) != issuer.public_bytes(serialization.Encoding.DER):
                     candidate.verify_directly_issued_by(issuer)
                     for extension in certificate_extensions(candidate):
@@ -360,22 +397,24 @@ def validate_ocsp_response(response_der, certificate, issuer, *, now=None,
                             continue
                     except x509.ExtensionNotFound:
                         pass
-                signer = candidate.public_key()
+                if isinstance(signer, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+                    signer.verify(response.signature, response.tbs_response_bytes)
+                elif isinstance(signer, ec.EllipticCurvePublicKey):
+                    signer.verify(response.signature, response.tbs_response_bytes, ec.ECDSA(algorithm))
+                elif isinstance(signer, rsa.RSAPublicKey) and response.signature_algorithm_oid.dotted_string in (
+                        "1.2.840.113549.1.1.11", "1.2.840.113549.1.1.12", "1.2.840.113549.1.1.13"):
+                    signer.verify(response.signature, response.tbs_response_bytes, padding.PKCS1v15(), algorithm)
+                else:
+                    continue
+            except (ValueError, TypeError, InvalidSignature, UnsupportedAlgorithm,
+                    x509.ExtensionNotFound, x509.DuplicateExtension):
+                # Invalid/unauthorized auxiliary certificates must not mask a
+                # later valid signer. No candidate can bypass these checks.
+                continue
+            else:
                 break
-        if signer is None:
-            raise ProtocolError("OCSP responder is not authorized")
-        algorithm = response.signature_hash_algorithm
-        if algorithm is not None and algorithm.name not in ("sha256", "sha384", "sha512"):
-            raise ProtocolError("OCSP signature is disallowed by local algorithm policy")
-        if isinstance(signer, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
-            signer.verify(response.signature, response.tbs_response_bytes)
-        elif isinstance(signer, ec.EllipticCurvePublicKey):
-            signer.verify(response.signature, response.tbs_response_bytes, ec.ECDSA(algorithm))
-        elif isinstance(signer, rsa.RSAPublicKey) and response.signature_algorithm_oid.dotted_string in (
-                "1.2.840.113549.1.1.11", "1.2.840.113549.1.1.12", "1.2.840.113549.1.1.13"):
-            signer.verify(response.signature, response.tbs_response_bytes, padding.PKCS1v15(), algorithm)
         else:
-            raise ProtocolError("unsupported OCSP signature algorithm")
+            raise ProtocolError("OCSP response validation failed: no authorized responder signature")
         _check_ocsp_single_extensions(response.tbs_response_bytes)
         if expected_nonce is not None:
             nonce = response.extensions.get_extension_for_class(x509.OCSPNonce).value.nonce

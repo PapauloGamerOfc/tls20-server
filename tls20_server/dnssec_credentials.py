@@ -433,7 +433,7 @@ class DNSSECChain:
 
 def match_tlsa(result, material, *, credential_type=0, pkix_validator=None,
                dane_path_validator=None, now=None, return_usage=False,
-               return_authorization=False):
+               return_authorization=False, path_constraints=None):
     """Apply usage/selector/matching; callers still verify online MAC/Finished.
 
     pkix_validator(material) must validate path AND service identity and return
@@ -442,6 +442,10 @@ def match_tlsa(result, material, *, credential_type=0, pkix_validator=None,
     returns its actual validated path (leaf first). A legacy True response
     still authorizes usage 2 but supplies no path for evidence validation.
     Absence of either callback does not turn usage 0/1/2 into an EE key pin.
+    Optional path_constraints(path, anchor) applies current protocol policy to
+    each validated candidate before selection. A legacy True callback supplies
+    an empty path and its authenticated anchor, not a fabricated issuer path.
+    DANE-EE does not validate a certificate signature path and skips this gate.
     """
     if not isinstance(result, ValidatedTLSA) or (time.time() if now is None else now) > result.expires_at:
         raise ProtocolError("DNSSEC service evidence is missing or expired")
@@ -459,6 +463,8 @@ def match_tlsa(result, material, *, credential_type=0, pkix_validator=None,
         path = tuple(value)
         if not path or path[0].public_bytes(serialization.Encoding.DER) != material[0]:
             raise ProtocolError("DANE validator returned a path for a different credential")
+        if path_constraints is not None and path_constraints(path, path[-1]) is not True:
+            raise ProtocolError("DANE path does not satisfy current protocol policy")
         return path
     def matches(record, value, certificate=None):
         if record.selector == 1:
@@ -498,6 +504,8 @@ def match_tlsa(result, material, *, credential_type=0, pkix_validator=None,
                     try:
                         path = dane_path_validator(material, cert)
                         if path is True:
+                            if path_constraints is not None and path_constraints((), cert) is not True:
+                                raise ProtocolError("DANE path does not satisfy current protocol policy")
                             return authorized(2)
                         if path is not False and path is not None:
                             return authorized(2, validated_path(path))
@@ -518,7 +526,7 @@ class DANEPolicy:
     limits: DNSSECLimits = DNSSECLimits()
 
     def authorize(self, material, credential_type, service_name, evidence, *, now=None,
-                  return_authorization=False):
+                  return_authorization=False, path_constraints=None):
         if not evidence or len(evidence) != len(material):
             raise ProtocolError("DANE policy requires current leaf DNSSEC evidence")
         leaf = dict(evidence[0])
@@ -532,5 +540,5 @@ class DANEPolicy:
             raise ProtocolError("DANE policy does not permit authenticated absence")
         authorization = match_tlsa(result, material, credential_type=credential_type,
             pkix_validator=self.pkix_validator, dane_path_validator=self.dane_path_validator,
-            now=moment, return_authorization=True)
+            now=moment, return_authorization=True, path_constraints=path_constraints)
         return authorization if return_authorization else (authorization.usage, authorization.expires_at)

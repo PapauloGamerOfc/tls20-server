@@ -166,11 +166,18 @@ class AuthenticatorFeatureLifecycleTests(unittest.IsolatedAsyncioTestCase):
         wire = prover.authenticate(credentials, request=first)
         entered = asyncio.Event()
         marker = object()
+        callback_cancelled = asyncio.Event()
+        callback_errors = []
 
         async def wait_for_policy(*args):
             application_owned = marker
             entered.set()
-            await asyncio.Future()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError as error:
+                callback_errors.append(error)
+                callback_cancelled.set()
+                raise
             return application_owned
 
         task = asyncio.create_task(verifier.validate(wire, wait_for_policy))
@@ -184,13 +191,261 @@ class AuthenticatorFeatureLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(caught)
         self.assertEqual(protocol_locals(caught), [])
         self.assertEqual(len(verifier._pending), 1)
-        trace = caught.__traceback__
+        # Policy cancellation is deliberately separated from the caller's
+        # cancellation so a non-cooperative policy cannot retain our secrets.
+        await asyncio.wait_for(callback_cancelled.wait(), 1)
+        trace = callback_errors[0].__traceback__
         while trace and trace.tb_frame.f_code.co_name != "wait_for_policy":
             trace = trace.tb_next
         self.assertIsNotNone(trace)
         self.assertIs(trace.tb_frame.f_locals["application_owned"], marker)
         wire = prover.authenticate(credentials, request=second)
         self.assertTrue((await verifier.validate(wire, validator)).authenticated)
+
+    def live_pair(self, role="server"):
+        from tls20_server.handshake import SecureChannel, Wire
+        from tests.test_robustness import MemoryWriter
+        verifier, prover, credentials, validator = self.setup_pair(role)
+        for manager in (verifier, prover):
+            old = manager.channel
+            channel = SecureChannel(Wire(asyncio.StreamReader(), MemoryWriter()), bytes(32), bytes(32),
+                exporter_secret=bytes(range(32)), role=old.role, enable_authenticators=True,
+                auth_share_secret=old.auth_share_secret, peer_auth_share=old.peer_auth_share,
+                local_capabilities=old.local_capabilities, peer_capabilities=old.peer_capabilities)
+            channel._authenticators = manager
+            manager.channel = channel
+            self.addCleanup(channel.abort)
+        return verifier, prover, credentials, validator
+
+    async def test_manager_close_releases_spontaneous_share_not_traffic_or_other_capabilities(self):
+        verifier, prover, credentials, validator = self.live_pair()
+        other, other_prover, other_credential, other_validator = self.live_pair()
+        request = verifier.request()
+        expected = verifier.channel.exporter("still available")
+        verifier.close()
+        verifier.close()  # Idempotent capability closure.
+        self.assertIsNone(verifier.channel.auth_share_secret)
+        self.assertFalse(verifier._pending)
+        self.assertFalse(verifier.channel.closed)
+        self.assertEqual(verifier.channel.exporter("still available"), expected)
+        await verifier.channel.send(b"ordinary application data")
+        self.assertTrue(verifier.channel.wire.writer.data)
+        with self.assertRaisesRegex(ProtocolError, "open connection"):
+            verifier.request()
+        self.assertIsNotNone(other.channel.auth_share_secret)
+        response = other_prover.authenticate(other_credential)
+        self.assertTrue((await other.validate(response, other_validator)).authenticated)
+        self.assertIsNotNone(credentials.private_key)  # Shared credentials are not destroyed.
+
+    async def test_closed_capability_revokes_inflight_keys_without_waiting_for_policy(self):
+        for role in ("server", "client"):
+            for ending in ("manager", "abort", "close", "peer_close"):
+                with self.subTest(role=role, ending=ending):
+                    verifier, prover, credentials, validator = self.live_pair(role)
+                    request = verifier.request()
+                    response = prover.authenticate(credentials, request=request)
+                    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                    callbacks = []
+
+                    async def stubborn(identity, parsed):
+                        callbacks.append(asyncio.current_task())
+                        entered.set()
+                        try:
+                            await asyncio.Future()
+                        except asyncio.CancelledError:
+                            cancelled.set()
+                            await release.wait()  # Deliberately ignore/delay cancellation.
+                        return await validator(identity, parsed)
+
+                    with patch.object(verifier, "_keys", wraps=verifier._keys) as derive:
+                        task = asyncio.create_task(verifier.validate(response, stubborn))
+                        try:
+                            await asyncio.wait_for(entered.wait(), 1)
+                            state = next(iter(verifier._inflight.values()))
+                            self.assertIsNotNone(state.private)
+                            derive.assert_not_called()
+                            if ending == "manager":
+                                verifier.close()
+                            elif ending == "abort":
+                                verifier.channel.abort()
+                            elif ending == "close":
+                                await verifier.channel.close()
+                            else:
+                                peer = c.RecordState(bytes(32), "seal")
+                                verifier.channel.wire.reader.feed_data(peer.seal(b"\1\0", 21))
+                                peer.close()
+                                self.assertIsNone(await verifier.channel.recv())
+                            # These references disappear synchronously, before
+                            # either validation or its policy task can resume.
+                            self.assertIsNone(state.private)
+                            self.assertTrue(state.closed.done())
+                            self.assertIsNone(verifier.channel.auth_share_secret)
+                            self.assertFalse(verifier._inflight)
+                            with self.assertRaises(ProtocolError) as failed:
+                                await asyncio.wait_for(task, 1)
+                            self.assertEqual(protocol_locals(failed.exception), [])
+                            await asyncio.wait_for(cancelled.wait(), 1)
+                            self.assertFalse(callbacks[0].done())
+                            derive.assert_not_called()
+                            release.set()
+                            self.assertIsNotNone(await asyncio.wait_for(callbacks[0], 1))
+                            with self.assertRaises(ProtocolError):
+                                await verifier.validate(response, validator, request=request)
+                        finally:
+                            release.set()
+                            if not task.done():
+                                task.cancel()
+                            await asyncio.gather(task, *callbacks, return_exceptions=True)
+
+    async def test_cancellation_cannot_be_swallowed_or_authorize_the_cancelled_request(self):
+        for role in ("server", "client"):
+            for behavior in ("wait", "return", "raise"):
+                with self.subTest(role=role, behavior=behavior):
+                    verifier, prover, credentials, validator = self.live_pair(role)
+                    first, second = verifier.request(), verifier.request()
+                    response = prover.authenticate(credentials, request=first)
+                    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                    callbacks = []
+                    async def stubborn(identity, parsed):
+                        callbacks.append(asyncio.current_task())
+                        entered.set()
+                        try:
+                            await asyncio.Future()
+                        except asyncio.CancelledError:
+                            cancelled.set()
+                            if behavior == "wait":
+                                await release.wait()
+                            elif behavior == "raise":
+                                raise RuntimeError("late callback failure")
+                        return await validator(identity, parsed)
+                    task = asyncio.create_task(verifier.validate(response, stubborn))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 1)
+                        state = next(iter(verifier._inflight.values()))
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError) as failure:
+                            await asyncio.wait_for(task, 1)
+                        await asyncio.wait_for(cancelled.wait(), 1)
+                        self.assertEqual(protocol_locals(failure.exception), [])
+                        self.assertIsNone(state.private)
+                        self.assertTrue(state.closed.done())
+                        self.assertFalse(verifier._inflight)
+                        self.assertEqual(len(verifier._pending), 1)
+                        self.assertFalse(verifier._closed)
+                        self.assertFalse(verifier.channel.closed)
+                        if role == "server":
+                            self.assertIsNotNone(verifier.channel.auth_share_secret)
+                        with self.assertRaises(ProtocolError):
+                            await verifier.validate(response, validator, request=first)
+                        wire = prover.authenticate(credentials, request=second)
+                        self.assertTrue((await verifier.validate(wire, validator)).authenticated)
+                    finally:
+                        release.set()
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, *callbacks, return_exceptions=True)
+
+    async def test_reentrant_policy_closure_never_cancels_the_application_task(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                verifier, prover, credentials, validator = self.live_pair()
+                request = verifier.request()
+                response = prover.authenticate(credentials, request=request)
+                task = asyncio.current_task()
+                cancellations = task.cancelling()
+                def close_sync(*args):
+                    verifier.close()
+                    return object()
+                async def close_async(identity, parsed):
+                    verifier.close()
+                    return await validator(identity, parsed)
+                with self.assertRaises(ProtocolError):
+                    await verifier.validate(response, close_async if asynchronous else close_sync)
+                self.assertEqual(task.cancelling(), cancellations)
+                self.assertIsNone(verifier.channel.auth_share_secret)
+                self.assertFalse(verifier._inflight)
+                self.assertFalse(verifier.channel.closed)
+                await verifier.channel.send(b"traffic after capability closure")
+
+    async def test_cancel_spontaneous_validation_preserves_share_until_capability_closes(self):
+        verifier, prover, credentials, validator = self.live_pair()
+        original = verifier.channel.auth_share_secret
+        response = prover.authenticate(credentials)
+        entered = asyncio.Event()
+        async def wait(*args):
+            entered.set()
+            await asyncio.Future()
+        task = asyncio.create_task(verifier.validate(response, wait))
+        await asyncio.wait_for(entered.wait(), 1)
+        state = next(iter(verifier._inflight.values()))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIsNone(state.private)
+        self.assertIs(verifier.channel.auth_share_secret, original)
+        with self.assertRaises(ProtocolError):
+            await verifier.validate(response, validator)
+        response = prover.authenticate(credentials)
+        self.assertTrue((await verifier.validate(response, validator)).authenticated)
+        verifier.close()
+        self.assertIsNone(verifier.channel.auth_share_secret)
+
+    async def test_channel_abort_completes_blocked_validation_without_external_task_cancel(self):
+        verifier, prover, credentials, _validator = self.live_pair()
+        request = verifier.request()
+        response = prover.authenticate(credentials, request=request)
+        entered = asyncio.Event()
+        async def blocked(*args):
+            entered.set()
+            await asyncio.Future()
+        task = asyncio.create_task(verifier.validate(response, blocked))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            verifier.channel.abort()
+            with self.assertRaises(ProtocolError):
+                await asyncio.wait_for(task, 0.5)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_late_callback_exception_is_observed_and_does_not_retain_manager_state(self):
+        from tls20_server.application_auth import _abandoned_authorizers
+        verifier, prover, credentials, _validator = self.live_pair()
+        request = verifier.request()
+        response = prover.authenticate(credentials, request=request)
+        entered, cancelled, release, finished = (asyncio.Event() for _ in range(4))
+        callback_task = None
+        async def late_failure(*args):
+            nonlocal callback_task
+            callback_task = asyncio.current_task()
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+            finally:
+                finished.set()
+            raise RuntimeError("late application exception")
+        task = asyncio.create_task(verifier.validate(response, late_failure))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.wait_for(cancelled.wait(), 1)
+            self.assertIn(callback_task, _abandoned_authorizers)
+            self.assertFalse(verifier._inflight)
+            release.set()
+            await asyncio.wait_for(finished.wait(), 1)
+            await asyncio.sleep(0)  # Let its result-observer callback run.
+            self.assertNotIn(callback_task, _abandoned_authorizers)
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, *([callback_task] if callback_task else []), return_exceptions=True)
 
     async def test_prover_failure_releases_derived_keys_in_chained_exception(self):
         verifier, prover, credentials, validator = self.setup_pair()

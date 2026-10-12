@@ -292,6 +292,14 @@ unusable association or a TA that cannot validate the presented chain does not
 prevent trying the remaining authenticated associations. No matching valid
 association still fails closed.
 
+For usages0/1/2 the actual validated path must also satisfy the current
+certificate-signature offer, independently of any delegation-grant offer;
+the trust anchor's own signature remains exempt. A candidate that cannot
+satisfy these constraints does not suppress another valid TLSA association.
+Usage3 retains its direct endpoint-binding semantics. With
+`delegated_credentials = true`, DANE can authorize the signing parent's path;
+the delegated X25519 key still requires its valid role-specific grant and MAC.
+
 For programmatic DANE policies, path callbacks return a leaf-first sequence of
 validated certificate objects. `dane_path_validator` also accepts legacy `True`
 results, but those do not provide an omitted issuer for OCSP/CT. Opting into
@@ -301,6 +309,21 @@ forms remain unchanged. A returned path must identify the same leaf, and
 Certificate-entry evidence remains bound to its original certificate. Repeated
 wire certificates with conflicting evidence are rejected; a later copy cannot
 erase a supplied OCSP response even when stapling is otherwise optional.
+
+The optional `path_constraints(path, anchor)` callback checks current protocol
+constraints before selecting each usage0/1/2 candidate. `resolve_peer` supplies
+the negotiated certificate-algorithm gate this way. A legacy boolean path
+validator supplies an empty path plus its authenticated anchor, so the resolver
+conservatively checks supplied certificates against available verified issuers;
+return the actual validated path to avoid this limitation. Usage3 does not
+invoke a certificate-path constraint.
+
+OCSP responder selection verifies both authorization and the actual response
+signature for each matching candidate. Auxiliary certificate order is not a
+trust decision: renewed responder certificates can share a subject name while
+using different keys. An invalid candidate cannot authorize a response or
+prevent trying a later valid signer; CertID, freshness, status and nonce checks
+remain mandatory after signer selection.
 
 Server `[client_auth]` supports `required = true` (default), `identity`,
 `roots`, and `allowed_certificates_sha256` (exact SHA256 DER-leaf fingerprints).

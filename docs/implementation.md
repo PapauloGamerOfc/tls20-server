@@ -372,6 +372,18 @@ requests and application-owned callback frames remain intact. This releases
 managed references to abandoned verifier/derived keys, not a guarantee of
 physical erasure of Python or provider memory.
 
+Closing the authenticator capability releases the retained connection
+`auth_share` without closing ordinary traffic. In-flight validations own a
+revocable key slot: capability/connection closure clears it immediately, even
+while application authorization is suspended. Derived exporter/MAC keys are
+created only after authorization returns. Async policy callbacks run in a
+separate task; cancelling validation cannot be suppressed by the callback.
+A callback that ignores cancellation may continue its application work, but
+receives no protocol private or derived key, cannot authorize the cancelled
+request, and has its eventual exception observed. Applications should still
+make callbacks cancellation-cooperative. Cancelling one request preserves
+other pending requests and the enabled spontaneous-identity capability.
+
 ### Test-only diagnostic build
 
 `python tools/build_test_wheel.py` builds a separately named diagnostic wheel
@@ -409,6 +421,23 @@ Client-MAC tests include independent spec-derived known answers, captured initia
 and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
+
+### Authenticator teardown and DANE/OCSP policy: 2026-10-12
+
+Regressions cover immediate capability/connection cleanup during stalled or
+cancellation-resistant authorization, independent DANE path/grant signature
+offers, DANE with explicitly enabled delegation, and OCSP responder key rollover
+with the same subject name. Negative controls retain mandatory trust, identity,
+signature, authorization, freshness and request-context checks.
+
+Windows native-provider suites on Python 3.11 and 3.12 each ran 743 tests:
+741 passed and two platform-specific checks were skipped. The minimal Python
+3.12 run completed the same suite with 92 explicit provider/platform skips.
+All 24 ordinary Phromium interoperability commands and 19 optional-provider
+commands passed against this worktree. Source/wheel packaging and isolated
+installation/CLI checks also passed. Logs are under `build/audit-fixes-*` and
+the browser's `out/*/audit-fixes-*`. This is local Windows evidence, not a
+remote Linux/macOS CI result or a guarantee of physical memory erasure.
 
 ### Zstandard multi-frame certificate validation: 2026-10-12
 

@@ -579,13 +579,13 @@ def _evidence(data, files, provider=None):
     return CredentialEvidencePolicy(**options), tuple(offered)
 
 
-def _dane(data, files, result):
+def _dane(data, files, result, *, allow_delegation=False):
     import dns.name
     import dns.rdatatype
     import dns.rrset
     import dns.zone
     from .dnssec_credentials import DANEPolicy
-    from .pki import validate_pkix_path
+    from .pki import _load_pkix_der, certificate_public_key, validate_pkix_path
     data = _table(data, ("anchors_file", "allow_authenticated_denial"), "DANE policy")
     try:
         zone = dns.zone.from_text(files.read(data.get("anchors_file"), 1048576).decode("ascii"),
@@ -602,12 +602,20 @@ def _dane(data, files, result):
             raise ConfigurationError("DNSSEC anchor inventory is empty or too large")
     except (UnicodeError, dns.exception.DNSException) as exc:
         raise ConfigurationError("Invalid explicit DNSSEC trust-anchor zone file") from exc
+    def signing_parent(material):
+        # An explicitly offered grant may have a signing parent rather than an
+        # X25519 leaf. This callback validates only the path/identity: resolve_peer
+        # still requires and verifies its grant before authorizing the MAC key.
+        return allow_delegation and not isinstance(certificate_public_key(
+            _load_pkix_der(material[0]), signature_provider=result.provider), x25519.X25519PublicKey)
     def pkix(material):
         validate_identity(material, trust_roots=result.roots, role="server", name=result.service,
+            signing_leaf=signing_parent(material),
             signature_provider=result.provider, offered_certificate_algorithms=supported_certificate_algorithms(result.provider))
         return validate_pkix_path(material, result.roots, signature_provider=result.provider)
     def dane_path(material, anchor):
         validate_identity(material, trust_roots=(anchor,), role="server", name=result.service,
+            signing_leaf=signing_parent(material),
             partial_chain=True, signature_provider=result.provider,
             offered_certificate_algorithms=supported_certificate_algorithms(result.provider))
         return validate_pkix_path(material, (anchor,), partial_chain=True, signature_provider=result.provider)
@@ -638,7 +646,7 @@ def _trust(result, data, files):
         raise ConfigurationError("Required current evidence needs an explicit evidence policy")
     if result.revocation_policy == "require-evidence" and not (evidence.require_ocsp or evidence.minimum_ct_v1_logs or evidence.minimum_ct_v2_logs):
         raise ConfigurationError("Required evidence must specify a positive OCSP or CT requirement")
-    dane = _dane(data["dane"], files, result) if "dane" in data else None
+    dane = _dane(data["dane"], files, result, allow_delegation=delegation) if "dane" in data else None
     its = _its(data["its"], files, role="server", identity=result.service) if "its" in data else None
     if 3 in types and its is None or its is not None and (delegation or require_delegation or evidence or dane):
         raise ConfigurationError("ITS credentials require their own explicit authorization policy")

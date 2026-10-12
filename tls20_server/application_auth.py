@@ -8,6 +8,7 @@ of immutable bytes or cryptographic provider allocations.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import hmac
 import inspect
@@ -57,6 +58,50 @@ class AuthenticationResult:
     authenticated: bool
     identity: object = None
     certificate: CertificateIdentity | None = None
+
+
+@dataclass(repr=False)
+class _ValidationState:
+    """Revocable ownership; suspended policy callbacks never receive this key."""
+
+    private: X25519PrivateKey | None
+    closed: asyncio.Future
+
+    def close(self):
+        self.private = None
+        if not self.closed.done():
+            self.closed.set_result(None)
+
+
+# Keep detached, non-cooperative application callbacks alive until completion;
+# asyncio only weakly owns Tasks. These tasks have public credential/request
+# inputs, never the manager's per-request private key or derived exporter keys.
+_abandoned_authorizers = set()
+
+
+def _consume_authorizer_result(future):
+    # A callback can ignore cancellation. Observe its eventual result without
+    # retaining the manager/channel, or exposing protocol secrets to that task.
+    _abandoned_authorizers.discard(future)
+    if not future.cancelled():
+        future.exception()
+
+
+async def _await_authorization(awaitable, state):
+    future = asyncio.ensure_future(awaitable)
+    try:
+        # Unlike a direct await, wait() does not let the callback suppress the
+        # caller's cancellation. Closing the capability also wakes us without
+        # cancelling the application's current task (including reentrant calls).
+        await asyncio.wait((future, state.closed), return_when=asyncio.FIRST_COMPLETED)
+        if state.closed.done():
+            raise ProtocolError("application authenticator validation was closed")
+        return future.result()
+    finally:
+        if not future.done():
+            future.cancel()
+            _abandoned_authorizers.add(future)
+        future.add_done_callback(_consume_authorizer_result)
 
 
 def credential_validator(policy, *, role, authorize, spontaneous_offers=()):
@@ -251,6 +296,7 @@ class AuthenticatorManager:
         self.channel = channel
         self.max_contexts, self.max_message_bytes = max_contexts, max_message_bytes
         self._used, self._pending = set(), {}
+        self._inflight = {}
         self._closed = False
 
     def _ready(self):
@@ -305,8 +351,15 @@ class AuthenticatorManager:
         del self._pending[parsed.context]
 
     def close(self):
-        self._pending.clear()
         self._closed = True
+        self._pending.clear()
+        # This manager is the connection's application-authentication
+        # capability. Ending it must release the retained spontaneous verifier
+        # share without closing traffic/exporters or shared credential keys.
+        self.channel.auth_share_secret = None
+        active, self._inflight = self._inflight, {}
+        for state in active.values():
+            state.close()
 
     @sync_protocol_boundary
     def authenticate(self, credentials=None, *, request=None, context=None, entry_extensions=None):
@@ -405,49 +458,61 @@ class AuthenticatorManager:
                 raise ProtocolError("empty Certificate is not an authenticated refusal")
         pending = self._pending.get(context)
         if pending is not None:
-            parsed, private = pending
+            parsed = pending[0]
             if request is not None and parsed.wire != request:
                 raise ProtocolError("authenticator does not match retained local request")
             request = parsed.wire
             offers = dict(parsed.extensions)
+            state = _ValidationState(pending[1], asyncio.get_running_loop().create_future())
             del self._pending[context]  # Consume even if subsequent validation fails.
+            pending = None  # Do not retain an immutable tuple containing the key across await.
         else:
             if request is not None or role != "server" or refusal:
                 raise ProtocolError("no retained local authenticator request")
             if (not self.channel.enable_authenticators or self.channel.auth_share_secret is None):
                 raise ProtocolError("spontaneous authenticator capability is unavailable")
             self._claim(context)
-            parsed, private = None, self.channel.auth_share_secret
+            parsed = None
             offers = dict(self.channel.local_capabilities)
             _offers(offers, role)
-        handshake_context, finished_key = self._keys(role)
-        name = c.hash_context(c.suite(self.channel.cipher_suite).hash_name, self.channel.native_provider)
-        if refusal:
-            certificate = _certificate([], context)
-        transcript = handshake_context + (request or b"") + certificate
-        authorized = None
-        if not refusal:
-            _check_certificate_extensions(identity, offers)
-            _check_certificate_filters(identity, offers)
-            cv, body = _read_frame(reader, 15)
-            cv_reader = m._Reader(body)
-            algorithm, proof = int.from_bytes(cv_reader.take(2), "big"), cv_reader.vector(2)
-            cv_reader.end()
-            if algorithm != (0xfe00 if role == "server" else 0xfe01) or len(proof) != len(finished_key):
-                raise ProtocolError("invalid application authenticator MAC envelope")
-            authorized = validator(identity, parsed)
-            if inspect.isawaitable(authorized):
-                authorized = await authorized
-            self._ready()  # A concurrent close cancels pending authorization.
-            if not isinstance(authorized, AuthorizedIdentity) or not isinstance(authorized.public_key, X25519PublicKey):
-                raise ProtocolError("identity policy did not authorize an X25519 credential")
-            expected = _proof(finished_key, private, c.public_bytes(authorized.public_key), transcript, role, name)
-            if not hmac.compare_digest(proof, expected):
-                raise ProtocolError("application authenticator MAC failed")
-            transcript += cv
-        _finished, value = _read_frame(reader, 20)
-        reader.end()
-        expected = c.mac(finished_key, c.digest(transcript, name), name)
-        if len(value) != len(expected) or not hmac.compare_digest(value, expected):
-            raise ProtocolError("application authenticator Finished failed")
-        return AuthenticationResult(not refusal, authorized.identity if authorized else None, identity)
+            state = _ValidationState(self.channel.auth_share_secret, asyncio.get_running_loop().create_future())
+        self._inflight[context] = state
+        try:
+            authorized = None
+            if not refusal:
+                _check_certificate_extensions(identity, offers)
+                _check_certificate_filters(identity, offers)
+                cv, body = _read_frame(reader, 15)
+                cv_reader = m._Reader(body)
+                algorithm, proof = int.from_bytes(cv_reader.take(2), "big"), cv_reader.vector(2)
+                cv_reader.end()
+                if (algorithm != (0xfe00 if role == "server" else 0xfe01)
+                        or len(proof) != c.suite(self.channel.cipher_suite).hash_length):
+                    raise ProtocolError("invalid application authenticator MAC envelope")
+                authorized = validator(identity, parsed)
+                if inspect.isawaitable(authorized):
+                    authorized = await _await_authorization(authorized, state)
+                self._ready()  # Includes synchronous/reentrant policy closure.
+                if not isinstance(authorized, AuthorizedIdentity) or not isinstance(authorized.public_key, X25519PublicKey):
+                    raise ProtocolError("identity policy did not authorize an X25519 credential")
+            # Derive exporter keys only after the last suspension point. No
+            # immutable derived secret or private-key alias outlives close().
+            handshake_context, finished_key = self._keys(role)
+            name = c.hash_context(c.suite(self.channel.cipher_suite).hash_name, self.channel.native_provider)
+            if refusal:
+                certificate = _certificate([], context)
+            transcript = handshake_context + (request or b"") + certificate
+            if not refusal:
+                expected = _proof(finished_key, state.private, c.public_bytes(authorized.public_key), transcript, role, name)
+                if not hmac.compare_digest(proof, expected):
+                    raise ProtocolError("application authenticator MAC failed")
+                transcript += cv
+            _finished, value = _read_frame(reader, 20)
+            reader.end()
+            expected = c.mac(finished_key, c.digest(transcript, name), name)
+            if len(value) != len(expected) or not hmac.compare_digest(value, expected):
+                raise ProtocolError("application authenticator Finished failed")
+            return AuthenticationResult(not refusal, authorized.identity if authorized else None, identity)
+        finally:
+            state.close()
+            self._inflight.pop(context, None)
