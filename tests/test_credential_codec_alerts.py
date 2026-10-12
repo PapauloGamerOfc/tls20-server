@@ -1,0 +1,164 @@
+"""Certificate codec alerts and cached-object framing on authenticated wires."""
+
+import asyncio
+import unittest
+from unittest.mock import patch
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+from tls20_server import credential_cache, handshake, messages
+from tls20_server.credential_profiles import CredentialPolicy, RawPublicKeyBinding
+from tls20_server.errors import ProtocolError
+from tls20_server.pki import Credentials
+from tls20_server.tickets import TicketCache
+from tests import test_sessions
+
+
+def altered_compression(body, algorithm, variant):
+    packed = credential_cache.compress_certificate(body, algorithm)
+    if variant == "garbage":
+        data = b"not a valid compressed stream"
+        return packed[:5] + len(data).to_bytes(3, "big") + data
+    if variant in ("short", "long"):
+        delta = -1 if variant == "short" else 1
+        return packed[:2] + (len(body) + delta).to_bytes(3, "big") + packed[5:]
+    return packed
+
+
+class CodecAlertTests(unittest.TestCase):
+    def test_codec_failure_alerts_do_not_change_outer_checks(self):
+        body = b"a test credential" * 4
+        for algorithm in (1, 2, 3):
+            packed = credential_cache.compress_certificate(body, algorithm)
+            self.assertEqual(credential_cache.decompress_certificate(packed, (algorithm,)), body)
+            for variant in ("garbage", "short", "long"):
+                with self.subTest(algorithm=algorithm, variant=variant), self.assertRaises(ProtocolError) as caught:
+                    credential_cache.decompress_certificate(altered_compression(body, algorithm, variant), (algorithm,))
+                self.assertEqual(caught.exception.alert, 42)
+            # A malformed envelope or an unoffered algorithm never reaches a
+            # codec and must not masquerade as a bad_certificate decode failure.
+            for invalid, offers in ((packed[:-1], (algorithm,)), (packed + b"x", (algorithm,)), (packed, ())):
+                with self.subTest(algorithm=algorithm, invalid=invalid), self.assertRaises(ProtocolError) as caught:
+                    credential_cache.decompress_certificate(invalid, offers)
+                self.assertNotEqual(caught.exception.alert, 42)
+
+    def test_unknown_cached_hash_must_still_have_valid_vector_length(self):
+        for length in (1, 32, 255):
+            data = bytes((255, length)) + bytes(length)
+            self.assertEqual(handshake._cache_offer(len(data).to_bytes(2, "big") + data), ((255, bytes(length)),))
+        for kind in (1, 2, 255):
+            with self.subTest(kind=kind), self.assertRaises(ProtocolError) as caught:
+                handshake._cache_offer(b"\x00\x02" + bytes((kind, 0)))
+            self.assertEqual(caught.exception.alert, 50)
+
+
+class CodecWireTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = test_sessions.SessionTests.asyncSetUp
+    asyncTearDown = test_sessions.SessionTests.asyncTearDown
+    accept = test_sessions.SessionTests.accept
+    handle = test_sessions.SessionTests.handle
+    connect = test_sessions.SessionTests.connect
+
+    @staticmethod
+    def client_credential():
+        key = X25519PrivateKey.generate()
+        raw = key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        credential = Credentials([raw], key, credential_type=2)
+        policy = CredentialPolicy(peer_name="device", raw_public_keys=(RawPublicKeyBinding("client", "device", raw),))
+        return credential, policy
+
+    async def test_both_credential_directions_emit_encrypted_bad_certificate(self):
+        credential, policy = self.client_credential()
+        original_read = handshake.Wire.read_record
+        for role in ("server", "client"):
+            for algorithm in (1, 2, 3):
+                for variant in ("valid", "garbage", "short", "long"):
+                    with self.subTest(role=role, algorithm=algorithm, variant=variant):
+                        self.cache = TicketCache()
+                        self.server_options = {} if role == "server" else {
+                            "client_credential_policy": policy, "require_client_auth": True,
+                            "client_certificate_types": (2,), "certificate_compression": (algorithm,)}
+                        options = {"certificate_compression": (algorithm,)} if role == "server" else {
+                            "client_credentials": credential}
+                        seen, received = [], asyncio.Event()
+
+                        async def capture(wire, state=None):
+                            data, kind = await original_read(wire, state)
+                            if kind == 21 and data != b"\x01\x00":
+                                seen.append((state is not None, data))
+                                received.set()
+                            return data, kind
+
+                        def compress(body, selected):
+                            self.assertEqual(selected, algorithm)
+                            return altered_compression(body, selected, variant)
+
+                        with patch.object(handshake, "compress_certificate", compress), \
+                             patch.object(handshake.Wire, "read_record", capture):
+                            if variant == "valid":
+                                client = await self.connect(**options)
+                                await client.send(b"codec control")
+                                self.assertEqual(await client.recv(), b"codec control")
+                                self.assertEqual(client.handshake_transcript, self.channels[-1].handshake_transcript)
+                                self.assertEqual(seen, [])
+                                await client.close()
+                            else:
+                                with self.assertRaises(ProtocolError) as caught:
+                                    await self.connect(**options)
+                                self.assertEqual(caught.exception.alert, 42)
+                                await asyncio.wait_for(received.wait(), 2)
+                                self.assertEqual(seen, [(True, b"\x02\x2a")])
+
+    async def test_post_handshake_client_codec_errors_use_bad_certificate(self):
+        credential, policy = self.client_credential()
+        for algorithm in (1, 2, 3):
+            for variant in ("valid", "garbage", "short", "long"):
+                with self.subTest(algorithm=algorithm, variant=variant):
+                    self.cache = TicketCache()
+                    self.server_options = {"client_credential_policy": policy, "require_client_auth": True,
+                        "client_certificate_types": (2,), "certificate_compression": (algorithm,)}
+                    client = await self.connect(client_credentials=credential, post_handshake_auth=True)
+                    pending = await self.channels[-1].request_client_auth(required=True)
+                    def compress(body, selected):
+                        self.assertEqual(selected, algorithm)
+                        return altered_compression(body, selected, variant)
+                    with patch.object(handshake, "compress_certificate", compress):
+                        await client.send(b"drive codec PHA")
+                        # Existing application data may be echoed before the
+                        # server receives the subsequent PHA response. Read it
+                        # without mistaking that ordering for PHA acceptance.
+                        self.assertEqual(await asyncio.wait_for(client.recv(), 2), b"drive codec PHA")
+                        if variant == "valid":
+                            self.assertEqual(await asyncio.wait_for(pending, 2), tuple(credential.chain_der))
+                            await client.close()
+                        else:
+                            with self.assertRaises(ProtocolError) as received:
+                                await asyncio.wait_for(client.recv(), 2)
+                            self.assertEqual(received.exception.alert, 42)
+                            # A fatal record aborts the channel and cancels its
+                            # outstanding PHA promise; the peer already proved
+                            # the exact encrypted alert above.
+                            with self.assertRaises(asyncio.CancelledError):
+                                await asyncio.wait_for(pending, 2)
+                            self.assertTrue(pending.cancelled())
+
+    async def test_unknown_cache_type_ignores_only_well_framed_hashes(self):
+        original = messages.client_hello
+        for value, valid in ((b"\x00\x03\xff\x01x", True), (b"\x00\x02\xff\x00", False)):
+            with self.subTest(value=value):
+                self.cache = TicketCache()
+                def altered(*args, **kwargs):
+                    kwargs["extra_extensions"] = tuple(kwargs.get("extra_extensions", ())) + ((25, value),)
+                    return original(*args, **kwargs)
+                with patch.object(messages, "client_hello", altered):
+                    if valid:
+                        client = await self.connect()
+                        self.assertEqual(client.cache_types, ())
+                        await client.send(b"unknown cache object")
+                        self.assertEqual(await client.recv(), b"unknown cache object")
+                        await client.close()
+                    else:
+                        with self.assertRaises(ProtocolError) as caught:
+                            await self.connect()
+                        self.assertEqual(caught.exception.alert, 50)

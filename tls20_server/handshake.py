@@ -28,7 +28,7 @@ from .credential_cache import (compress_certificate, decompress_certificate, mat
     cached_request_body, resolve_cached_request)
 from .handshake_options import client_controls, server_controls, client_control_selection
 from .exporter_access import expose as expose_exporter
-from .secret_lifecycle import HandshakeSecrets, handshake_boundary
+from .secret_lifecycle import HandshakeSecrets, handshake_boundary, protocol_boundary
 from .credential_selection import (encode_certificate_authorities, encode_oid_filters,
     preferred_credentials, match_credentials)
 from types import SimpleNamespace
@@ -213,7 +213,8 @@ class SecureChannel:
                  heartbeat_local_mode=None, heartbeat_peer_mode=None,
                  selected_external_psk_identity=b"", bootstrap_binding=None, bootstrap_authorization=None,
                  peer_authenticated=True, client_credential_candidates=(), native_provider=None, pake_identity=b"",
-                 credential_expires_at=None, allowed_psk_modes=(1, 0)):
+                 credential_expires_at=None, allowed_psk_modes=(1, 0),
+                 certificate_feature_offers=(), certificate_features=()):
         if wire.pending:
             raise ProtocolError("leftover handshake bytes")
         self.wire = wire
@@ -221,6 +222,8 @@ class SecureChannel:
         self.wire.deadline = None
         self.cipher_suite = cipher_suite
         self.protocol, self.role = protocol, role
+        self.certificate_feature_offers = tuple(certificate_feature_offers)
+        self.certificate_features = tuple(certificate_features)
         self.handshake_completed = True
         self.peer_authenticated = bool(peer_authenticated)
         self.enable_authenticators = enable_authenticators
@@ -323,6 +326,7 @@ class SecureChannel:
         self.post_handshake.clear()
         self.handshake_transcript = b""
 
+    @protocol_boundary
     async def request_client_auth(self, *, required=False, max_pending=128,
                                   certificate_authorities=None, oid_filters=None,
                                   certificate_algorithms=None, delegation_signature_algorithms=None):
@@ -372,8 +376,8 @@ class SecureChannel:
                  "transcript": bytearray(self.handshake_transcript + request),
                  "stage": "certificate", "chain": [], "key": None, "context": context,
                  "offers": offers, "metadata": ()}
-        self.pending_client_auth[context] = state
         future.add_done_callback(lambda done: self.abort() if done.cancelled() and not self.closed else None)
+        self.pending_client_auth[context] = state
         try:
             await self.send_handshake(request)
         except BaseException:
@@ -433,7 +437,9 @@ class SecureChannel:
                 if self.client_credential_policy is not None:
                     state["key"] = _resolve_credential(state["chain"], state["metadata"], role="client",
                         credential_type=self.client_certificate_type, policy=self.client_credential_policy,
-                        offers=state["offers"].items()).public_key
+                        offers=state["offers"].items(), negotiated_extensions=_certificate_feature_state(
+                            state["offers"].items(), certificate_message=frame[0],
+                            certificate_metadata=state["metadata"], authenticated_by_mac=True)).public_key
                 else:
                     if self.client_certificate_type != 0 or any(state["metadata"]):
                         raise ProtocolError("extended client credentials require an explicit policy")
@@ -617,6 +623,8 @@ class SecureChannel:
                         pake_identity=self.pake_identity,
                         credential_expires_at=self.credential_expires_at,
                         allowed_psk_modes=self.allowed_psk_modes,
+                        certificate_feature_offers=self.certificate_feature_offers,
+                        certificate_features=self.certificate_features,
                         record_size_limit=self.sender.record_limit))
             else:
                 raise ProtocolError("unexpected post-handshake message", alert=10)
@@ -959,6 +967,10 @@ def _cache_offer(data):
     result = []
     while reader.position < len(reader.data):
         kind, value = reader.take(1)[0], reader.vector(1)
+        # RFC7924's CachedObject hash vector is nonempty even for an unknown
+        # object type. Ignore unsupported semantics only after valid framing.
+        if not value:
+            raise ProtocolError("empty cached object hash", alert=50)
         if kind in (1, 2) and len(value) != 32 or (kind, value) in result:
             raise ProtocolError("invalid cached object offer", alert=47)
         result.append((kind, value))
@@ -984,7 +996,8 @@ def _decode_request(request, *, cache_enabled=False, templates=()):
     return m.parse_certificate_request(body, details=True)
 
 
-def _resolve_credential(chain, metadata, *, role, credential_type, policy, offers):
+def _resolve_credential(chain, metadata, *, role, credential_type, policy, offers,
+                        negotiated_extensions=(), feature_offers=None):
     offered = dict(offers)
     if 5 in offered:
         from .status_request import parse_status_request, response_matches_request
@@ -997,7 +1010,40 @@ def _resolve_credential(chain, metadata, *, role, credential_type, policy, offer
         certificate_algorithms=m._u16_list(offered[50]) if 50 in offered else (),
         grant_algorithms=m._u16_list(offered[0xff04]) if 0xff04 in offered else (),
         delegated_schemes=m._u16_list(offered[34]) if 34 in offered else (),
-        entry_extensions=metadata, offered_extensions=tuple(offered))
+        entry_extensions=metadata, offered_extensions=tuple(offered),
+        negotiated_extensions=negotiated_extensions, feature_offers=feature_offers)
+
+
+def _certificate_feature_state(offers, selections=(), *, certificate_message=None,
+                               certificate_metadata=(), authenticated_by_mac=False):
+    """Satisfaction is a selection or a checked message, never just an offer.
+
+    Certificate-algorithm and delegation requirements are checked while
+    resolving the credential. The MAC is verified before accepting this state.
+    Unilateral hints/capabilities (e.g. CA hints and PHA) are not server echoes.
+    """
+    offered = dict(offers)
+    satisfied = set(selections).intersection(offered)
+    if 50 in offered:
+        satisfied.add(50)
+    if 41 in satisfied and 45 in offered:
+        satisfied.add(45)
+    if authenticated_by_mac and 0xff02 in offered:
+        satisfied.add(0xff02)
+    if authenticated_by_mac and 0xff03 in offered:
+        satisfied.add(0xff03)
+    if certificate_message == 25 and 27 in offered:
+        satisfied.add(27)
+    if certificate_metadata and 34 in dict(certificate_metadata[0]) and 0xff04 in offered:
+        satisfied.add(0xff04)
+    return tuple(sorted(satisfied))
+
+
+def _check_lab_features(chain, offers, satisfied):
+    # The legacy lab trust path also obeys wire feature requirements.
+    from .tls_features import certificate_features
+    if certificate_features(x509.load_der_x509_certificate(chain[0])).intersection(dict(offers)) - set(satisfied):
+        raise ProtocolError("an offered mandatory TLS Feature was not satisfied")
 
 
 def _policy_context(policy):
@@ -1348,7 +1394,9 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         elif client_credential_policy is not None:
                             _resolve_credential(ticket.client_certificate_chain, ticket.client_certificate_extensions,
                                 role="client", credential_type=ticket.client_certificate_type,
-                                policy=client_credential_policy, offers=client_auth_offers)
+                                policy=client_credential_policy, offers=client_auth_offers,
+                                negotiated_extensions=_certificate_feature_state(client_auth_offers,
+                                    certificate_metadata=ticket.client_certificate_extensions))
                         else:
                             await _validate_client(client_auth_validator, ticket.client_certificate_chain)
                         authenticated_client = tuple(ticket.client_certificate_chain)
@@ -1558,7 +1606,9 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                     elif client_credential_policy is not None:
                         key = _resolve_credential(client_chain, client_metadata, role="client",
                             credential_type=client_credential_type, policy=client_credential_policy,
-                            offers=client_auth_offers).public_key
+                            offers=client_auth_offers, negotiated_extensions=_certificate_feature_state(
+                                client_auth_offers, certificate_message=cert[0],
+                                certificate_metadata=client_metadata, authenticated_by_mac=True)).public_key
                     else:
                         if client_credential_type != 0 or any(client_metadata):
                             raise ProtocolError("extended client credentials require an explicit policy")
@@ -1907,13 +1957,17 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     elif credential_policy is not None:
                         cached_credential = _resolve_credential(ticket.certificate_chain, ticket.certificate_extensions,
                             role="server", credential_type=ticket.certificate_type,
-                            policy=credential_policy, offers=credential_offers)
+                            policy=credential_policy, offers=credential_offers,
+                            feature_offers=set(ticket.certificate_feature_offers) | (set(dict(credential_offers)) & {5, 18, 52}),
+                            negotiated_extensions=ticket.certificate_features)
                         if cached_credential.expires_at is not None:
                             refreshed_expiry = cached_credential.expires_at.timestamp()
                             credential_expires_at = (min(credential_expires_at, refreshed_expiry)
                                 if credential_expires_at is not None else refreshed_expiry)
                     else:
                         validate_chain(ticket.certificate_chain, trust_roots, server_name, revocation_policy)
+                        _check_lab_features(ticket.certificate_chain,
+                            tuple(pair for pair in credential_offers if pair[0] in (5, 18, 52)), ())
                 except ProtocolError:
                     # Stale authentication state is not authority to resume.
                     # A normal full handshake can validate a renewed credential.
@@ -1975,6 +2029,16 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     message = m.client_hello(auth_public, traffic_public, server_name if send_server_name else "", random, **options)
                 return message
             ch = bound_hello(c.PREFACE)
+            if (offer_early and external is None and ticket.certificate_type == 0
+                    and ticket.certificate_chain):
+                from .tls_features import certificate_features
+                required = certificate_features(x509.load_der_x509_certificate(ticket.certificate_chain[0]))
+                offered = m.parse_client_hello(ch[4:], password_authenticated=False).extensions
+                if required.intersection(offered) - {5, 18, 25, 27, 52, 0xff02}:
+                    # Current SH/EE requirements cannot be assumed from a
+                    # predecessor. Do not release bytes before checking them.
+                    offer_early = options["early_data"] = False
+                    ch = bound_hello(c.PREFACE)
             transcript.add(ch)
             writer.write(c.PREFACE)
             await wire.send_frame(ch)
@@ -2000,6 +2064,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             sh = await wire.receive_frame(2, boundary=True)
             ephemeral_public, sid, resumed, group, retry, cookie, selected_id = m.parse_server_hello(sh[4:], with_suite=True)
             retried = retry
+            retry_features = (44,) if retry and cookie else ()
             if selected_id not in cipher_suites:
                 raise ProtocolError("unoffered server cipher suite", alert=47)
             selected = c.suite(selected_id)
@@ -2143,12 +2208,31 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             if accepted and (not resumed or psk_index != 0 or ticket.cipher_suite != selected_id):
                 raise ProtocolError("early data requires selected PSK")
             transcript.add(ee)
+            # Use the final, serialized ClientHello (including HRR changes),
+            # not the subset of extras assembled for certificate evidence.
+            credential_offers = m.parse_client_hello(ch[4:], password_authenticated=False).extension_values
+            feature_selections = set(selection_extensions) | set(selected_extensions) | set(retry_features)
             chain_der = ticket.certificate_chain if resumed else []
             certificate_metadata = ticket.certificate_extensions if resumed and external is None else ()
             if resumed and external is None:
                 certificate_type = ticket.certificate_type
             client_auth_request = None
             learned_requests = []
+            certificate_features = _certificate_feature_state(credential_offers, feature_selections,
+                certificate_metadata=certificate_metadata)
+            if resumed and external is None and not selected_combined and chain_der:
+                # No new Certificate/MAC flight is carried by this PSK
+                # resumption of an authenticated credential lineage. Its
+                # cached-info, compression and auth-share requirements are
+                # redundant (RFC7633 §4), not missing fresh authentication.
+                redundant = {25, 27, 0xff02}.intersection(dict(credential_offers))
+                certificate_features = tuple(sorted(set(certificate_features) | redundant))
+                if credential_policy is not None:
+                    _resolve_credential(chain_der, certificate_metadata, role="server",
+                        credential_type=certificate_type, policy=credential_policy, offers=credential_offers,
+                        negotiated_extensions=certificate_features)
+                elif not provisioning_trust:
+                    _check_lab_features(chain_der, credential_offers, certificate_features)
             if not resumed or selected_combined:
                 cert = await wire.receive_frame((11, 13, 25, 252, 253), receiver)
                 if cert[0] in (13, 252):
@@ -2160,6 +2244,9 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     cert = await wire.receive_frame((11, 25, 253), receiver)
                 chain_der, certificate_metadata = _decode_credential(cert, offered_compression=certificate_compression,
                     cached=1 in cache_selected, snapshots=snapshots, credential_type=certificate_type)
+                certificate_features = _certificate_feature_state(credential_offers, feature_selections,
+                    certificate_message=cert[0], certificate_metadata=certificate_metadata,
+                    authenticated_by_mac=True)
                 if unauthenticated:
                     if certificate_type not in (0, 2) or any(certificate_metadata):
                         raise ProtocolError("unauthenticated operation cannot claim delegated or auxiliary credential authority")
@@ -2179,7 +2266,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                         binding=bootstrap_binding, entry_extensions=certificate_metadata, normal_httpps=normal_httpps).public_key
                 elif credential_policy is not None:
                     authorized = _resolve_credential(chain_der, certificate_metadata, role="server",
-                        credential_type=certificate_type, policy=credential_policy, offers=credential_offers)
+                        credential_type=certificate_type, policy=credential_policy, offers=credential_offers,
+                        negotiated_extensions=certificate_features)
                     static_key = authorized.public_key
                     credential_expires_at = authorized.expires_at.timestamp() if authorized.expires_at is not None else None
                 else:
@@ -2187,6 +2275,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                         raise ProtocolError("extended server credentials require an explicit policy")
                     _check_certificate_offer(chain_der, certificate_algorithms, native_provider)
                     static_key = validate_chain(chain_der, trust_roots, server_name, revocation_policy)
+                    _check_lab_features(chain_der, credential_offers, certificate_features)
                 wire.check_deadline()
                 static_public = c.public_bytes(static_key)
                 if static_public in (auth_public, c.traffic_auth_component(traffic_group, traffic_public),
@@ -2257,6 +2346,11 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     "service": bootstrap_binding.service, "trust_mode": bootstrap_binding.trust_mode,
                     "bsk": bootstrap_binding.spki, "fresh_client_possession": selected_combined,
                     "peer_authorization_confirmed": False}
+            ticket_feature_offers = ()
+            if certificate_type == 0 and chain_der:
+                from .tls_features import certificate_features as required_certificate_features
+                ticket_feature_offers = tuple(sorted(required_certificate_features(
+                    x509.load_der_x509_certificate(chain_der[0])).intersection(dict(credential_offers))))
             channel = SecureChannel(wire, client_app, server_app, exporter_secret=exporter,
                 resumption_secret=schedule.derive_secret(schedule.master_secret(traffic_root), "res master", transcript.snapshot()),
                 ticket_cache=None if unauthenticated else ticket_cache, name=server_name, context=roots_hash, certificate_chain=chain_der,
@@ -2274,6 +2368,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 selected_external_psk_identity=selected_external_identity, bootstrap_binding=bootstrap_binding,
                 bootstrap_authorization=bootstrap_authorization,
                 credential_expires_at=credential_expires_at,
+                certificate_feature_offers=ticket_feature_offers,
+                certificate_features=tuple(value for value in certificate_features if value in ticket_feature_offers),
                 allowed_psk_modes=tuple(mode for mode in psk_modes if mode in (0, 1)),
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode,
                 peer_authenticated=not unauthenticated, native_provider=native_provider)

@@ -157,23 +157,26 @@ def validate_delegation(parent_der, grant, *, role, grant_algorithms,
     return public_key, expiry
 
 
-def _mandatory_evidence_validator(policy, material, evidence, offered_extensions):
+def _mandatory_evidence_validator(policy, material, evidence, offered_extensions, negotiated_extensions):
     """Bind enabled certificate requirements to actual protocol offers.
 
     Offline revocation policy is not a waiver for a feature the endpoint has
     offered and its certificate requires. Unknown *unoffered* registry values
-    remain harmless. An offered requirement needs an installed validator, not
-    merely a syntactically present blob or the word 'offline'.
+    remain harmless. An offered evidence requirement needs an installed
+    validator, not merely a syntactically present blob or the word 'offline'.
+    Other features must be satisfied by the protocol's real selection state.
     """
     from .tls_features import certificate_features
     required = certificate_features(_load_pkix_der(material[0])).intersection(offered_extensions)
     validator = policy.evidence_validator
-    if not required:
-        return validator
     leaf = dict(evidence[0]) if evidence else {}
+    # Only the protocol caller supplies authenticated selection state. Policy
+    # configuration is not evidence that a peer negotiated an extension.
+    if required - set(leaf) - set(negotiated_extensions):
+        raise ProtocolError("an offered mandatory TLS Feature was not satisfied")
     if required.intersection((5, 18, 52)) - set(leaf):
         raise ProtocolError("required offered certificate evidence is absent")
-    if validator is None:
+    if required.intersection((5, 18, 52)) and validator is None:
         raise ProtocolError("mandatory offered TLS Feature has no installed validator")
     from .credential_evidence import CredentialEvidencePolicy
     if isinstance(validator, CredentialEvidencePolicy):
@@ -181,6 +184,7 @@ def _mandatory_evidence_validator(policy, material, evidence, offered_extensions
         # may strengthen minimum counts, but cannot accidentally suppress a
         # mandatory CT check by leaving the optional minimum at its default 0.
         validator = replace(validator, offered_extensions=tuple(offered_extensions),
+            negotiated_extensions=tuple(negotiated_extensions),
             enforce_tls_feature=True, require_ocsp=validator.require_ocsp or 5 in required,
             minimum_ct_v1_logs=max(validator.minimum_ct_v1_logs, int(18 in required)),
             minimum_ct_v2_logs=max(validator.minimum_ct_v2_logs, int(52 in required)))
@@ -190,7 +194,7 @@ def _mandatory_evidence_validator(policy, material, evidence, offered_extensions
 def resolve_peer(material, credential_type=0, role="server", *, policy,
                  certificate_algorithms=SUPPORTED_CERTIFICATE_ALGORITHMS,
                  grant_algorithms=(), delegated_schemes=(), entry_extensions=(),
-                 offered_extensions=()):
+                 offered_extensions=(), negotiated_extensions=(), feature_offers=None):
     """Resolve current authenticated X.509/DC/RPK material to a MAC proof key.
 
     An AuthorizedCredential does not assert the peer possesses its key: the
@@ -238,7 +242,8 @@ def resolve_peer(material, credential_type=0, role="server", *, policy,
         raise ProtocolError("required delegated credential is absent")
     if grant is not None and (not grant_algorithms or not certificate_algorithms):
         raise ProtocolError("delegation requires independent certificate and grant offers")
-    evidence_validator = _mandatory_evidence_validator(policy, material, evidence, offered_extensions)
+    evidence_validator = _mandatory_evidence_validator(policy, material, evidence,
+        offered_extensions if feature_offers is None else feature_offers, negotiated_extensions)
     if dane_usage is not None:
         # DANE-EE authenticates the exact endpoint material independently of
         # CA trust, certificate names and validity. Other usages have already

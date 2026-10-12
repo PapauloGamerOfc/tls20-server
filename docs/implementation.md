@@ -16,6 +16,27 @@ follow redirects, manage cookies or install a browser protocol handler.
 
 ## Implemented connection flows
 
+TLS Feature requirements are checked against the actual ClientHello and the
+authenticated selection/message state, not a caller's predeclared negotiation
+list. Resumption rechecks current negotiation and cached certificate evidence.
+Requirements that depend on the new ServerHello/EncryptedExtensions prevent
+early application data until they can be checked; ordinary eligible 0-RTT
+remains available. A missing Certificate flight on PSK resumption does not
+require redundant certificate compression, caching or a fresh certificate MAC.
+Newly offered mandatory OCSP/CT evidence is checked before sending early bytes,
+including on the legacy lab trust path.
+
+Invalid certificate decompression or a decompressed-length mismatch produces
+`bad_certificate` (42). Outer framing, unoffered algorithms and allocation
+limits retain their separate checks. CachedObject hashes must be nonempty even
+for unknown object types; well-formed unknown types are still ignored.
+
+PHA request failures and cancellation clear completed protocol traceback
+frames, releasing abandoned ephemeral-key references. A validation error
+before sending a new request does not destroy independent pending requests.
+This is managed-reference cleanup, not guaranteed erasure of Python memory;
+see [SECURITY.md](../SECURITY.md).
+
 1. The dedicated listener checks the bootstrap and parses TLS-style Hello
    messages and extensions, selecting only version `0x0400`. It rejects
    `signature_algorithms`; certificate signature preferences are separate.

@@ -44,6 +44,10 @@ class SessionTicket:
     # Local state, not an NST wire field. A successor cannot acquire a mode
     # that the ClientHello authorizing its ancestor ticket did not offer.
     allowed_psk_modes: tuple[int, ...] = (1, 0)
+    # Authenticated state of the connection issuing this ticket, for credential
+    # preflight only. Every resumption must check its own new negotiation.
+    certificate_feature_offers: tuple[int, ...] = ()
+    certificate_features: tuple[int, ...] = ()
 
     def expired(self, now=None):
         return ((time.monotonic() if now is None else now) - self.issued >= self.lifetime

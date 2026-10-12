@@ -122,6 +122,21 @@ frames are cleared (including chained exceptions), retaining traceback locations
 but not protocol-local secret references. Application callback frames, explicitly
 retained callback values, shared credentials/providers and ticket caches are not
 wiped. Diagnostics must therefore not rely on protocol frame locals after failure.
+The same completed-frame cleanup applies to post-handshake authentication request
+creation, including validation errors before sending and cancellation during the
+write. A pre-send error leaves unrelated live authentication requests intact;
+a failed or cancelled write aborts and releases the connection's pending state.
+
+TLS Feature requirements use the actual serialized ClientHello and validated
+ServerHello/EncryptedExtensions or credential-message selection, not a caller's
+predeclared negotiated-extension policy. Resumption checks the new negotiation
+again. When a cached certificate requires an offered feature that depends on new
+negotiation, 0-RTT is withheld; ordinary resumed 1-RTT is still available if those
+requirements are satisfied. Certificate caching/compression and the fresh
+authentication share are redundant when an authenticated credential lineage is
+resumed without a new Certificate/MAC flight. Cached OCSP/CT evidence, including newly
+offered requirements, is revalidated before early bytes under the current policy,
+not accepted merely because it is cached.
 
 ## Resource limits and operational precautions
 

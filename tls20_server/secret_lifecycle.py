@@ -56,6 +56,22 @@ def handshake_boundary(method):
     return guarded
 
 
+def protocol_boundary(method):
+    """Release completed protocol frames without changing live channel state.
+
+    A pre-send validation error must not abort independent pending requests.
+    The operation itself owns its state transition and transport cleanup.
+    """
+    @functools.wraps(method)
+    async def guarded(*args, **kwargs):
+        try:
+            return await method(*args, **kwargs)
+        except BaseException as error:
+            clear_protocol_tracebacks(error)
+            raise
+    return guarded
+
+
 class HandshakeSecrets:
     """Own temporary epochs/ephemerals until handoff or handshake termination."""
 

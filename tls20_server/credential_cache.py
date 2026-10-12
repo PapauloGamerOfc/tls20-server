@@ -189,41 +189,41 @@ def _decompress_zstandard(data, declared, max_size):
     window_limit = max(1024, max_size)
     while cursor < len(source):
         if len(source) - cursor < 4:
-            raise ProtocolError("truncated zstandard frame")
+            raise ProtocolError("truncated zstandard frame", alert=42)
         magic = int.from_bytes(source[cursor:cursor + 4], "little")
         if 0x184D2A50 <= magic <= 0x184D2A5F:
             if len(source) - cursor < 8:
-                raise ProtocolError("truncated zstandard skippable frame")
+                raise ProtocolError("truncated zstandard skippable frame", alert=42)
             cursor += 8 + int.from_bytes(source[cursor + 4:cursor + 8], "little")
             if cursor > len(source):
-                raise ProtocolError("truncated zstandard skippable frame")
+                raise ProtocolError("truncated zstandard skippable frame", alert=42)
             continue
         if magic != 0xFD2FB528:
-            raise ProtocolError("invalid or trailing zstandard frame")
+            raise ProtocolError("invalid or trailing zstandard frame", alert=42)
         parameters = zstandard.get_frame_parameters(source[cursor:])
         if parameters.window_size > window_limit:
             raise ProtocolError("zstandard window exceeds credential memory budget")
         if parameters.content_size != zstandard.CONTENTSIZE_UNKNOWN:
             known_size += parameters.content_size
             if known_size > declared:
-                raise ProtocolError("zstandard frames exceed declared credential size")
+                raise ProtocolError("zstandard frames exceed declared credential size", alert=42)
         cursor += zstandard.frame_header_size(source[cursor:])
         while True:
             if len(source) - cursor < 3:
-                raise ProtocolError("truncated zstandard block header")
+                raise ProtocolError("truncated zstandard block header", alert=42)
             block = int.from_bytes(source[cursor:cursor + 3], "little")
             kind = (block >> 1) & 3
             if kind == 3:
-                raise ProtocolError("reserved zstandard block type")
+                raise ProtocolError("reserved zstandard block type", alert=42)
             cursor += 3 + (1 if kind == 1 else block >> 3)
             if cursor > len(source):
-                raise ProtocolError("truncated zstandard block")
+                raise ProtocolError("truncated zstandard block", alert=42)
             if block & 1:
                 break
         if parameters.has_checksum:
             cursor += 4
             if cursor > len(source):
-                raise ProtocolError("truncated zstandard checksum")
+                raise ProtocolError("truncated zstandard checksum", alert=42)
 
     # The pinned provider passes max_window_size directly to libzstd in bytes.
     # Keep an explicit header check as well as the decoder's allocation guard.
@@ -236,7 +236,7 @@ def _decompress_zstandard(data, declared, max_size):
                 break
             used += count
     if used != declared:
-        raise ProtocolError("decompressed certificate length mismatch")
+        raise ProtocolError("decompressed certificate length mismatch", alert=42)
     return bytes(result[:used])
 
 
@@ -255,25 +255,25 @@ def decompress_certificate(body: bytes, offered_algorithms, *, max_size=MAX_CRED
             decoder = zlib.decompressobj()
             result = decoder.decompress(data, declared + 1)
             if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
-                raise ProtocolError("incomplete or trailing compressed certificate")
+                raise ProtocolError("incomplete or trailing compressed certificate", alert=42)
         elif algorithm == 2:
             import brotli
             decoder = brotli.Decompressor()
             result = decoder.process(data, output_buffer_limit=declared + 1)
             while not decoder.is_finished() and not decoder.can_accept_more_data():
                 if len(result) > declared:
-                    raise ProtocolError("decompressed certificate exceeds declared length")
+                    raise ProtocolError("decompressed certificate exceeds declared length", alert=42)
                 result += decoder.process(b"", output_buffer_limit=declared + 1 - len(result))
             if not decoder.is_finished():
-                raise ProtocolError("incomplete compressed certificate")
+                raise ProtocolError("incomplete compressed certificate", alert=42)
         else:
             result = _decompress_zstandard(data, declared, max_size)
         if len(result) != declared:
-            raise ProtocolError("decompressed certificate length mismatch")
+            raise ProtocolError("decompressed certificate length mismatch", alert=42)
         return result
     except ProtocolError:
         raise
     except Exception as exc:
         # Provider-specific malformed-input exceptions differ; never leak them or
         # retry another codec/credential representation after authentication fails.
-        raise ProtocolError("certificate decompression failed") from exc
+        raise ProtocolError("certificate decompression failed", alert=42) from exc
