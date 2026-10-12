@@ -12,7 +12,7 @@ from tls20_server.errors import ProtocolError
 from tls20_server.handshake import Wire
 from tls20_server.pki import Credentials
 from tls20_server.tickets import TicketCache
-from tests import test_sessions, test_credential_profiles
+from tests import test_sessions, test_credential_profiles, test_credential_cache
 
 
 class CredentialHandshakeTests(unittest.IsolatedAsyncioTestCase):
@@ -70,6 +70,49 @@ class CredentialHandshakeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(int.from_bytes(certificate[0][4:6], "big"), algorithm)
                 self.assertIn(certificate[0], client.handshake_transcript)
                 self.assertEqual(client.handshake_transcript, self.channels[-1].handshake_transcript)
+
+    async def test_multiframe_zstandard_authenticates_both_directions_and_pha(self):
+        import asyncio
+        import zstandard
+
+        credential = self.raw()
+        policy = CredentialPolicy(peer_name="device", raw_public_keys=(
+            RawPublicKeyBinding("client", "device", credential.chain_der[0]),))
+        self.server_options = {"client_credential_policy": policy, "require_client_auth": True,
+                               "client_certificate_types": (2,), "certificate_compression": (3,)}
+        frames, original_send = [], Wire.send_frame
+
+        async def capture(wire, frame, state=None):
+            frames.append(frame)
+            await original_send(wire, frame, state)
+
+        def compressed(body, algorithm):
+            self.assertEqual(algorithm, 3)
+            compressor = zstandard.ZstdCompressor(write_content_size=False, write_checksum=True)
+            split = len(body) // 2
+            skip = test_credential_cache.CredentialCacheTests.skippable_frame()
+            data = (skip + compressor.compress(body[:split]) + skip
+                    + compressor.compress(body[split:]) + skip)
+            return test_credential_cache.CredentialCacheTests.zstandard_body(data, len(body))
+
+        with patch("tls20_server.handshake.compress_certificate", compressed), \
+             patch.object(Wire, "send_frame", capture):
+            client = await self.connect(client_credentials=credential, post_handshake_auth=True,
+                                        certificate_compression=(3,))
+            server = self.channels[-1]
+            self.assertEqual(server.authenticated_client, tuple(credential.chain_der))
+            self.assertEqual(client.handshake_transcript, server.handshake_transcript)
+            initial_certificates = [frame for frame in frames if frame[0] == 25]
+            self.assertEqual(len(initial_certificates), 2)
+            for frame in initial_certificates:
+                self.assertIn(frame, client.handshake_transcript)
+            frames.clear()
+            future = await server.request_client_auth(required=True)
+            await client.send(b"drive multiframe PHA")
+            self.assertEqual(await asyncio.wait_for(client.recv(), 2), b"drive multiframe PHA")
+            self.assertEqual(await asyncio.wait_for(future, 2), tuple(credential.chain_der))
+            self.assertEqual([frame[0] for frame in frames], [13, 25, 15, 20])
+        self.assertFalse(self.errors)
 
     async def test_cached_server_material_with_and_without_compression(self):
         first = await self.connect()

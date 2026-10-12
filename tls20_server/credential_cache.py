@@ -177,6 +177,69 @@ def compress_certificate(body: bytes, algorithm: int):
     return algorithm.to_bytes(2, "big") + len(body).to_bytes(3, "big") + _vector(data, 3)
 
 
+def _decompress_zstandard(data, declared, max_size):
+    import zstandard
+
+    # RFC 8478 permits concatenated and skippable frames. The streaming API
+    # bounds output, but returns EOF for truncated input too, so first check
+    # each frame's envelope. The provider still validates block contents,
+    # dictionaries, content sizes and checksums during decompression below.
+    source = memoryview(data)
+    cursor, known_size = 0, 0
+    window_limit = max(1024, max_size)
+    while cursor < len(source):
+        if len(source) - cursor < 4:
+            raise ProtocolError("truncated zstandard frame")
+        magic = int.from_bytes(source[cursor:cursor + 4], "little")
+        if 0x184D2A50 <= magic <= 0x184D2A5F:
+            if len(source) - cursor < 8:
+                raise ProtocolError("truncated zstandard skippable frame")
+            cursor += 8 + int.from_bytes(source[cursor + 4:cursor + 8], "little")
+            if cursor > len(source):
+                raise ProtocolError("truncated zstandard skippable frame")
+            continue
+        if magic != 0xFD2FB528:
+            raise ProtocolError("invalid or trailing zstandard frame")
+        parameters = zstandard.get_frame_parameters(source[cursor:])
+        if parameters.window_size > window_limit:
+            raise ProtocolError("zstandard window exceeds credential memory budget")
+        if parameters.content_size != zstandard.CONTENTSIZE_UNKNOWN:
+            known_size += parameters.content_size
+            if known_size > declared:
+                raise ProtocolError("zstandard frames exceed declared credential size")
+        cursor += zstandard.frame_header_size(source[cursor:])
+        while True:
+            if len(source) - cursor < 3:
+                raise ProtocolError("truncated zstandard block header")
+            block = int.from_bytes(source[cursor:cursor + 3], "little")
+            kind = (block >> 1) & 3
+            if kind == 3:
+                raise ProtocolError("reserved zstandard block type")
+            cursor += 3 + (1 if kind == 1 else block >> 3)
+            if cursor > len(source):
+                raise ProtocolError("truncated zstandard block")
+            if block & 1:
+                break
+        if parameters.has_checksum:
+            cursor += 4
+            if cursor > len(source):
+                raise ProtocolError("truncated zstandard checksum")
+
+    # The pinned provider passes max_window_size directly to libzstd in bytes.
+    # Keep an explicit header check as well as the decoder's allocation guard.
+    decoder = zstandard.ZstdDecompressor(max_window_size=window_limit)
+    result, used = bytearray(declared + 1), 0
+    with decoder.stream_reader(source, read_across_frames=True) as reader:
+        while used <= declared:
+            count = reader.readinto(memoryview(result)[used:])
+            if not count:
+                break
+            used += count
+    if used != declared:
+        raise ProtocolError("decompressed certificate length mismatch")
+    return bytes(result[:used])
+
+
 def decompress_certificate(body: bytes, offered_algorithms, *, max_size=MAX_CREDENTIAL_BODY):
     if not isinstance(body, bytes) or not 8 <= len(body) <= max_size + 8:
         raise ProtocolError("compressed credential exceeds local budget")
@@ -204,12 +267,7 @@ def decompress_certificate(body: bytes, offered_algorithms, *, max_size=MAX_CRED
             if not decoder.is_finished():
                 raise ProtocolError("incomplete compressed certificate")
         else:
-            import zstandard
-            frame_size = zstandard.frame_content_size(data)
-            if frame_size not in (zstandard.CONTENTSIZE_UNKNOWN, zstandard.CONTENTSIZE_ERROR) and frame_size > declared:
-                raise ProtocolError("zstandard frame exceeds declared credential size")
-            decoder = zstandard.ZstdDecompressor(max_window_size=max(1024, (max_size + 1023) // 1024))
-            result = decoder.decompress(data, max_output_size=declared, allow_extra_data=False)
+            result = _decompress_zstandard(data, declared, max_size)
         if len(result) != declared:
             raise ProtocolError("decompressed certificate length mismatch")
         return result

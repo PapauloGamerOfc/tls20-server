@@ -361,6 +361,29 @@ and PHA transcripts, intervening KeyUpdate, identity-isolated caches, refused or
 revoked credentials, and cancellation cleanup. These checks supplement, rather
 than replace, end-to-end tests that share implementation code.
 
+### Zstandard multi-frame certificate validation: 2026-10-12
+
+Certificate decompression accepts the RFC 8478 concatenation of Zstandard
+frames, including all skippable-frame magic values and unknown content sizes.
+An envelope check rejects truncated frames before bounded streaming decoding;
+the provider still verifies compressed contents, dictionary requirements and
+checksums. Output is bounded during decoding to the declared length plus one
+overflow byte, and every frame's window remains within the local memory budget.
+Neither concatenation nor metadata permits trailing junk or extra output.
+
+Regressions cover known/unknown sizes, empty, raw and RLE frames, every truncated
+boundary, invalid checksums, reserved blocks, declared-size and window limits.
+Real initial and post-handshake client authentication verifies transcript/MAC
+binding with multi-frame and skippable-frame certificate flights. The former
+decoder fails the new valid-frame regressions.
+
+Windows native-provider suites on Python 3.11 and 3.12 each completed 672 tests:
+670 passed and two POSIX-only checks were skipped. Independent Phromium tests
+also cover full and cached certificate representations, including corrupted
+cache references after successful initial authentication. Logs are retained
+under `build/zstd-dane-*` and the browser's `out/*/zstd-dane-*`. These local
+results are not a claim of completed remote CI or a formal security audit.
+
 ### DANE names, post-handshake alerts and deterministic fixtures: 2026-10-12
 
 DANE evidence selection uses the same strict, case-insensitive DNS-name parser
