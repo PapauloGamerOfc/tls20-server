@@ -272,18 +272,37 @@ class ServerTransportTests(unittest.IsolatedAsyncioTestCase):
         client = None
         server_writer = None
         try:
-            _, client = await asyncio.open_connection("127.0.0.1", listener.sockets[0].getsockname()[1])
+            # Configure the receive window before connecting, and never attach
+            # a StreamReader: pause_reading() can leave a read already in flight
+            # and changing SO_RCVBUF after connect need not shrink that window.
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            client.setblocking(False)
+            await asyncio.get_running_loop().sock_connect(
+                client, ("127.0.0.1", listener.sockets[0].getsockname()[1]))
             server_writer = await accepted
-            client.transport.pause_reading()
-            client.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             server_writer.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-            server_writer.write(b"x" * (2 * 1024 * 1024))
-            # Proactor transports may count their first write as in-flight
-            # rather than buffered; a second immediate write is queued too.
-            server_writer.write(b"y" * (2 * 1024 * 1024))
+            # Fill until drain really blocks, not until an assumed number of
+            # bytes has been accepted by a platform's kernel. Proactor counts
+            # in-flight writes too, even if their completion can drain at once.
+            # The cap bounds fixture memory if a platform ignores buffer sizes.
+            chunk = b"x" * (1024 * 1024)
+            for _ in range(64):
+                server_writer.write(chunk)
+                try:
+                    await asyncio.wait_for(server_writer.drain(), 0.03)
+                except TimeoutError:
+                    # A completion may win the race with the timeout callback.
+                    # Only stop when there is still actual pending output.
+                    if server_writer.transport.get_write_buffer_size() > 0:
+                        break
+            else:
+                self.fail("Unread loopback peer did not produce backpressure within 64 MiB")
             self.assertGreater(server_writer.transport.get_write_buffer_size(), 0)
-            with patch("tls20_server.server.CLOSE_WAIT_SECONDS", 0.03):
+            with patch("tls20_server.server.CLOSE_WAIT_SECONDS", 0.03), patch.object(
+                    server_writer.transport, "abort", wraps=server_writer.transport.abort) as abort:
                 await asyncio.wait_for(_close_writer(server_writer), 1)
+                abort.assert_called_once()
             await asyncio.sleep(0)
             self.assertEqual(server_writer.transport.get_write_buffer_size(), 0)
             # A still-buffered accepted transport would hang wait_closed on
@@ -292,7 +311,7 @@ class ServerTransportTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(listener.wait_closed(), 1)
         finally:
             if client is not None:
-                client.transport.abort()
+                client.close()
             if server_writer is not None:
                 server_writer.transport.abort()
             listener.close()

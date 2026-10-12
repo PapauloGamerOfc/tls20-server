@@ -25,13 +25,13 @@ def _vector(value: bytes, width: int) -> bytes:
     return len(value).to_bytes(width, "big") + value
 
 
-def _take(data: bytes, cursor: int, width: int):
+def _take(data: bytes, cursor: int, width: int, *, alert=40):
     if cursor + width > len(data):
-        raise ProtocolError("truncated credential representation")
+        raise ProtocolError("truncated credential representation", alert=alert)
     size = int.from_bytes(data[cursor:cursor + width], "big")
     cursor += width
     if cursor + size > len(data):
-        raise ProtocolError("truncated credential representation")
+        raise ProtocolError("truncated credential representation", alert=alert)
     return data[cursor:cursor + size], cursor + size
 
 
@@ -73,30 +73,32 @@ def resolve_cached_certificate(body, snapshots, *, credential_type=0, expected_c
     """
     if len(body) > MAX_CREDENTIAL_BODY:
         raise ProtocolError("cached credential exceeds local budget")
-    context, cursor = _take(body, 0, 1)
-    if context != expected_context or cursor + 32 > len(body):
-        raise ProtocolError("cached credential context or hash is invalid")
+    context, cursor = _take(body, 0, 1, alert=50)
+    if cursor + 32 > len(body):
+        raise ProtocolError("truncated cached credential hash", alert=50)
     wanted = body[cursor:cursor + 32]
-    metadata, end = _take(body, cursor + 32, 3)
+    metadata, end = _take(body, cursor + 32, 3, alert=50)
     if end != len(body):
-        raise ProtocolError("trailing cached credential data")
+        raise ProtocolError("trailing cached credential data", alert=50)
+    if context != expected_context:
+        raise ProtocolError("cached credential context is invalid", alert=47)
     matched = None
     for kind, entries in snapshots:
         entries = tuple(entries)
         if hmac.compare_digest(material_hash(entries, kind), wanted):
             if kind != credential_type or matched is not None and matched != entries:
-                raise ProtocolError("ambiguous cached credential material")
+                raise ProtocolError("ambiguous cached credential material", alert=47)
             matched = entries
     if matched is None:
-        raise ProtocolError("unoffered or missing cached credential material")
+        raise ProtocolError("unoffered or missing cached credential material", alert=47)
     blocks, cursor = [], 0
     while cursor < len(metadata):
-        value, cursor = _take(metadata, cursor, 2)
+        value, cursor = _take(metadata, cursor, 2, alert=50)
         blocks.append(value)
         if len(blocks) > len(matched):
-            raise ProtocolError("cached credential metadata count mismatch")
+            raise ProtocolError("cached credential metadata count mismatch", alert=47)
     if len(blocks) != len(matched):
-        raise ProtocolError("cached credential metadata count mismatch")
+        raise ProtocolError("cached credential metadata count mismatch", alert=47)
     # Reconstructed Certificate-body size is bounded independently of reference.
     if 1 + len(context) + 3 + sum(5 + len(entry) + len(ext)
             for entry, ext in zip(matched, blocks)) > MAX_CREDENTIAL_BODY:
@@ -136,19 +138,19 @@ def cached_request_body(context: bytes, extension_block: bytes, fresh_share: byt
 
 
 def resolve_cached_request(body: bytes, templates):
-    context, cursor = _take(body, 0, 1)
+    context, cursor = _take(body, 0, 1, alert=50)
     if cursor + 64 != len(body):
-        raise ProtocolError("invalid cached certificate request")
+        raise ProtocolError("invalid cached certificate request", alert=50)
     wanted, share = body[cursor:cursor + 32], body[cursor + 32:]
     matched = None
     for extension_block in templates:
         template = request_template(extension_block)
         if hmac.compare_digest(hashlib.sha256(template).digest(), wanted):
             if matched is not None and matched != template:
-                raise ProtocolError("ambiguous cached request template")
+                raise ProtocolError("ambiguous cached request template", alert=47)
             matched = template
     if matched is None:
-        raise ProtocolError("unoffered cached request template")
+        raise ProtocolError("unoffered cached request template", alert=47)
     if len(matched) - 2 + 36 > 65535:
         raise ProtocolError("reconstructed certificate request exceeds wire length")
     # Reconstruct the extension block, with its fresh share LAST, only for the

@@ -482,6 +482,24 @@ selection values retain `illegal_parameter` (47). These parsing checks do not
 replace certificate, grant, responder-trust or application-authorization checks;
 the shared DER helpers retain their existing defaults for other consumers.
 
+CachedCertificate and CachedCertificateRequest references follow the same
+syntax/semantic distinction: truncated contexts, hashes, shares or metadata
+vectors and trailing bytes produce `decode_error`; well-framed unknown hashes,
+wrong contexts and metadata-count mismatches produce `illegal_parameter`.
+Wire regressions cover plain and compressed certificates and initial and
+post-handshake requests. Local reconstruction budgets remain independent of
+peer syntax validation.
+
+Early-exporter test teardown waits for the peer handler to consume close_notify
+before explicitly destroying its record keys. An event-gated regression checks
+that ordering without sleeps; selector and proactor event loops need not
+schedule peer shutdown identically.
+The transport backpressure fixture likewise waits for actual blocked output
+from a non-reading loopback peer within a bounded write budget, rather than
+assuming a fixed number of bytes fills every operating system's TCP buffers.
+It checks that shutdown really invokes transport abort and leaves no buffered
+output behind.
+
 Password retries may carry only a salt after a proactive ClientHello with one
 password key share: the group remains unchanged and the commitment is recomputed.
 Empty or mixed initial offers still require an explicit group selection. The

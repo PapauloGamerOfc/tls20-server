@@ -90,6 +90,11 @@ class ExporterProbe:
         await client.send(b"independent 1-RTT application")
         self.test.assertEqual(await client.recv(), b"independent 1-RTT application")
         await client.close()
+        # close() flushes the client's close_notify, but the server handler may
+        # still be decrypting it. Join our handlers before destroying their keys;
+        # selector and proactor loops need not schedule the two endpoints alike.
+        await asyncio.wait_for(asyncio.gather(*tuple(self.test.tasks)), 2)
+        self.test.assertFalse(self.test.errors)
         server.abort()
         for handles in self.handles.values():
             self.assert_closed(handles)
@@ -101,6 +106,45 @@ class OrdinaryEarlyExporterTests(unittest.IsolatedAsyncioTestCase):
     accept = test_sessions.SessionTests.accept
     handle = test_sessions.SessionTests.handle
     connect = test_sessions.SessionTests.connect
+
+    async def test_probe_waits_for_handler_completion_before_aborting(self):
+        handler_at_exit, release_handler, aborted = (asyncio.Event() for _ in range(3))
+        original_handle = self.handle
+
+        async def delayed_handler(reader, writer):
+            await original_handle(reader, writer)
+            handler_at_exit.set()
+            await release_handler.wait()
+
+        self.handle = delayed_handler
+        key = ExternalPSK(b"fixture PSK", b"fixture secret", "localhost")
+        probe = ExporterProbe(self, handshake, available=True)
+        self.server_options = {"external_psks": (key,),
+            "on_early_exporter": probe.callback("server"), "diagnostics": "server"}
+        with probe:
+            client = await self.connect(external_psks=(key,),
+                on_early_exporter=probe.callback("client"), diagnostics="client")
+        server = self.channels[-1]
+        original_abort = type(server).abort
+
+        def observe_abort(channel):
+            if channel is server:
+                aborted.set()
+            return original_abort(channel)
+
+        with patch.object(type(server), "abort", observe_abort):
+            completion = asyncio.create_task(probe.finish(client, server))
+            try:
+                await asyncio.wait_for(handler_at_exit.wait(), 2)
+                # A deliberately delayed handler makes the teardown ordering
+                # deterministic even on loops where close_notify usually wins.
+                self.assertFalse(completion.done())
+                self.assertFalse(aborted.is_set())
+            finally:
+                release_handler.set()
+                await asyncio.wait_for(completion, 2)
+        self.assertTrue(aborted.is_set())
+        self.assertFalse(self.errors)
 
     async def test_first_vs_later_identity_with_and_without_retry_or_early_payload(self):
         first = ExternalPSK(b"first sha256", b"public fixture one", "localhost", max_early_data=1024)
@@ -279,6 +323,8 @@ class PasswordEarlyExporterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await wire.read_record(app_receiver), (b"valid 1-RTT", 23))
                 writer.write(app_sender.seal(b"\x01\x00", 21))
                 await writer.drain()
+                await asyncio.wait_for(asyncio.gather(*tuple(self.tasks)), 2)
+                self.assertFalse(self.errors)
         finally:
             for state in records:
                 state.close()
