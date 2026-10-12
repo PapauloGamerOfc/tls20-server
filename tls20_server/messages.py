@@ -318,6 +318,12 @@ def client_hello(A: bytes, B: bytes, name: str, random: bytes,
                  + b"\x01\x00" + _vec(ext, 2))
 
 
+def validate_ct_request_extensions(extensions):
+    """CT request offers are empty, unlike their CertificateEntry responses."""
+    if any(kind in extensions and extensions[kind] for kind in (18, 52)):
+        raise ProtocolError("certificate transparency request must be empty", alert=50)
+
+
 def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticated=None) -> ClientHello:
     r = _Reader(body)
     if r.take(2) != b"\x03\x03":
@@ -339,6 +345,12 @@ def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticat
     r.end()
     validate_extension_context(ext, "CH")
     validate_delegation_offer(ext)
+    validate_ct_request_extensions(ext)
+    # RFC 9846 section 9.2 requires these as a pair even for PSK-only offers.
+    # Check presence before parsing shares, so a missing group list is not
+    # misreported as an unadvertised individual key share (illegal_parameter).
+    if (10 in ext) != (51 in ext):
+        raise ProtocolError("supported_groups and key_share must be paired", alert=109)
     if 5 in ext:
         parse_status_request(ext[5])
     if 47 in ext:
@@ -618,6 +630,7 @@ def parse_certificate_request(body: bytes, *, details=False):
     r = _Reader(body); context = r.vector(1); ext = extensions(r.vector(2)); r.end()
     validate_extension_context(ext, "CR")
     validate_delegation_offer(ext)
+    validate_ct_request_extensions(ext)
     if 5 in ext:
         parse_status_request(ext[5], certificate_request=True)
     if 47 in ext:

@@ -30,8 +30,12 @@ class GenericHandshakeTests(unittest.IsolatedAsyncioTestCase):
         self.server_options = {"external_psks": (key,)}
         for groups in (b"\x2a\x2a", b"\xfe\xff", b"\x2a\x2a\xfe\xff"):
             with self.subTest(groups=groups):
+                # An advisory list with no common group is legal for psk_ke,
+                # but RFC 9846 section 9.2 still requires its paired key_share.
                 channel = await self.connect(external_psk=key, psk_modes=(0,),
-                    certificate_evidence_extensions=((10, m._vec(groups, 2)),))
+                    certificate_evidence_extensions=((10, m._vec(groups, 2)), (51, b"\0\0")))
+                self.assertEqual(dict(channel.local_capabilities)[10], m._vec(groups, 2))
+                self.assertEqual(dict(channel.local_capabilities)[51], b"\0\0")
                 await channel.send(b"PSK-only data")
                 self.assertEqual(await channel.recv(), b"PSK-only data")
         self.assertFalse(self.errors)

@@ -167,6 +167,7 @@ def _read_frame(reader, expected):
 
 def _offers(extensions, role):
     m.validate_delegation_offer(extensions)
+    m.validate_ct_request_extensions(extensions)
     if 50 not in extensions:
         raise ProtocolError("authenticator request requires certificate path algorithms")
     algorithms = m._u16_list(extensions[50])
@@ -488,10 +489,10 @@ class AuthenticatorManager:
                 raise ProtocolError("no retained local authenticator request")
             if (not self.channel.enable_authenticators or self.channel.auth_share_secret is None):
                 raise ProtocolError("spontaneous authenticator capability is unavailable")
-            self._claim(context)
             parsed = None
             offers = dict(self.channel.local_capabilities)
             _offers(offers, role)
+            self._claim(context)
             state = _ValidationState(self.channel.auth_share_secret, asyncio.get_running_loop().create_future())
         self._inflight[context] = state
         try:
