@@ -185,6 +185,16 @@ and disposal of temporary traffic states. The password tests require the
 explicit native-provider manifest described in the profile guide; ordinary
 test discovery reports their absence rather than claiming native coverage.
 
+Finished regressions distinguish a body whose size differs from the negotiated
+hash (`decode_error`, 50) from a correctly sized, invalid MAC (`decrypt_error`,
+51, or the password server's authentication-failure mask, 20). Loopback tests
+cover both directions, both SHA-256/SHA-384 sizes, and post-handshake client
+authentication with a selected identity or an authenticated refusal. Credential
+request tests validate CA/OID filters before refusing an identity; compression
+tests distinguish malformed framing, unoffered algorithms and decoding failure.
+Lifecycle regressions verify that retired traffic epochs and temporary keys are
+released after their last permitted use, including error paths.
+
 ## Further documentation
 
 - [Configuration](docs/configuration.md)

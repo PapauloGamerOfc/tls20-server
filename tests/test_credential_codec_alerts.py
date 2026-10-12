@@ -2,6 +2,7 @@
 
 import asyncio
 import unittest
+import zlib
 from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
@@ -23,7 +24,34 @@ def altered_compression(body, algorithm, variant):
     if variant in ("short", "long"):
         delta = -1 if variant == "short" else 1
         return packed[:2] + (len(body) + delta).to_bytes(3, "big") + packed[5:]
+    if variant == "truncated":
+        return packed[:-1]
+    if variant == "trailing":
+        return packed + b"x"
+    if variant == "empty-vector":
+        return packed[:5] + bytes(3)
+    if variant == "unoffered":
+        return (1 if algorithm != 1 else 2).to_bytes(2, "big") + packed[2:]
+    if variant == "unknown":
+        return b"\xff\xff" + packed[2:]
+    if variant == "declared-zero":
+        return packed[:2] + bytes(3) + packed[5:]
+    if variant == "empty-decoded":
+        if algorithm == 1:
+            data = zlib.compress(b"")
+        elif algorithm == 2:
+            import brotli
+            data = brotli.compress(b"")
+        else:
+            import zstandard
+            data = zstandard.ZstdCompressor().compress(b"")
+        return packed[:2] + bytes(3) + len(data).to_bytes(3, "big") + data
     return packed
+
+
+VARIANT_ALERTS = {"garbage": 42, "short": 42, "long": 42, "truncated": 50,
+    "trailing": 50, "empty-vector": 50, "unoffered": 47, "unknown": 47,
+    "declared-zero": 42, "empty-decoded": 50}
 
 
 class CodecAlertTests(unittest.TestCase):
@@ -42,6 +70,30 @@ class CodecAlertTests(unittest.TestCase):
                 with self.subTest(algorithm=algorithm, invalid=invalid), self.assertRaises(ProtocolError) as caught:
                     credential_cache.decompress_certificate(invalid, offers)
                 self.assertNotEqual(caught.exception.alert, 42)
+
+    def test_compressed_envelope_syntax_semantics_and_local_limits(self):
+        body = b"bounded credential" * 20
+        for algorithm in (1, 2, 3):
+            packed = credential_cache.compress_certificate(body, algorithm)
+            for variant, alert in VARIANT_ALERTS.items():
+                with self.subTest(algorithm=algorithm, variant=variant):
+                    invalid = altered_compression(body, algorithm, variant)
+                    if variant == "empty-decoded":
+                        self.assertEqual(credential_cache.decompress_certificate(invalid, (algorithm,)), b"")
+                    else:
+                        with self.assertRaises(ProtocolError) as caught:
+                            credential_cache.decompress_certificate(invalid, (algorithm,))
+                        self.assertEqual(caught.exception.alert, alert)
+            for size in range(8):
+                with self.assertRaises(ProtocolError) as caught:
+                    credential_cache.decompress_certificate(packed[:size], (algorithm,))
+                self.assertEqual(caught.exception.alert, 50)
+            with self.assertRaises(ProtocolError) as caught:
+                credential_cache.decompress_certificate(packed, (algorithm,), max_size=len(body) - 1)
+            self.assertEqual(caught.exception.alert, 40)
+            with self.assertRaises(ProtocolError) as caught:
+                credential_cache.decompress_certificate(packed, (algorithm,), max_size=1)
+            self.assertEqual(caught.exception.alert, 40)
 
     def test_unknown_cached_hash_must_still_have_valid_vector_length(self):
         for length in (1, 32, 255):
@@ -73,7 +125,7 @@ class CodecWireTests(unittest.IsolatedAsyncioTestCase):
         original_read = handshake.Wire.read_record
         for role in ("server", "client"):
             for algorithm in (1, 2, 3):
-                for variant in ("valid", "garbage", "short", "long"):
+                for variant in ("valid", *VARIANT_ALERTS):
                     with self.subTest(role=role, algorithm=algorithm, variant=variant):
                         self.cache = TicketCache()
                         self.server_options = {} if role == "server" else {
@@ -106,14 +158,14 @@ class CodecWireTests(unittest.IsolatedAsyncioTestCase):
                             else:
                                 with self.assertRaises(ProtocolError) as caught:
                                     await self.connect(**options)
-                                self.assertEqual(caught.exception.alert, 42)
+                                self.assertEqual(caught.exception.alert, VARIANT_ALERTS[variant])
                                 await asyncio.wait_for(received.wait(), 2)
-                                self.assertEqual(seen, [(True, b"\x02\x2a")])
+                                self.assertEqual(seen, [(True, bytes((2, VARIANT_ALERTS[variant])))])
 
     async def test_post_handshake_client_codec_errors_use_bad_certificate(self):
         credential, policy = self.client_credential()
         for algorithm in (1, 2, 3):
-            for variant in ("valid", "garbage", "short", "long"):
+            for variant in ("valid", *VARIANT_ALERTS):
                 with self.subTest(algorithm=algorithm, variant=variant):
                     self.cache = TicketCache()
                     self.server_options = {"client_credential_policy": policy, "require_client_auth": True,
@@ -135,7 +187,7 @@ class CodecWireTests(unittest.IsolatedAsyncioTestCase):
                         else:
                             with self.assertRaises(ProtocolError) as received:
                                 await asyncio.wait_for(client.recv(), 2)
-                            self.assertEqual(received.exception.alert, 42)
+                            self.assertEqual(received.exception.alert, VARIANT_ALERTS[variant])
                             # A fatal record aborts the channel and cancels its
                             # outstanding PHA promise; the peer already proved
                             # the exact encrypted alert above.

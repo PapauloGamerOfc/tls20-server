@@ -303,14 +303,14 @@ class GOSTProvider(OpenSSLProvider):
         output, encoded = ct.create_string_buffer(width), _buffer(public)
         try:
             peer, _ = self._parameters(group, False)
-            self._check(self.lib.EVP_PKEY_set1_encoded_public_key(peer, encoded, len(public)))
+            self._check(self.lib.EVP_PKEY_set1_encoded_public_key(peer, encoded, len(public)), alert=47)
             # Reject coordinate reductions/noncanonical wire encodings too.
             if self._public(peer, width) != public:
                 raise ProtocolError("noncanonical GOST point", alert=47)
             check = self.lib.EVP_PKEY_CTX_new_from_pkey(self._context, peer, None)
             if not check:
                 raise ProtocolError("GOST validation context unavailable")
-            self._check(self.lib.EVP_PKEY_public_check(check))
+            self._check(self.lib.EVP_PKEY_public_check(check), alert=47)
             context = self.lib.EVP_PKEY_CTX_new_from_pkey(self._context, private.pointer, None)
             if not context:
                 raise ProtocolError("GOST exchange context unavailable")

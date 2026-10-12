@@ -15,11 +15,12 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from tls20_server import crypto as c, messages as m
 from tls20_server.application_auth import (
     AuthenticatorManager, AuthorizedIdentity, credential_validator, parse_request,
+    _frame,
 )
 from tls20_server.errors import ProtocolError
 from tls20_server.lab import generate_lab_credentials
 from tls20_server.credential_profiles import CredentialPolicy
-from tls20_server.credential_selection import encode_oid_filters
+from tls20_server.credential_selection import encode_oid_filters, encode_certificate_authorities, _oid_der
 from tls20_server.pki import Credentials
 from tests.test_pki import issue, der
 
@@ -109,6 +110,44 @@ class AuthenticatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.server.validate(response, self.policy)).authenticated)
         with self.assertRaises(ProtocolError):
             self.server.authenticate(self.credentials, request=request)
+
+    async def test_filter_syntax_is_checked_before_empty_authenticator_refusal(self):
+        oid = _oid_der("2.5.29.15")
+        item = m._vec(oid, 1) + m._vec(b"", 2)
+        malformed = (
+            (47, b"", 50), (47, b"\0\0", 50),
+            (47, m._vec(m._vec(b"not DER", 2), 2), 50),
+            (48, b"", 50), (48, b"\0\x01\0", 50),
+            (48, m._vec(m._vec(b"\x06\0", 1) + m._vec(b"", 2), 2), 50),
+            (48, m._vec(item + item, 2), 47),
+            (48, encode_oid_filters([("2.5.29.15", b"")])[:-2] + b"\0\x01", 50),
+        )
+        for verifier, prover in ((self.client, self.server), (self.server, self.client)):
+            for kind, value, alert in malformed:
+                with self.subTest(role=prover.channel.role, kind=kind, value=value):
+                    # Build a peer's request directly, bypassing local encoding
+                    # checks. Presence or absence of credentials changes no
+                    # syntax requirement and must not consume its context.
+                    verifier_ext = 0xff02 if prover.channel.role == "server" else 0xff03
+                    wire = _frame(17 if prover.channel.role == "server" else 13,
+                        m._vec(b"filter-request", 1) + m._vec(m.extension(verifier_ext, c.public_bytes(self.share))
+                            + m.extension(50, m._vec(b"\x08\x07", 2)) + m.extension(kind, value), 2))
+                    for credentials in (None, self.credentials):
+                        with self.assertRaises(ProtocolError) as caught:
+                            prover.authenticate(credentials, request=wire)
+                        self.assertEqual(caught.exception.alert, alert)
+            # Legal filters may be unmatched, empty (OID list), or contain an
+            # unknown OID. A well-formed unknown extension remains ignorable.
+            filters = (
+                (47, encode_certificate_authorities([self.root_cert.subject])),
+                (48, b"\0\0"), (48, encode_oid_filters([("1.2.3.4", b"opaque")])),
+                (0xaaaa, b"ignored"),
+            )
+            for extra in filters:
+                request = verifier.request(extra_extensions=(extra,))
+                response = prover.authenticate(None, request=request)
+                result = await verifier.validate(response, self.policy, request=request)
+                self.assertFalse(result.authenticated)
 
     async def test_requested_oid_filters_select_credentials_or_authenticated_refusal(self):
         ca = ec.generate_private_key(ec.SECP256R1())

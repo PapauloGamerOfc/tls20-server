@@ -484,7 +484,7 @@ class SecureChannel:
             state["transcript"].extend(frame)
             state["stage"] = "finished"
         elif kind == 20 and state["stage"] == "finished":
-            if not self.schedule.verify_finished(self.receiver.secret, bytes(state["transcript"]), body):
+            if not _verify_finished(self.schedule, self.receiver.secret, bytes(state["transcript"]), body):
                 raise ProtocolError("post-handshake client Finished failed", alert=51)
             if state["required"] and not state["chain"]:
                 raise ProtocolError("client certificate required", alert=116)
@@ -829,6 +829,18 @@ class SecureChannel:
                 raise
 
 
+def _verify_finished(schedule, secret, transcript, body):
+    """Distinguish the fixed negotiated wire size from a failed MAC.
+
+    The framing layer can recognize supported sizes but does not know which
+    hash was negotiated. All initial, PHA and password Finished paths share
+    this check before their authentication-specific failure policy applies.
+    """
+    if len(body) != c.hash_length(schedule.hash_name):
+        raise ProtocolError("Finished body must have the negotiated hash length", alert=50)
+    return schedule.verify_finished(secret, transcript, body)
+
+
 def handshake_keys(root, transcript, hash_name=None):
     schedule = c.KeySchedule(c.secret_hash(root, hash_name))
     return (schedule.derive_secret(root, "c hs traffic", transcript.snapshot()),
@@ -838,6 +850,11 @@ def handshake_keys(root, transcript, hash_name=None):
 def application_keys(root, transcript, hash_name=None):
     schedule = c.KeySchedule(c.secret_hash(root, hash_name))
     master = schedule.master_secret(root)
+    return application_keys_from_master(master, transcript, schedule.hash_name)
+
+
+def application_keys_from_master(master, transcript, hash_name=None):
+    schedule = c.KeySchedule(c.secret_hash(master, hash_name))
     return (schedule.derive_secret(master, "c ap traffic", transcript.snapshot()),
             schedule.derive_secret(master, "s ap traffic", transcript.snapshot()))
 
@@ -1670,29 +1687,39 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             sf = m.frame(20, schedule.finished(server_secret, transcript.snapshot()))
             transcript.add(sf)
             await wire.send_frame(sf, sender)
-            client_app, server_app = application_keys(traffic_root, transcript, schedule.hash_name)
+            master = schedule.master_secret(traffic_root)
+            traffic_root = server_secret = None
+            client_app, server_app = application_keys_from_master(master, transcript, schedule.hash_name)
             # Sending ServerFinished transitions our write epoch immediately,
             # including alerts emitted while waiting for ClientFinished.
+            handshake_sender = sender
             sender = secrets.record(server_app, "seal", selected_id, send_limit, provider=native_provider)
-            exporter = schedule.derive_secret(schedule.master_secret(traffic_root), "exp master", transcript.snapshot())
+            secrets.close_record(handshake_sender)
+            handshake_sender = None
+            exporter = schedule.derive_secret(master, "exp master", transcript.snapshot())
+            if not (ticket_store is not None and 45 in hello.extensions and successor_modes):
+                master = None
             emit_diagnostic(diagnostics, "TLS20_CLIENT_TRAFFIC_SECRET_0", hello.random, client_app)
             emit_diagnostic(diagnostics, "TLS20_SERVER_TRAFFIC_SECRET_0", hello.random, server_app)
             emit_diagnostic(diagnostics, "TLS20_EXPORTER_SECRET", hello.random, exporter)
             await expose_exporter(on_exporter, exporter, exporter_accesses,
                                   stage="server-finished", role="server", hash_name=schedule.hash_name)
-            early_exporter = None
+            early_exporter = early_receiver = None
             # The API revokes early-exporter access on HRR, like its client.
             # CH2 may remove incompatible PSKs: its identity zero must never
             # be substituted for CH1's early PSK when deriving over CH1.
             if ticket is not None and selected_identity == 0 and not retried:
                 early_root = c.extract(bytes(selected.hash_length), ticket.psk, schedule.hash_name)
                 early_exporter = schedule.derive_secret(early_root, "e exp master", c.PREFACE + initial_ch)
+                if accepted:
+                    early_receiver = secrets.record(schedule.derive_secret(early_root,
+                        "c e traffic", c.PREFACE + ch), "open", selected_id,
+                        ticket.record_size_limit, provider=native_provider)
+                early_root = None
                 emit_diagnostic(diagnostics, "TLS20_EARLY_EXPORTER_SECRET", hello.random, early_exporter)
                 await expose_exporter(on_early_exporter, early_exporter, exporter_accesses,
                                       stage="early", role="server", hash_name=schedule.hash_name)
             if hello.early_data:
-                early_receiver = (secrets.record(schedule.derive_secret(c.extract(bytes(selected.hash_length), ticket.psk, schedule.hash_name),
-                    "c e traffic", c.PREFACE + ch), "open", selected_id, ticket.record_size_limit, provider=native_provider) if accepted else None)
                 if early_receiver is not None:
                     emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", hello.random, early_receiver.secret)
                 total, discarded = 0, 0
@@ -1711,6 +1738,8 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                             wire.pending.extend(content)
                             eoed = await wire.receive_frame(5, early_receiver, boundary=True)
                             transcript.add(eoed)
+                            secrets.close_record(early_receiver)
+                            early_receiver = None
                             await on_early_data(b"")
                             break
                         if kind != 23:
@@ -1773,9 +1802,14 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             client_mac_verified = client_auth_private is not None
             client_auth_private = None
             cf = await wire.receive_frame(20, receiver, boundary=True)
-            if not schedule.verify_finished(client_secret, transcript.snapshot(), cf[4:]):
+            if not _verify_finished(schedule, client_secret, transcript.snapshot(), cf[4:]):
                 raise ProtocolError("client Finished verification failed", alert=51)
             transcript.add(cf)
+            secrets.close_record(receiver)
+            receiver = client_secret = None
+            resumption = (schedule.derive_secret(master, "res master", transcript.snapshot())
+                if master is not None else None)
+            master = None
             if require_client_auth and not client_chain:
                 raise ProtocolError("client certificate required", alert=116)
             bootstrap_authorization = None
@@ -1822,9 +1856,11 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
             for access in exporter_accesses:
                 access.complete(peer_authenticated=bool(ticket is not None or authenticated_client))
             channel._exporter_accesses = tuple(exporter_accesses)
+            retired_sender = sender
             sender = channel.sender
+            secrets.close_record(retired_sender)
+            retired_sender = None
             if ticket_store is not None and 45 in hello.extensions and successor_modes:
-                resumption = schedule.derive_secret(schedule.master_secret(traffic_root), "res master", transcript.snapshot())
                 count = controls.expected_tickets if controls.expected_tickets is not None else 1
                 for _ in range(count):
                     message = ticket_store.issue(resumption, server_name, protocol,
@@ -2195,17 +2231,19 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
             writer.write(c.PREFACE)
             await wire.send_frame(ch)
             wire.allow_ccs = True
-            early_exporter = None
+            early_exporter = early_sender = None
             if ticket:
                 early_root = c.extract(bytes(psk_length), ticket.psk, psk_hash)
                 early_exporter = c.derive_secret(early_root, "e exp master", transcript.snapshot(), psk_hash)
+                if offer_early:
+                    early_sender = secrets.record(c.derive_secret(early_root,
+                        "c e traffic", transcript.snapshot(), psk_hash), "seal", ticket.cipher_suite,
+                        ticket.record_size_limit, provider=native_provider)
+                early_root = None
                 emit_diagnostic(diagnostics, "TLS20_EARLY_EXPORTER_SECRET", random, early_exporter)
                 await expose_exporter(on_early_exporter, early_exporter, exporter_accesses,
                                       stage="early", role="client", hash_name=psk_hash)
             if offer_early:
-                early_sender = secrets.record(c.derive_secret(early_root,
-                    "c e traffic", transcript.snapshot(), psk_hash), "seal", ticket.cipher_suite,
-                    ticket.record_size_limit, provider=native_provider)
                 emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", random, early_sender.secret)
                 early_chunk = min(16384, ticket.record_size_limit - 1)
                 for offset in range(0, len(early_data), early_chunk):
@@ -2250,6 +2288,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 # early exporters in every protocol that uses HRR. Revoke now,
                 # before an awaited CH2/ServerHello can expose a stale handle.
                 early_exporter = None
+                secrets.close_record(early_sender)
+                early_sender = None
                 for access in exporter_accesses:
                     if access.stage == "early":
                         access.close()
@@ -2385,6 +2425,9 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 roots_hash = client_ticket_context(bootstrap_binding, protocol)
             if accepted and (not resumed or psk_index != 0 or ticket.cipher_suite != selected_id):
                 raise ProtocolError("early data requires selected PSK", alert=47)
+            if not accepted:
+                secrets.close_record(early_sender)
+                early_sender = None
             transcript.add(ee)
             # Use the final, serialized ClientHello (including HRR changes),
             # not the subset of extras assembled for certificate evidence.
@@ -2471,16 +2514,20 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     raise ProtocolError("server authentication verification failed", alert=51)
                 transcript.add(cv)
             sf = await wire.receive_frame(20, receiver, boundary=True)
-            if not schedule.verify_finished(server_secret, transcript.snapshot(), sf[4:]):
+            if not _verify_finished(schedule, server_secret, transcript.snapshot(), sf[4:]):
                 raise ProtocolError("server Finished verification failed", alert=51)
             transcript.add(sf)
+            secrets.close_record(receiver)
+            receiver = server_secret = None
             if pin_attempt is not None:
                 effective_spki = static_key.public_bytes(serialization.Encoding.DER,
                     serialization.PublicFormat.SubjectPublicKeyInfo)
                 pin_attempt.verify(selected_extensions.get(32), traffic_root, pinning_transcript,
                                    effective_spki, authenticated=True, hash_name=schedule.hash_name)
-            client_app, server_app = application_keys(traffic_root, transcript, schedule.hash_name)
-            exporter = schedule.derive_secret(schedule.master_secret(traffic_root), "exp master", transcript.snapshot())
+            master = schedule.master_secret(traffic_root)
+            traffic_root = None
+            client_app, server_app = application_keys_from_master(master, transcript, schedule.hash_name)
+            exporter = schedule.derive_secret(master, "exp master", transcript.snapshot())
             emit_diagnostic(diagnostics, "TLS20_CLIENT_TRAFFIC_SECRET_0", random, client_app)
             emit_diagnostic(diagnostics, "TLS20_SERVER_TRAFFIC_SECRET_0", random, server_app)
             emit_diagnostic(diagnostics, "TLS20_EXPORTER_SECRET", random, exporter)
@@ -2504,6 +2551,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 eoed = m.frame(5, b"")
                 await wire.send_frame(eoed, early_sender)
                 transcript.add(eoed)
+                secrets.close_record(early_sender)
+                early_sender = None
             if client_auth_request is not None:
                 context, share, algorithms, request_extensions = client_auth_request
                 candidates = preferred_credentials((value for value in (
@@ -2518,10 +2567,15 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     await wire.send_frame(message, sender)
             cf = m.frame(20, schedule.finished(client_secret, transcript.snapshot()))
             await wire.send_frame(cf, sender)
+            handshake_sender = sender
             sender = secrets.record(client_app, "seal", selected_id, send_limit, provider=native_provider)
+            secrets.close_record(handshake_sender)
+            handshake_sender = client_secret = None
             if pin_attempt is not None:
                 pin_attempt.commit()
             transcript.add(cf)
+            resumption = schedule.derive_secret(master, "res master", transcript.snapshot())
+            master = None
             wire.check_deadline()
             bootstrap_authorization = None
             if bootstrap_binding is not None:
@@ -2535,7 +2589,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 ticket_feature_offers = tuple(sorted(required_certificate_features(
                     x509.load_der_x509_certificate(chain_der[0])).intersection(dict(credential_offers))))
             channel = SecureChannel(wire, client_app, server_app, exporter_secret=exporter,
-                resumption_secret=schedule.derive_secret(schedule.master_secret(traffic_root), "res master", transcript.snapshot()),
+                resumption_secret=resumption,
                 ticket_cache=None if unauthenticated else ticket_cache, name=server_name, context=roots_hash, certificate_chain=chain_der,
                 resumed=resumed and external is None, early_data_accepted=accepted, handshake_transcript=transcript.snapshot(),
                 client_credentials=client_credentials, local_post_handshake_auth=post_handshake_auth
@@ -2557,6 +2611,10 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode,
                 peer_authenticated=not unauthenticated, native_provider=native_provider)
             secrets.establish(channel)
+            retired_sender = sender
+            sender = channel.sender
+            secrets.close_record(retired_sender)
+            retired_sender = None
             channel.client_credential_candidates = credential_candidates
             channel.expected_ticket_count = controls.expected_tickets
             for access in exporter_accesses:

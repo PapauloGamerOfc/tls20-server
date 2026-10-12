@@ -236,9 +236,9 @@ def dh(private: X25519PrivateKey, public: bytes) -> bytes:
     try:
         shared = private.exchange(X25519PublicKey.from_public_bytes(public))
     except ValueError as exc:
-        raise ProtocolError("invalid X25519 shared secret") from exc
+        raise ProtocolError("invalid X25519 shared secret", alert=47) from exc
     if hmac.compare_digest(shared, ZERO32):
-        raise ProtocolError("all-zero X25519 shared secret")
+        raise ProtocolError("all-zero X25519 shared secret", alert=47)
     return shared
 
 
@@ -303,14 +303,14 @@ def traffic_dh(private, group: int, public: bytes, provider=None) -> bytes:
         try:
             return private.exchange(x448.X448PublicKey.from_public_bytes(public))
         except ValueError as exc:
-            raise ProtocolError("invalid X448 traffic share") from exc
+            raise ProtocolError("invalid X448 traffic share", alert=47) from exc
     if group in EC_GROUPS and len(public) == GROUP_LENGTHS[group] and public[0] == 4:
         try:
             peer = ec.EllipticCurvePublicKey.from_encoded_point(EC_GROUPS[group](), public)
             return private.exchange(ec.ECDH(), peer)
         except (ValueError, TypeError) as exc:
-            raise ProtocolError("invalid elliptic-curve traffic share") from exc
-    raise ProtocolError("invalid traffic group or share")
+            raise ProtocolError("invalid elliptic-curve traffic share", alert=47) from exc
+    raise ProtocolError("invalid traffic group or share", alert=47)
 
 
 def traffic_server(group: int, client_share: bytes, provider=None) -> tuple[bytes, bytes]:

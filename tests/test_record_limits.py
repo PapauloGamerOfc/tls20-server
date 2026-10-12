@@ -176,4 +176,4 @@ class RecordLimitNetworkTests(unittest.IsolatedAsyncioTestCase):
         writer.write(c.PREFACE)
         _, public = c.traffic_key(29)
         await wire.send_frame(m.client_hello(bytes(32), public, "localhost", bytes(32)))
-        self.assertEqual(await reader.read(), b"\x15\x03\x03\x00\x02\x02\x28")
+        self.assertEqual(await reader.read(), b"\x15\x03\x03\x00\x02\x02\x2f")

@@ -177,10 +177,10 @@ class OpenSSLProvider:
                 if not self._native_depth and self._context:
                     self.lib.OPENSSL_thread_stop_ex(self._context)
 
-    def _check(self, result):
+    def _check(self, result, *, alert=40):
         if result != 1:
             self.lib.ERR_clear_error()
-            raise ProtocolError("optional native cryptographic operation failed")
+            raise ProtocolError("optional native cryptographic operation failed", alert=alert)
 
     @_synchronized
     def close(self):
@@ -284,11 +284,11 @@ class OpenSSLProvider:
             self._check(self.lib.EVP_PKEY_paramgen_init(importer))
             self._check(self.lib.EVP_PKEY_CTX_set_group_name(importer, b"SM2"))
             self._check(self.lib.EVP_PKEY_generate(importer, ct.byref(peer)))
-            self._check(self.lib.EVP_PKEY_set1_encoded_public_key(peer, data, len(public)))
+            self._check(self.lib.EVP_PKEY_set1_encoded_public_key(peer, data, len(public)), alert=47)
             check = self.lib.EVP_PKEY_CTX_new_from_pkey(self._context, peer, b"provider=default")
             if not check:
                 raise ProtocolError("native public key validation context unavailable")
-            self._check(self.lib.EVP_PKEY_public_check(check))
+            self._check(self.lib.EVP_PKEY_public_check(check), alert=47)
             context = self.lib.EVP_PKEY_CTX_new_from_pkey(self._context, private.pointer, b"provider=default")
             if not context:
                 raise ProtocolError("native ECDH context unavailable")

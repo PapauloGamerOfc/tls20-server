@@ -102,6 +102,12 @@ class HandshakeSecrets:
         self.keys.append(key)
         return key, public
 
+    def close_record(self, state):
+        """Retire an epoch immediately after its last permitted use."""
+        if state is not None:
+            state.close()
+            self.records = [value for value in self.records if value is not state]
+
     def close_key(self, key):
         close = getattr(key, "close", None)
         if close is not None:

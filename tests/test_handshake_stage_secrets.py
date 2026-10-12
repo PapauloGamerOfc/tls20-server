@@ -16,6 +16,7 @@ from tests import test_sessions, test_pake_handshake
 from tls20_server import handshake as hs
 from tls20_server.application_auth import AuthorizedIdentity
 from tls20_server.lab import generate_lab_credentials
+from tls20_server.retry_cookie import RetryCookiePolicy
 
 
 def stage_snapshot():
@@ -36,6 +37,11 @@ def stage_snapshot():
                         ("auth_shared", "auth_root", "traffic_shared", "traffic_private",
                          "shared", "ordinary_private", "auth_private")},
                     "owned_keys": len(values["secrets"].keys),
+                    "epoch_present": {name: values.get(name) is not None for name in
+                        ("traffic_root", "root", "early_root", "server_secret", "early_secret", "secret")},
+                    "records": tuple((state.operation, bool(state.secret),
+                        state is values.get("sender"), state is values.get("receiver"))
+                        for state in values["secrets"].records),
                 })
                 del values
             frame = frame.f_back
@@ -118,6 +124,15 @@ class HandshakeStageSecretTests(unittest.IsolatedAsyncioTestCase):
                                     expected["auth_private"] = snapshot["present"]["auth_private"]
                                     self.assertEqual(snapshot["present"], expected, snapshot["function"])
                                     self.assertEqual(snapshot["owned_keys"], 0, snapshot["function"])
+                                    self.assertFalse(any(snapshot["epoch_present"].values()), snapshot)
+                                    # Every remaining epoch still has a role:
+                                    # server reads CF and writes application;
+                                    # client only writes its unfinished flight.
+                                    expected_records = (("open", True, False, True), ("seal", True, True, False)) if role == "server" else (("seal", True, True, False),)
+                                    if snapshot["function"][1] in ("client", "server") or not mixed:
+                                        self.assertEqual(snapshot["records"], expected_records)
+                                    else:
+                                        self.assertEqual(snapshot["records"], ())
                             if not password and not resumed:
                                 self.assertEqual(len(proof_snapshots), 1)
                                 self.assertFalse(any(proof_snapshots[0]["present"].values()))
@@ -169,6 +184,87 @@ class HandshakeStageSecretTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_only_explicit_authenticator_capability_retains_auth_share(self):
         await self.exchange(authenticators=True)
+
+    async def early_epochs(self, *, password=False):
+        for disposition in ("accepted", "rejected", "retry"):
+            with self.subTest(password=password, disposition=disposition):
+                fixture = test_pake_handshake.PakeHandshakeTests() if password else test_sessions.SessionTests()
+                await fixture.asyncSetUp()
+                try:
+                    first = await fixture.connect()
+                    await first.close()
+                    await asyncio.gather(*tuple(fixture.tasks))
+                    observations, early_accesses = [], []
+                    async def early_exporter(access):
+                        snapshots = stage_snapshot()
+                        self.assertTrue(snapshots)
+                        self.assertTrue(all(not entry["epoch_present"]["early_root"] for entry in snapshots))
+                        early_accesses.append(access)
+                    async def exporter(access):
+                        observations.append(("exporter", access.role, stage_snapshot()))
+                    options = {"on_early_exporter": early_exporter, "on_exporter": exporter}
+                    if disposition == "retry":
+                        options["retry_cookie_policy"] = RetryCookiePolicy()
+                    if password:
+                        fixture.options = options
+                    else:
+                        fixture.server_options = options
+                    original_send, original_receive = hs.Wire.send_frame, hs.Wire.receive_frame
+                    hello_count = 0
+                    async def send(wire, message, state=None):
+                        nonlocal hello_count
+                        if message[0] == 1:
+                            hello_count += 1
+                            if hello_count == 2:
+                                observations.append(("retry", "client", stage_snapshot()))
+                        if message[0] == 20 and wire.writer.get_extra_info("peername")[1] == fixture.port:
+                            observations.append(("client-finished", "client", stage_snapshot()))
+                        return await original_send(wire, message, state)
+                    async def receive(wire, expected, state=None, **kwargs):
+                        if expected == 20 and wire.writer.get_extra_info("peername")[1] != fixture.port:
+                            observations.append(("before-cf", "server", stage_snapshot()))
+                        return await original_receive(wire, expected, state, **kwargs)
+                    # Both paths share the replay gate; rejection is a policy
+                    # control, not a malformed packet or altered transcript.
+                    with patch.object(hs.Wire, "send_frame", send), patch.object(hs.Wire, "receive_frame", receive), \
+                         patch.object(fixture.store, "consume_early", return_value=disposition != "rejected"):
+                        channel = await fixture.connect(early_data=b"epoch transition", on_early_exporter=early_exporter,
+                                                        on_exporter=exporter)
+                    self.assertEqual(channel.early_data_accepted, disposition == "accepted")
+                    for label, role, frames in observations:
+                        for snapshot in frames:
+                            self.assertFalse(snapshot["epoch_present"]["early_root"], (label, snapshot))
+                            if label == "retry":
+                                self.assertEqual(snapshot["records"], ())
+                            elif label == "client-finished":
+                                self.assertEqual(snapshot["records"], (("seal", True, True, False),))
+                            elif label == "before-cf":
+                                self.assertEqual(snapshot["records"], (("open", True, False, True), ("seal", True, True, False)))
+                            elif label == "exporter" and role == "client":
+                                self.assertEqual(len(snapshot["records"]), 2 if disposition == "accepted" else 1)
+                    self.assertTrue(any(label == "client-finished" for label, _, _ in observations))
+                    if disposition == "retry":
+                        self.assertTrue(any(label == "retry" for label, _, _ in observations))
+                        self.assertTrue(all(not access.active for access in early_accesses))
+                    else:
+                        self.assertEqual(len(early_accesses), 2)
+                        self.assertEqual(early_accesses[0].export("retained"), early_accesses[1].export("retained"))
+                    await channel.send(b"live application epoch")
+                    self.assertEqual(await channel.recv(), b"live application epoch")
+                    self.assertEqual(channel.exporter("live"), fixture.channels[-1].exporter("live"))
+                    await channel.close()
+                    await asyncio.gather(*tuple(fixture.tasks))
+                    self.assertFalse(fixture.errors)
+                finally:
+                    await fixture.asyncTearDown()
+
+    async def test_early_epochs_retire_at_retry_rejection_and_end(self):
+        await self.early_epochs()
+
+    @unittest.skipUnless(os.environ.get("TLS20_TEST_PAKE") and os.environ.get("TLS20_TEST_OPENSSL"),
+                         "native PAKE fixture required")
+    async def test_password_early_epochs_retire_at_retry_rejection_and_end(self):
+        await self.early_epochs(password=True)
 
     @unittest.skipUnless(os.environ.get("TLS20_TEST_OPENSSL"), "native provider required")
     async def test_native_traffic_private_is_closed_before_callback(self):

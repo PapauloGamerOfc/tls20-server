@@ -206,6 +206,12 @@ def parse_request(wire):
         raise ProtocolError("server_name is only allowed in a client-generated request")
     _offers(extensions, role)
     _status_request(extensions, requested=True)
+    # Validate recognized filters even when no local credential exists. An
+    # authenticated refusal does not make a malformed request well-formed.
+    if 47 in extensions:
+        m.parse_certificate_authorities(extensions[47])
+    if 48 in extensions:
+        m.parse_oid_filters(extensions[48])
     return AuthenticatorRequest(wire, context, role, extensions[expected], tuple(extensions.items()))
 
 

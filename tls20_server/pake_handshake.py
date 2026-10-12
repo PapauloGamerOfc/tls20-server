@@ -97,8 +97,8 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                  require_server_name=True, require_alpn=True, diagnostics=None,
                  on_exporter=None, on_early_exporter=None, groups=tuple(GROUPS), enable_authenticators=False,
                  retry_cookie_policy=None):
-    from .handshake import (Wire, Transcript, SecureChannel, check_timeout, handshake_keys, application_keys,
-                            _record_limit, _peer_record_limit, _peer_fragment_limit, _retry_psks_unchanged)
+    from .handshake import (Wire, Transcript, SecureChannel, check_timeout, handshake_keys, application_keys_from_master,
+                            _record_limit, _peer_record_limit, _peer_fragment_limit, _retry_psks_unchanged, _verify_finished)
     check_timeout(timeout)
     from .retry_cookie import RetryCookiePolicy, validate_retry_cookie
     if retry_cookie_policy is not None and not isinstance(retry_cookie_policy, RetryCookiePolicy):
@@ -264,6 +264,8 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                                 group=group, resumed=ticket is not None, selected_identity=identity_index)
             transcript.add(sh)
             client_secret, server_secret = handshake_keys(root, transcript, selected.hash_name)
+            master = schedule.master_secret(root)
+            root = None
             _log(diagnostics, hello.random, client_secret, server_secret)
             receiver = secrets.record(client_secret, "open", selected_id, receive_limit)
             sender = secrets.record(server_secret, "seal", selected_id, send_limit)
@@ -284,32 +286,39 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
             transcript.add(ee);await wire.send_frame(ee, sender)
             sf = m.frame(20, schedule.finished(server_secret, transcript.snapshot()))
             transcript.add(sf);await wire.send_frame(sf, sender)
-            client_app, server_app = application_keys(root, transcript, selected.hash_name)
+            server_secret = None
+            client_app, server_app = application_keys_from_master(master, transcript, selected.hash_name)
+            handshake_sender = sender
             sender = secrets.record(server_app, "seal", selected_id, send_limit)
-            exporter = schedule.derive_secret(schedule.master_secret(root), "exp master", transcript.snapshot())
+            secrets.close_record(handshake_sender)
+            handshake_sender = None
+            exporter = schedule.derive_secret(master, "exp master", transcript.snapshot())
+            successor_modes = tuple(mode for mode in dict.fromkeys(hello.psk_modes)
+                if mode in (0, 1) and (ticket is None or mode in ticket.allowed_psk_modes))
+            if not (ticket_store is not None and 45 in ext and successor_modes):
+                master = None
             _log(diagnostics, hello.random, client_app, server_app, application=True)
             emit_diagnostic(diagnostics, "TLS20_EXPORTER_SECRET", hello.random, exporter)
             await expose_exporter(on_exporter,exporter,exporter_accesses,stage="server-finished",
                 role="server",hash_name=selected.hash_name)
-            early_exporter = None
+            early_exporter = early_receiver = None
             # Match the ordinary API's HRR revocation policy. CH2 identity
             # zero may have belonged to a later PSK in CH1, so it cannot be
             # used to create a new early-exporter lineage over initial_ch.
             if ticket and identity_index == 0 and not retried:
                 early_root = c.extract(bytes(selected.hash_length), ticket.psk, selected.hash_name)
                 early_exporter = schedule.derive_secret(early_root, "e exp master", c.PREFACE + initial_ch)
+                if accepted:
+                    # Only identity zero can authenticate early records.
+                    early_secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE + ch)
+                    early_receiver = secrets.record(early_secret, "open", selected_id, ticket.record_size_limit)
+                    emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", hello.random, early_secret)
+                    early_secret = None
+                early_root = None
                 emit_diagnostic(diagnostics,"TLS20_EARLY_EXPORTER_SECRET",hello.random,early_exporter)
                 await expose_exporter(on_early_exporter,early_exporter,exporter_accesses,stage="early",
                     role="server",hash_name=selected.hash_name)
             if ticket and hello.early_data:
-                early_receiver = None
-                if accepted:
-                    # Early records always use the first offered PSK. If a
-                    # later identity won, discard them without deriving keys
-                    # from the selected (unrelated) resumption PSK.
-                    early_secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE + ch)
-                    early_receiver = secrets.record(early_secret, "open", selected_id, ticket.record_size_limit)
-                    emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", hello.random, early_secret)
                 total = discarded = 0
                 while True:
                     record = await wire.raw_record()
@@ -323,7 +332,10 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                         if kind == 22:
                             wire.pending.extend(content)
                             eoed = await wire.receive_frame(5, early_receiver, boundary=True)
-                            transcript.add(eoed);await on_early_data(b"");break
+                            transcript.add(eoed)
+                            secrets.close_record(early_receiver)
+                            early_receiver = None
+                            await on_early_data(b"");break
                         if kind != 23:
                             raise ProtocolError("unexpected password session early record type", alert=10)
                         total += len(content)
@@ -345,11 +357,14 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                         if discarded > 1048576:
                             raise ProtocolError("rejected early data budget")
             cf = await wire.receive_frame(20, receiver, boundary=True)
-            if not schedule.verify_finished(client_secret, transcript.snapshot(), cf[4:]) or not authorized or not policy.authorized(identity):
+            if not _verify_finished(schedule, client_secret, transcript.snapshot(), cf[4:]) or not authorized or not policy.authorized(identity):
                 raise ProtocolError("password authentication failed", alert=20)
             transcript.add(cf)
-            successor_modes = tuple(mode for mode in dict.fromkeys(hello.psk_modes)
-                if mode in (0, 1) and (ticket is None or mode in ticket.allowed_psk_modes))
+            secrets.close_record(receiver)
+            receiver = client_secret = None
+            resumption = (schedule.derive_secret(master, "res master", transcript.snapshot())
+                if master is not None else None)
+            master = None
             channel = SecureChannel(wire, server_app, client_app, exporter_secret=exporter,
                 role="server", protocol=protocol, cipher_suite=selected_id, resumed=ticket is not None,
                 early_data_accepted=accepted, early_exporter_secret=early_exporter,
@@ -359,6 +374,10 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                 receive_record_limit=receive_limit, send_record_limit=send_limit,
                 heartbeat_local_mode=controls.heartbeat_local_mode, heartbeat_peer_mode=controls.heartbeat_peer_mode)
             secrets.establish(channel)
+            retired_sender = sender
+            sender = channel.sender
+            secrets.close_record(retired_sender)
+            retired_sender = None
             channel.password_permissions = policy.accounts[identity].permissions
             channel.peer_authenticated = True
             channel.expected_ticket_count = controls.expected_tickets
@@ -366,7 +385,6 @@ async def server(reader, writer, policy, *, timeout=10, application_protocols=(b
                 access.complete(peer_authenticated=True)
             channel._exporter_accesses = tuple(exporter_accesses)
             if ticket_store is not None and 45 in ext and successor_modes:
-                resumption = schedule.derive_secret(schedule.master_secret(root), "res master", transcript.snapshot())
                 ordinary_suite = RESUMPTION_SUITES.get(selected_id, selected_id)
                 early_limit = max_early_data if on_early_data is not None and selected_id != 0xc0b3 else 0
                 for _ in range(controls.expected_tickets if controls.expected_tickets is not None else 1):
@@ -406,8 +424,8 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                  on_exporter=None, on_early_exporter=None,
                  enable_authenticators=False, authenticator_extensions=(), authenticator_certificate_algorithms=None,
                  _first_flight=None, _ticket_context=None, _auth_share_secret=None):
-    from .handshake import (Wire, Transcript, SecureChannel, check_timeout, handshake_keys, application_keys,
-                            _record_limit, _peer_record_limit, _fragment_limit, _peer_fragment_limit)
+    from .handshake import (Wire, Transcript, SecureChannel, check_timeout, handshake_keys, application_keys_from_master,
+                            _record_limit, _peer_record_limit, _fragment_limit, _peer_fragment_limit, _verify_finished)
     check_timeout(timeout)
     if not isinstance(credential, PasswordCredential):
         raise ValueError("explicit password credentials required")
@@ -488,16 +506,18 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                 selected = c.suite(ticket.cipher_suite);schedule=c.KeySchedule(selected.hash_name)
                 early_root = c.extract(bytes(selected.hash_length), ticket.psk, selected.hash_name)
                 early_exporter = schedule.derive_secret(early_root,"e exp master",c.PREFACE+ch)
+                if kwargs["early_data"]:
+                    if len(early_data) > ticket.max_early_data:
+                        raise ProtocolError("password session early data exceeds allowance")
+                    secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE+ch)
+                    emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", random, secret)
+                    early_sender = secrets.record(secret,"seal",ticket.cipher_suite,ticket.record_size_limit)
+                    secret = None
+                early_root = None
                 emit_diagnostic(diagnostics,"TLS20_EARLY_EXPORTER_SECRET",random,early_exporter)
                 await expose_exporter(on_early_exporter,early_exporter,exporter_accesses,stage="early",
                     role="client",hash_name=selected.hash_name)
             if ticket and kwargs["early_data"]:
-                if len(early_data) > ticket.max_early_data:
-                    raise ProtocolError("password session early data exceeds allowance")
-                secret = schedule.derive_secret(early_root, "c e traffic", c.PREFACE+ch)
-                emit_diagnostic(diagnostics, "TLS20_CLIENT_EARLY_TRAFFIC_SECRET", random, secret)
-                early_sender = secrets.record(secret,"seal",ticket.cipher_suite,ticket.record_size_limit)
-                early_exporter = schedule.derive_secret(early_root,"e exp master",c.PREFACE+ch)
                 for offset in range(0,len(early_data),min(16384,ticket.record_size_limit-1)):
                     writer.write(early_sender.seal(early_data[offset:offset+min(16384,ticket.record_size_limit-1)],23))
                     await writer.drain()
@@ -549,7 +569,7 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                     kwargs["cookie"] = cookie
                     kwargs["age"] = ticket.obfuscated_age()
                     if early_sender is not None:
-                        early_sender.close()
+                        secrets.close_record(early_sender)
                         early_sender = None
                     if selected_group:
                         group = selected_group
@@ -579,6 +599,8 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
             root=c.handshake_secret(shared,ticket.psk if ticket else None,selected.hash_name)
             shared = None
             client_secret,server_secret=handshake_keys(root,transcript,selected.hash_name)
+            master = schedule.master_secret(root)
+            root = None
             _log(diagnostics,random,client_secret,server_secret)
             sender=secrets.record(client_secret,"seal",selected_id)
             receiver=secrets.record(server_secret,"open",selected_id)
@@ -586,6 +608,9 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
             accepted,protocol,chosen=m.parse_encrypted_extensions(ee[4:],application_protocols,
                 offered_early=early_sender is not None,allowed_extensions=tuple(k for k,_ in extra if k in (1,15,28,55,56,58)),
                 with_extensions=True,offered_name=bool(name),require_alpn=require_alpn)
+            if not accepted:
+                secrets.close_record(early_sender)
+                early_sender = None
             controls=client_control_selection(chosen,heartbeat=heartbeat_mode,tickets=ticket_request,signaling=signaling)
             send_limit=_peer_record_limit(chosen[28]) if 28 in chosen else 16385
             receive_limit=_record_limit(record_size_limit) if 28 in chosen else 16385
@@ -598,21 +623,31 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
             receiver.record_limit=receive_limit;sender.record_limit=send_limit
             transcript.add(ee)
             sf=await wire.receive_frame(20,receiver,boundary=True)
-            if not schedule.verify_finished(server_secret,transcript.snapshot(),sf[4:]):
+            if not _verify_finished(schedule,server_secret,transcript.snapshot(),sf[4:]):
                 raise ProtocolError("server password proof failed",alert=51)
             transcript.add(sf)
-            client_app,server_app=application_keys(root,transcript,selected.hash_name)
-            exporter=schedule.derive_secret(schedule.master_secret(root),"exp master",transcript.snapshot())
+            secrets.close_record(receiver)
+            receiver = server_secret = None
+            client_app,server_app=application_keys_from_master(master,transcript,selected.hash_name)
+            exporter=schedule.derive_secret(master,"exp master",transcript.snapshot())
             _log(diagnostics,random,client_app,server_app,application=True)
             emit_diagnostic(diagnostics,"TLS20_EXPORTER_SECRET",random,exporter)
             await expose_exporter(on_exporter,exporter,exporter_accesses,stage="server-finished",
                 role="client",peer_authenticated=True,hash_name=selected.hash_name)
             if accepted:
                 eoed=m.frame(5,b"");await wire.send_frame(eoed,early_sender);transcript.add(eoed)
+                secrets.close_record(early_sender)
+                early_sender = None
             cf=m.frame(20,schedule.finished(client_secret,transcript.snapshot()))
             await wire.send_frame(cf,sender);transcript.add(cf)
+            handshake_sender = sender
+            sender = secrets.record(client_app, "seal", selected_id, send_limit)
+            secrets.close_record(handshake_sender)
+            handshake_sender = client_secret = None
+            resumption = schedule.derive_secret(master, "res master", transcript.snapshot())
+            master = None
             channel = SecureChannel(wire,client_app,server_app,exporter_secret=exporter,
-                resumption_secret=schedule.derive_secret(schedule.master_secret(root),"res master",transcript.snapshot()),
+                resumption_secret=resumption,
                 ticket_cache=ticket_cache,name=credential.service,context=context,
                 role="client",protocol=protocol,cipher_suite=selected_id,resumed=ticket is not None,
                 early_data_accepted=accepted,early_exporter_secret=early_exporter,
@@ -623,6 +658,10 @@ async def client(reader, writer, credential, *, timeout=10, application_protocol
                 receive_record_limit=receive_limit,send_record_limit=send_limit,
                 heartbeat_local_mode=controls.heartbeat_local_mode,heartbeat_peer_mode=controls.heartbeat_peer_mode)
             secrets.establish(channel)
+            retired_sender = sender
+            sender = channel.sender
+            secrets.close_record(retired_sender)
+            retired_sender = None
             channel.peer_authenticated=True
             channel.expected_ticket_count=controls.expected_tickets
             for access in exporter_accesses:access.complete(peer_authenticated=True)

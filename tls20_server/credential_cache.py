@@ -243,15 +243,19 @@ def _decompress_zstandard(data, declared, max_size):
 
 
 def decompress_certificate(body: bytes, offered_algorithms, *, max_size=MAX_CREDENTIAL_BODY):
-    if not isinstance(body, bytes) or not 8 <= len(body) <= max_size + 8:
+    if not isinstance(body, bytes) or len(body) < 8:
+        raise ProtocolError("truncated compressed credential", alert=50)
+    if len(body) > max_size + 8:
         raise ProtocolError("compressed credential exceeds local budget")
     algorithm = int.from_bytes(body[:2], "big")
     declared = int.from_bytes(body[2:5], "big")
-    data, end = _take(body, 5, 3)
-    if end != len(body) or not data or not 1 <= declared <= max_size:
-        raise ProtocolError("invalid compressed credential length")
+    data, end = _take(body, 5, 3, alert=50)
+    if end != len(body) or not data:
+        raise ProtocolError("invalid compressed credential length", alert=50)
+    if declared > max_size:
+        raise ProtocolError("decompressed credential exceeds local budget")
     if algorithm not in offered_algorithms or algorithm not in COMPRESSION_ALGORITHMS:
-        raise ProtocolError("unoffered certificate compression algorithm")
+        raise ProtocolError("unoffered certificate compression algorithm", alert=47)
     try:
         if algorithm == 1:
             decoder = zlib.decompressobj()
