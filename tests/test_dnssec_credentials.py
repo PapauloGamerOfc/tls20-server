@@ -3,6 +3,7 @@ import hashlib
 import io
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import dns.dnssec
@@ -122,6 +123,244 @@ class DNSSECCredentialTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             resolve_peer((der(leaf),der(fake)),policy=policy,offered_extensions=(59,5),
                 entry_extensions=(((59,proof),(5,staple(fake,fake_key))),()))
+
+    def test_validated_dane_and_pkix_paths_retain_omitted_issuer_for_ocsp(self):
+        from tls20_server.credential_evidence import CredentialEvidencePolicy
+        from tls20_server.pki import validate_identity, validate_pkix_path
+        from tests.test_credential_profiles import CredentialProfileTests
+        from tests.test_pki import der
+        fixture = CredentialProfileTests(); fixture.setUp()
+        response = fixture.make_ocsp()
+        good = b'\x01' + len(response).to_bytes(3, 'big') + response
+        bad = good[:-1] + bytes((good[-1] ^ 1,))
+        def validate_path(material, anchor=fixture.root):
+            validate_identity(material, trust_roots=(anchor,), role='server',
+                              name='example.test', partial_chain=True)
+            return validate_pkix_path(material, (anchor,), partial_chain=True)
+        for usage in (0, 1, 2):
+            association = der(fixture.leaf if usage == 1 else fixture.root)
+            rrset = dns.rrset.from_text(self.owner, 300, 'IN', 'TLSA',
+                                       f'{usage} 0 0 ' + association.hex())
+            proof = DNSSECWireEvidence(24, self.chain(*self.sign(rrset))).encode()
+            policy = CredentialPolicy(peer_name='example.test',
+                dane_policy=DANEPolicy({'.': self.root_keys}, pkix_validator=validate_path,
+                                      dane_path_validator=validate_path),
+                evidence_validator=CredentialEvidencePolicy(require_ocsp=True))
+            for include_issuer in (False, True):
+                material = (der(fixture.leaf),) + ((der(fixture.root),) if include_issuer else ())
+                for staple in (good, bad, None):
+                    with self.subTest(usage=usage, include_issuer=include_issuer, good=staple is good):
+                        leaf_evidence = ((59, proof),) + (((5, staple),) if staple else ())
+                        evidence = (leaf_evidence,) + ((),) * (len(material) - 1)
+                        if staple is good:
+                            peer = resolve_peer(material, policy=policy,
+                                offered_extensions=(59, 5), entry_extensions=evidence)
+                            self.assertEqual(peer.provenance, 'dane-x509')
+                            self.assertEqual(peer.material, material)  # Wire credential is unchanged.
+                        else:
+                            with self.assertRaises(ProtocolError):
+                                resolve_peer(material, policy=policy,
+                                    offered_extensions=(59, 5), entry_extensions=evidence)
+            # Legacy boolean callbacks must not fabricate an issuer path. They
+            # remain compatible, but omitted-issuer evidence needs a real path.
+            if usage == 2:
+                def legacy(material, anchor):
+                    validate_path(material, anchor)
+                    return True
+                legacy_policy = replace(policy, dane_policy=replace(policy.dane_policy, dane_path_validator=legacy))
+                with self.assertRaisesRegex(ProtocolError, 'issuer is not available'):
+                    resolve_peer((der(fixture.leaf),), policy=legacy_policy, offered_extensions=(59, 5),
+                        entry_extensions=(((59, proof), (5, good)),))
+                resolve_peer((der(fixture.leaf), der(fixture.root)), policy=legacy_policy,
+                    offered_extensions=(59, 5), entry_extensions=(((59, proof), (5, good)), ()))
+
+    def test_dane_ta_rollover_tries_all_usable_associations(self):
+        from tls20_server.pki import validate_identity, validate_pkix_path
+        from tests.test_credential_profiles import CredentialProfileTests
+        from tests.test_pki import der
+        fixture = CredentialProfileTests(); fixture.setUp()
+        unrelated = CredentialProfileTests(); unrelated.setUp()
+        good, wrong, malformed = der(fixture.root), der(unrelated.root), b'not-a-certificate'
+        rrset = dns.rrset.from_text(self.owner, 300, 'IN', 'TLSA',
+            *('2 0 0 ' + value.hex() for value in (good, wrong, malformed)))
+        authenticated = self.validate(self.chain(*self.sign(rrset)))
+        records = {record.cert: record for record in authenticated.records}
+        calls = []
+        for legacy in (False, True):
+            def validate_path(material, anchor):
+                calls.append(der(anchor))
+                validate_identity(material, trust_roots=(anchor,), role='server',
+                                  name='example.test', partial_chain=True)
+                return True if legacy else validate_pkix_path(material, (anchor,), partial_chain=True)
+            for order in ((good,), (wrong,), (malformed,), (good, wrong),
+                          (wrong, good), (malformed, wrong, good)):
+                with self.subTest(legacy=legacy, order=tuple(value == good for value in order)):
+                    # Every record is from the real signed RRset. Pin its order
+                    # after DNSSEC validation, so wire randomization cannot hide
+                    # a first-association-only implementation.
+                    result = replace(authenticated, records=tuple(records[value] for value in order))
+                    calls.clear()
+                    if good in order:
+                        authorization = match_tlsa(result, (der(fixture.leaf),),
+                            dane_path_validator=validate_path, return_authorization=True)
+                        self.assertEqual(authorization.usage, 2)
+                        self.assertEqual(calls[-1], good)
+                        if not legacy:
+                            self.assertEqual(tuple(der(cert) for cert in authorization.validated_path),
+                                             (der(fixture.leaf), good))
+                        else:
+                            self.assertEqual(authorization.validated_path, ())
+                        self.assertTrue(match_tlsa(result, (der(fixture.leaf),), dane_path_validator=validate_path))
+                        self.assertEqual(match_tlsa(result, (der(fixture.leaf),),
+                            dane_path_validator=validate_path, return_usage=True), 2)
+                    else:
+                        with self.assertRaises(ProtocolError):
+                            match_tlsa(result, (der(fixture.leaf),), dane_path_validator=validate_path)
+        single = replace(authenticated, records=(records[good],))
+        with self.assertRaises(ProtocolError):
+            match_tlsa(single, (der(fixture.leaf),),
+                dane_path_validator=lambda material, anchor: (unrelated.leaf, anchor))
+
+    def test_dane_profile_retains_actual_path_and_checks_reference_identity(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from tls20_server.profiles import load_profile
+        from tests.test_credential_profiles import CredentialProfileTests
+        from tests.test_pki import der, issue
+        fixture = CredentialProfileTests(); fixture.setUp()
+        rrset = dns.rrset.from_text(self.owner, 300, 'IN', 'TLSA', '2 0 0 ' + der(fixture.root).hex())
+        proof = DNSSECWireEvidence(24, self.chain(*self.sign(rrset))).encode()
+        response = fixture.make_ocsp()
+        staple = b'\x01' + len(response).to_bytes(3, 'big') + response
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            (directory / 'anchors.zone').write_text(self.root_keys.to_text() + '\n', encoding='ascii')
+            (directory / 'client.toml').write_text('role="client"\nservice="example.test"\n'
+                'port=343\nmode="certificate"\n[trust.dane]\nanchors_file="anchors.zone"\n'
+                '[trust.evidence]\nrequire_ocsp=true\n', encoding='ascii')
+            profile = load_profile(directory / 'client.toml', role='client')
+            try:
+                policy = profile.options['credential_policy']
+                peer = resolve_peer((der(fixture.leaf),), policy=policy, offered_extensions=(59, 5),
+                    entry_extensions=(((59, proof), (5, staple)),))
+                self.assertEqual(peer.provenance, 'dane-x509')
+                evidence = (((59, proof),),)
+                usage, expiry = policy.dane_policy.authorize((der(fixture.leaf),), 0, 'example.test', evidence)
+                self.assertEqual(usage, 2)
+                self.assertGreater(expiry, self.now)
+                for bad_leaf in (issue(fixture.key, fixture.ca_key, fixture.name, fixture.ca_name,
+                                       hostname='wrong.test'),
+                                 issue(fixture.key, fixture.ca_key, fixture.name, fixture.ca_name, validity=-1)):
+                    with self.assertRaises(ProtocolError):
+                        policy.dane_policy.authorize((der(bad_leaf),), 0, 'example.test', evidence)
+            finally:
+                profile.close()
+
+    def test_dane_ta_retains_dns_issuer_for_ct_v2_binding(self):
+        from tls20_server.credential_evidence import CredentialEvidencePolicy
+        from tls20_server.pki import validate_identity, validate_pkix_path
+        from tests.test_pki import der
+        from tests.test_transparency import TransparencyTests, listed
+        fixture = TransparencyTests(); fixture.setUp()
+        rrset = dns.rrset.from_text(self.owner, 300, 'IN', 'TLSA', '2 0 0 ' + der(fixture.root).hex())
+        proof = DNSSECWireEvidence(24, self.chain(*self.sign(rrset))).encode()
+        def validate_path(material, anchor):
+            validate_identity(material, trust_roots=(anchor,), role='server',
+                              name='example.test', partial_chain=True)
+            return validate_pkix_path(material, (anchor,), partial_chain=True)
+        policy = CredentialPolicy(peer_name='example.test',
+            dane_policy=DANEPolicy({'.': self.root_keys}, dane_path_validator=validate_path),
+            evidence_validator=CredentialEvidencePolicy(minimum_ct_v2_logs=1,
+                trusted_logs_v2={fixture.log_v2.log_id: fixture.log_v2}))
+        valid = listed(fixture.v2()[0])
+        invalid = valid[:-1] + bytes((valid[-1] ^ 1,))
+        for value in (valid, invalid):
+            metadata = (((59, proof), (52, value)),)
+            if value is valid:
+                peer = resolve_peer((der(fixture.cert),), policy=policy,
+                    offered_extensions=(59, 5, 52), entry_extensions=metadata)
+                self.assertEqual(peer.provenance, 'dane-x509')
+            else:
+                with self.assertRaises(ProtocolError):
+                    resolve_peer((der(fixture.cert),), policy=policy,
+                        offered_extensions=(59, 5, 52), entry_extensions=metadata)
+
+    def test_duplicate_leaf_cannot_erase_an_optional_ocsp_response(self):
+        from tls20_server.credential_evidence import CredentialEvidencePolicy
+        from tls20_server.pki import validate_identity, validate_pkix_path
+        from tests.test_credential_profiles import CredentialProfileTests
+        from tests.test_pki import der
+        fixture = CredentialProfileTests(); fixture.setUp()
+        rrset = dns.rrset.from_text(self.owner, 300, 'IN', 'TLSA', '2 0 0 ' + der(fixture.root).hex())
+        proof = DNSSECWireEvidence(24, self.chain(*self.sign(rrset))).encode()
+        def validate_path(material, anchor):
+            # Model a legitimate alternate path provider which tolerates
+            # redundant wire certificates. It still validates path and name.
+            unique = tuple(dict.fromkeys(material))
+            validate_identity(unique, trust_roots=(anchor,), role='server', name='example.test', partial_chain=True)
+            return validate_pkix_path(unique, (anchor,), partial_chain=True)
+        policy = CredentialPolicy(peer_name='example.test',
+            dane_policy=DANEPolicy({'.': self.root_keys}, dane_path_validator=validate_path),
+            evidence_validator=CredentialEvidencePolicy(require_ocsp=False))
+        response = fixture.make_ocsp()
+        good = b'\x01' + len(response).to_bytes(3, 'big') + response
+        bad = good[:-1] + bytes((good[-1] ^ 1,))
+        for duplicate in (False, True):
+            for staple in (good, bad):
+                with self.subTest(duplicate=duplicate, valid_signature=staple is good):
+                    material = (der(fixture.leaf),) * (2 if duplicate else 1)
+                    evidence = (((59, proof), (5, staple)),) + (((),) if duplicate else ())
+                    if duplicate or staple is bad:
+                        expected = 'ambiguous duplicate' if duplicate else 'OCSP response validation failed'
+                        with self.assertRaisesRegex(ProtocolError, expected):
+                            resolve_peer(material, policy=policy, offered_extensions=(59, 5), entry_extensions=evidence)
+                    else:
+                        peer = resolve_peer(material, policy=policy, offered_extensions=(59, 5), entry_extensions=evidence)
+                        self.assertEqual(peer.provenance, 'dane-x509')
+
+    def test_dane_reordered_path_preserves_intermediate_ocsp_binding(self):
+        from tls20_server.credential_evidence import CredentialEvidencePolicy
+        from tls20_server.pki import validate_identity, validate_pkix_path
+        from tests.test_credential_profiles import CredentialProfileTests
+        from tests.test_pki import der, issue
+        fixture = CredentialProfileTests(); fixture.setUp()
+        inter_key = ec.generate_private_key(ec.SECP256R1())
+        inter_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'DANE intermediate')])
+        inter = issue(inter_key, fixture.ca_key, inter_name, fixture.ca_name, ca=True)
+        leaf = issue(fixture.key, inter_key, fixture.name, inter_name)
+        rrset = dns.rrset.from_text(self.owner, 300, 'IN', 'TLSA', '2 0 0 ' + der(fixture.root).hex())
+        proof = DNSSECWireEvidence(24, self.chain(*self.sign(rrset))).encode()
+        def validate_path(material, anchor):
+            validate_identity(material, trust_roots=(anchor,), role='server', name='example.test', partial_chain=True)
+            path = validate_pkix_path(material, (anchor,), partial_chain=True)
+            self.assertEqual(tuple(der(cert) for cert in path), (der(leaf), der(inter), der(fixture.root)))
+            return path
+        def staple(cert, issuer, key):
+            moment = datetime.now(timezone.utc)
+            response = ocsp.OCSPResponseBuilder().add_response(cert=cert, issuer=issuer,
+                algorithm=hashes.SHA256(), cert_status=ocsp.OCSPCertStatus.GOOD,
+                this_update=moment-timedelta(seconds=60), next_update=moment+timedelta(hours=1),
+                revocation_time=None, revocation_reason=None).responder_id(
+                ocsp.OCSPResponderEncoding.HASH, issuer).sign(key, hashes.SHA256())
+            wire = response.public_bytes(serialization.Encoding.DER)
+            return b'\x01' + len(wire).to_bytes(3, 'big') + wire
+        policy = CredentialPolicy(peer_name='example.test',
+            dane_policy=DANEPolicy({'.': self.root_keys}, dane_path_validator=validate_path),
+            evidence_validator=CredentialEvidencePolicy(require_ocsp=True))
+        leaf_staple = staple(leaf, inter, inter_key)
+        inter_staple = staple(inter, fixture.root, fixture.ca_key)
+        invalid = inter_staple[:-1] + bytes((inter_staple[-1] ^ 1,))
+        # Deliberately put root before intermediate on the wire. Evidence must
+        # follow DER identity when the validator builds the actual path.
+        material = (der(leaf), der(fixture.root), der(inter))
+        for value in (inter_staple, invalid):
+            evidence = (((59, proof), (5, leaf_staple)), (), ((5, value),))
+            if value is inter_staple:
+                peer = resolve_peer(material, policy=policy, offered_extensions=(59, 5), entry_extensions=evidence)
+                self.assertEqual(peer.provenance, 'dane-x509')
+            else:
+                with self.assertRaisesRegex(ProtocolError, 'OCSP response validation failed'):
+                    resolve_peer(material, policy=policy, offered_extensions=(59, 5), entry_extensions=evidence)
 
     def test_extension_envelope_is_distinct_from_bare_rr_chain(self):
         wire = self.chain(*self.sign(self.tlsa()))

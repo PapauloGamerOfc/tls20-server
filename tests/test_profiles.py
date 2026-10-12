@@ -192,6 +192,33 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(evidence=evidence), self.assertRaises(ConfigurationError):
                 load_profile(self.profile("client", '[trust]\nroots="ca.pem"\n[trust.evidence]\n'+evidence), role="client")
 
+    def test_client_ocsp_profile_emits_empty_cr_request_with_real_validator(self):
+        fingerprint = hashlib.sha256(self.credentials.chain_der[0]).hexdigest()
+        settings = ('[credential]\nchain="fullchain.pem"\nprivate_key="server.key"\n'
+            '[client_auth]\nroots="ca.pem"\n'
+            f'allowed_certificates_sha256=["{fingerprint}"]\n'
+            '[client_auth.evidence]\nrequire_ocsp=true\nocsp_max_age_seconds=900\n')
+        loaded = load_profile(self.profile("server", settings), role="server")
+        self.addCleanup(loaded.close)
+        self.assertEqual(loaded.options["client_certificate_evidence_extensions"], ((5, b""),))
+        policy = loaded.options["client_credential_policy"].evidence_validator
+        self.assertTrue(policy.require_ocsp)
+        self.assertEqual(policy.ocsp_max_age_seconds, 900)
+        self.assertEqual(policy.offered_extensions, (5,))
+        self.assertIsNone(policy.ocsp_request, "CR has no ClientHello nonce/responder preferences")
+
+    def test_client_ocsp_profile_rejects_undefined_ct_request_and_non_x509_bypasses(self):
+        fingerprint = hashlib.sha256(self.credentials.chain_der[0]).hexdigest()
+        base = ('[credential]\nchain="fullchain.pem"\nprivate_key="server.key"\n'
+            '[client_auth]\nroots="ca.pem"\nraw_public_keys=["server.spki"]\n'
+            f'allowed_certificates_sha256=["{fingerprint}"]\n')
+        for types, evidence in (("[0]", 'minimum_ct_v1_logs=0'), ("[0]", 'ocsp_request="request.bin"'),
+                                ("[0]", 'require_ocsp=1'), ("[0]", 'ocsp_max_age_seconds=0'),
+                                ("[0,2]", 'require_ocsp=true'), ("[2]", 'require_ocsp=true')):
+            with self.subTest(types=types, evidence=evidence), self.assertRaises(ConfigurationError):
+                load_profile(self.profile("server", base + f'certificate_types={types}\n'
+                    '[client_auth.evidence]\n' + evidence), role="server")
+
     def test_dnssec_anchor_file_is_real_rrset_inventory(self):
         import dns.dnssec
         import dns.rrset

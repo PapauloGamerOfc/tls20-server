@@ -72,6 +72,18 @@ def protocol_boundary(method):
     return guarded
 
 
+def sync_protocol_boundary(method):
+    """Synchronous counterpart for application-authenticator operations."""
+    @functools.wraps(method)
+    def guarded(*args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except BaseException as error:
+            clear_protocol_tracebacks(error)
+            raise
+    return guarded
+
+
 class HandshakeSecrets:
     """Own temporary epochs/ephemerals until handoff or handshake termination."""
 

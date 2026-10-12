@@ -159,6 +159,21 @@ the latter requires an existing delegation verifier. Resumption is isolated
 when either handshake preference changes. These are embedding API controls,
 not additional mandatory server configuration fields.
 
+To request client OCSP, set
+`client_certificate_evidence_extensions=((5, b""),)` on `server_handshake` and
+install `client_credential_policy` with an actual evidence validator (for example
+`CredentialEvidencePolicy(require_ocsp=True)`). Only X.509 client credential
+types may be enabled with this request. Unlike ClientHello, CertificateRequest's
+`status_request` value is empty; it cannot carry nonce/responder preferences.
+`request_client_auth(certificate_evidence_extensions=...)` overrides this offer
+for that PHA request only: `None` inherits the handshake policy and `()` omits
+the request. Removing an offer does not disable a locally required OCSP policy.
+The client sends configured OCSP evidence only when requested; real signature,
+CertID, authority, status and freshness checks still govern its acceptance.
+Cached client evidence is checked again before accepting resumption or 0-RTT.
+This API does not implicitly enable client CT, which requires its own explicit
+application profile in the specification.
+
 `client_handshake(..., client_credentials=Credentials(...),
 post_handshake_auth=True)` supplies an optional client chain/private key and
 advertises PHA. Both options default off. Initial client credentials are sent
@@ -178,6 +193,9 @@ secret, including intervening KeyUpdates. Requests have a local pending budget
 Closing the channel, cancelling the returned Future, or cancelling reception
 with authentication pending consumes its retained verifier state. Python cannot
 promise physical erasure of that memory.
+Failed PHA responses also clear secret-bearing completed protocol traceback
+frames at the public receive boundary, including malformed shares and provider
+failures/cancellation. Application callback frames remain application-owned.
 
 Changing or removing the configured client credential isolates the client ticket
 cache, so another identity cannot silently inherit an old session. The server
@@ -343,6 +361,16 @@ Well-framed unknown/GREASE or wrong-role schemes in the optional delegation
 offer do not exclude an independently compatible direct X25519 credential.
 They do not authorize an unoffered delegated proof: actual grant selection and
 verification still enforce the role-specific MAC and grant-signature lists.
+
+TLS Feature requirements use the current authenticator's actual path/grant and
+role-MAC mechanisms, not a blanket copy of its offers or a previous handshake.
+Required OCSP/CT evidence must still be present and valid; advertising a grant
+algorithm without returning a delegated credential cannot satisfy that feature.
+Request, proof-generation and validation failures clear completed protocol
+traceback frames, including chained exceptions and cancellation. Other pending
+requests and application-owned callback frames remain intact. This releases
+managed references to abandoned verifier/derived keys, not a guarantee of
+physical erasure of Python or provider memory.
 
 ### Test-only diagnostic build
 

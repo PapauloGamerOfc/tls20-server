@@ -48,6 +48,15 @@ class ValidatedTLSA:
 
 
 @dataclass(frozen=True)
+class DANEAuthorization:
+    usage: int | None
+    expires_at: float
+    # Only a validating callback can supply this path. DANE-EE and legacy
+    # boolean callbacks authorize no extra issuer material by themselves.
+    validated_path: tuple = ()
+
+
+@dataclass(frozen=True)
 class DNSSECWireEvidence:
     """RFC 9102 section 2.3 Certificate-entry extension, not bare DNS RRs.
 
@@ -423,22 +432,34 @@ class DNSSECChain:
 
 
 def match_tlsa(result, material, *, credential_type=0, pkix_validator=None,
-               dane_path_validator=None, now=None, return_usage=False):
+               dane_path_validator=None, now=None, return_usage=False,
+               return_authorization=False):
     """Apply usage/selector/matching; callers still verify online MAC/Finished.
 
     pkix_validator(material) must validate path AND service identity and return
     the actual validated path (leaf first). dane_path_validator(material,anchor)
-    validates against the DNS-authorized TA with DANE name/path rules. Absence
-    of either callback does not turn usage 0/1/2 into an EE key pin.
+    validates against the DNS-authorized TA with DANE name/path rules and
+    returns its actual validated path (leaf first). A legacy True response
+    still authorizes usage 2 but supplies no path for evidence validation.
+    Absence of either callback does not turn usage 0/1/2 into an EE key pin.
     """
     if not isinstance(result, ValidatedTLSA) or (time.time() if now is None else now) > result.expires_at:
         raise ProtocolError("DNSSEC service evidence is missing or expired")
+    def authorized(usage, path=()):
+        if return_authorization:
+            return DANEAuthorization(usage, result.expires_at, path)
+        return usage if return_usage else usage is not None
     if result.authenticated_denial:
-        return None if return_usage else False
+        return authorized(None)
     material = tuple(material)
     if not material or credential_type not in (0, 2) or credential_type == 2 and len(material) != 1:
         raise ProtocolError("unsupported DANE credential material")
     certificates = tuple(_load_pkix_der(value) for value in material) if credential_type == 0 else ()
+    def validated_path(value):
+        path = tuple(value)
+        if not path or path[0].public_bytes(serialization.Encoding.DER) != material[0]:
+            raise ProtocolError("DANE validator returned a path for a different credential")
+        return path
     def matches(record, value, certificate=None):
         if record.selector == 1:
             value = (certificate.public_key().public_bytes(serialization.Encoding.DER,
@@ -454,25 +475,36 @@ def match_tlsa(result, material, *, credential_type=0, pkix_validator=None,
         return hmac.compare_digest(value, record.cert)
     for record in result.records:
         if record.usage == 3 and matches(record, material[0], certificates[0] if certificates else None):
-            return 3 if return_usage else True
+            return authorized(3)
         if credential_type != 0:
             continue
         if record.usage in (0, 1) and pkix_validator is not None:
             try:
-                path = tuple(pkix_validator(material))
+                path = validated_path(pkix_validator(material))
                 candidates = path[:1] if record.usage == 1 else path[1:]
                 if any(matches(record, cert.public_bytes(serialization.Encoding.DER), cert) for cert in candidates):
-                    return record.usage if return_usage else True
+                    return authorized(record.usage, path)
             except ProtocolError:
                 continue
         elif record.usage == 2 and dane_path_validator is not None:
             candidates = list(certificates[1:])
             if record.selector == 0 and record.mtype == 0:
-                candidates.append(_load_pkix_der(record.cert))
+                try:
+                    candidates.append(_load_pkix_der(record.cert))
+                except ProtocolError:
+                    continue  # An unusable association does not invalidate its RRset.
             for cert in candidates:
                 if matches(record, cert.public_bytes(serialization.Encoding.DER), cert):
-                    if dane_path_validator(material, cert) is True:
-                        return 2 if return_usage else True
+                    try:
+                        path = dane_path_validator(material, cert)
+                        if path is True:
+                            return authorized(2)
+                        if path is not False and path is not None:
+                            return authorized(2, validated_path(path))
+                    except ProtocolError:
+                        # Rollover RRsets can contain several authorized TAs;
+                        # one that cannot build this path is not a global veto.
+                        continue
     raise ProtocolError("DNSSEC-authenticated TLSA records do not authorize this credential")
 
 
@@ -485,7 +517,8 @@ class DANEPolicy:
     dane_path_validator: object = None
     limits: DNSSECLimits = DNSSECLimits()
 
-    def authorize(self, material, credential_type, service_name, evidence, *, now=None):
+    def authorize(self, material, credential_type, service_name, evidence, *, now=None,
+                  return_authorization=False):
         if not evidence or len(evidence) != len(material):
             raise ProtocolError("DANE policy requires current leaf DNSSEC evidence")
         leaf = dict(evidence[0])
@@ -497,7 +530,7 @@ class DANEPolicy:
                             now=moment, limits=self.limits).validate_service(service_name, self.port)
         if result.authenticated_denial and not self.allow_authenticated_denial:
             raise ProtocolError("DANE policy does not permit authenticated absence")
-        usage = match_tlsa(result, material, credential_type=credential_type,
+        authorization = match_tlsa(result, material, credential_type=credential_type,
             pkix_validator=self.pkix_validator, dane_path_validator=self.dane_path_validator,
-            now=moment, return_usage=True)
-        return usage, result.expires_at
+            now=moment, return_authorization=True)
+        return authorization if return_authorization else (authorization.usage, authorization.expires_at)

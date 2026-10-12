@@ -65,6 +65,46 @@ class DNSSECHandshakeTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises((ProtocolError, ConnectionError)):
                         await self.connect(credential_policy=policy, server_certificate_types=(kind,))
 
+    async def test_dane_ta_omitted_issuer_ocsp_full_resumed_and_early(self):
+        from tls20_server.credential_evidence import CredentialEvidencePolicy
+        from tls20_server.pki import validate_identity, validate_pkix_path
+        from tests.test_credential_profiles import CredentialProfileTests
+        from tests.test_pki import der, issue
+        dns_fixture = test_dnssec_credentials.DNSSECCredentialTests(); dns_fixture.setUp()
+        fixture = CredentialProfileTests(); fixture.setUp()
+        fixture.leaf = issue(fixture.key, fixture.ca_key, fixture.name, fixture.ca_name, hostname='localhost')
+        self.roots = [fixture.root]
+        rrset = dns.rrset.from_text('_343._tcp.localhost.', 300, 'IN', 'TLSA',
+                                   '2 0 0 ' + der(fixture.root).hex())
+        proof = DNSSECWireEvidence(24, dns_fixture.chain(*dns_fixture.sign(rrset, root=True))).encode()
+        response = fixture.make_ocsp()
+        staple = b'\x01' + len(response).to_bytes(3, 'big') + response
+        self.credentials = Credentials([der(fixture.leaf)], fixture.key,
+            entry_extensions=(((59, proof), (5, staple)),), dnssec_service=('localhost', 343))
+        def validate_path(material, anchor):
+            validate_identity(material, trust_roots=(anchor,), role='server',
+                              name='localhost', partial_chain=True)
+            return validate_pkix_path(material, (anchor,), partial_chain=True)
+        policy = CredentialPolicy(peer_name='localhost',
+            dane_policy=DANEPolicy({'.': dns_fixture.root_keys}, dane_path_validator=validate_path),
+            evidence_validator=CredentialEvidencePolicy(require_ocsp=True))
+        for resumed, early in ((False, b''), (True, b''), (True, b'public DANE fixture')):
+            channel = await self.connect(credential_policy=policy, early_data=early,
+                certificate_evidence_extensions=((5, b'\x01\0\0\0\0'),))
+            self.assertEqual(channel.resumed, resumed)
+            self.assertEqual(channel.early_data_accepted, bool(early))
+            self.assertTrue(channel.peer_authenticated)
+            self.assertEqual(channel.handshake_transcript, self.channels[-1].handshake_transcript)
+            await channel.send(b'current DNSSEC and OCSP')
+            self.assertEqual(await channel.recv(), b'current DNSSEC and OCSP')
+        self.assertFalse(self.errors)
+        self.cache = TicketCache()
+        invalid = staple[:-1] + bytes((staple[-1] ^ 1,))
+        self.credentials = replace(self.credentials, entry_extensions=(((59, proof), (5, invalid)),))
+        with self.assertRaisesRegex(ProtocolError, 'OCSP response validation failed'):
+            await self.connect(credential_policy=policy,
+                certificate_evidence_extensions=((5, b'\x01\0\0\0\0'),))
+
     async def test_case_insensitive_sni_keeps_dane_evidence_and_actual_transcript(self):
         original_credentials, client_hello = self.credentials, m.client_hello
         for kind in (0, 2):

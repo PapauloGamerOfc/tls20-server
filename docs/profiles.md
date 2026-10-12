@@ -285,6 +285,23 @@ bogus data never downgrades. Usage0/1 require the separate PKIX roots; usage2
 validates a DNS-authorized trust-anchor path; usage3 authenticates the exact
 endpoint. The original evidence deadline is retained in session caches.
 
+OCSP/CT validation uses the actual path returned by the PKIX/DANE validator,
+including a trust anchor supplied in a full-certificate TLSA association rather
+than the Certificate message. Multiple TLSA associations are alternatives: an
+unusable association or a TA that cannot validate the presented chain does not
+prevent trying the remaining authenticated associations. No matching valid
+association still fails closed.
+
+For programmatic DANE policies, path callbacks return a leaf-first sequence of
+validated certificate objects. `dane_path_validator` also accepts legacy `True`
+results, but those do not provide an omitted issuer for OCSP/CT. Opting into
+`return_authorization=True` on `DANEPolicy.authorize` or `match_tlsa` exposes the
+`DANEAuthorization` result, including `validated_path`; their default return
+forms remain unchanged. A returned path must identify the same leaf, and
+Certificate-entry evidence remains bound to its original certificate. Repeated
+wire certificates with conflicting evidence are rejected; a later copy cannot
+erase a supplied OCSP response even when stapling is otherwise optional.
+
 Server `[client_auth]` supports `required = true` (default), `identity`,
 `roots`, and `allowed_certificates_sha256` (exact SHA256 DER-leaf fingerprints).
 CA membership alone is not application authorization. Alternatively provision
@@ -292,6 +309,16 @@ CA membership alone is not application authorization. Alternatively provision
 require a verified client grant. The client supplies its own `[credential]`.
 The HTTP relay gates access to its one backend; it does not insert a claimed
 identity HTTP header or invent per-route authorization from certificate fields.
+
+For X.509 client OCSP, add `[client_auth.evidence]` with `require_ocsp = true`
+and optionally `ocsp_max_age_seconds = 86400` (default). This installs the real
+OCSP verifier and requests an empty `status_request(5)` in the initial
+CertificateRequest and, by default, later PHA requests. The client's existing
+`[[credential.evidence]]` provisions its associated OCSP response. A configured
+staple is omitted if not requested. This client-evidence profile requires
+`certificate_types = [0]` (the X.509 default); it cannot be bypassed by selecting
+RPK/ITS. Client CT and ClientHello-style OCSP nonce/responder request files are
+not part of this profile and are rejected rather than silently ignored.
 
 ## POK, pinning and ITS
 

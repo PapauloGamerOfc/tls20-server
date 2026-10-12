@@ -21,6 +21,7 @@ from . import crypto as c
 from . import messages as m
 from .credential_selection import match_credentials, credential_algorithms_match
 from .errors import ProtocolError
+from .secret_lifecycle import protocol_boundary, sync_protocol_boundary
 
 
 @dataclass(frozen=True)
@@ -79,11 +80,22 @@ def credential_validator(policy, *, role, authorize, spontaneous_offers=()):
         offers = dict(request.extensions if request is not None else spontaneous_offers)
         _offers(offers, role)
         _check_status_responses(identity, offers, requested=request is not None)
+        # Path/grant algorithms are checked by resolve_peer below. The exact
+        # role's share is consumed by validate()'s MAC proof before it returns
+        # an authenticated identity. Merely offering unrelated capabilities
+        # (including evidence or delegation without a grant) is insufficient.
+        satisfied = {50}
+        share_extension = 0xff02 if role == "server" else 0xff03
+        if share_extension in offers:
+            satisfied.add(share_extension)
+        if identity.extensions and 34 in dict(identity.extensions[0]) and 0xff04 in offers:
+            satisfied.add(0xff04)
         resolved = resolve_peer(identity.chain, 0, role, policy=policy,
             certificate_algorithms=m._u16_list(offers[50]),
             grant_algorithms=m._u16_list(offers[0xff04]) if 0xff04 in offers else (),
             delegated_schemes=m._u16_list(offers[34]) if 34 in offers else (),
-            entry_extensions=identity.extensions, offered_extensions=tuple(offers))
+            entry_extensions=identity.extensions, offered_extensions=tuple(offers),
+            negotiated_extensions=tuple(sorted(satisfied)))
         permitted = authorize(resolved)
         if inspect.isawaitable(permitted):
             permitted = await permitted
@@ -264,6 +276,7 @@ class AuthenticatorManager:
         return tuple(self.channel.exporter("EXPORTER-" + role + " authenticator " + label, b"", length)
                      for label in ("handshake context", "finished key"))
 
+    @sync_protocol_boundary
     def request(self, *, context=None, certificate_algorithms=None, extra_extensions=()):
         self._ready()
         context = secrets.token_bytes(32) if context is None else context
@@ -282,6 +295,7 @@ class AuthenticatorManager:
         self._pending[context] = (request, private)
         return wire
 
+    @sync_protocol_boundary
     def cancel(self, request):
         """Cancellation consumes a locally generated context and releases its key."""
         parsed = parse_request(request)
@@ -294,6 +308,7 @@ class AuthenticatorManager:
         self._pending.clear()
         self._closed = True
 
+    @sync_protocol_boundary
     def authenticate(self, credentials=None, *, request=None, context=None, entry_extensions=None):
         self._ready()
         role = self.channel.role
@@ -361,6 +376,7 @@ class AuthenticatorManager:
         self._bounded(wire)
         return wire
 
+    @protocol_boundary
     async def validate(self, authenticator, validator, *, request=None):
         """Validate with a locally retained verifier key and explicit trust policy.
 

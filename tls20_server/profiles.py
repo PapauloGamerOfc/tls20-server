@@ -610,7 +610,7 @@ def _dane(data, files, result):
         validate_identity(material, trust_roots=(anchor,), role="server", name=result.service,
             partial_chain=True, signature_provider=result.provider,
             offered_certificate_algorithms=supported_certificate_algorithms(result.provider))
-        return True
+        return validate_pkix_path(material, (anchor,), partial_chain=True, signature_provider=result.provider)
     return DANEPolicy(anchors, result.port, _boolean(data.get("allow_authenticated_denial", False), "DANE denial fallback"),
                       pkix if result.roots else None, dane_path)
 
@@ -656,29 +656,42 @@ def _trust(result, data, files):
 def _client_auth(result, data, files):
     from .credential_profiles import CredentialPolicy
     data = _table(data, ("required", "roots", "identity", "raw_public_keys", "allowed_certificates_sha256",
-                        "certificate_types", "require_delegation", "its", "certificate_authorities", "oid_filters"), "client authorization")
+                        "certificate_types", "require_delegation", "its", "certificate_authorities", "oid_filters",
+                        "evidence"), "client authorization")
     identity = _text(data.get("identity", "authorized-client"), "client authorization identity", 255)
     bindings = _bindings(data.get("raw_public_keys", []), files, role="client", identity=identity)
     fingerprints = tuple(_hex(value, "authorized client certificate fingerprint", length=32) for value in
                          _array(data.get("allowed_certificates_sha256", []), "client certificate fingerprints", maximum=4096))
     roots = _roots(data.get("roots"), files, result.provider)
     its = _its(data["its"], files, role="client", identity=identity) if "its" in data else None
+    evidence, evidence_offers = None, ()
+    if "evidence" in data:
+        from dataclasses import replace
+        settings = _table(data["evidence"], ("require_ocsp", "ocsp_max_age_seconds"), "client OCSP policy")
+        evidence, _ = _evidence(settings, files, result.provider)
+        # CR status_request carries no nonce/responder preference vector. Do
+        # not import ClientHello's request or an unspecified client CT policy.
+        evidence = replace(evidence, ocsp_request=None, offered_extensions=(5,))
+        evidence_offers = ((5, b""),)
     if not bindings and not its and (not roots or not fingerprints):
         raise ConfigurationError("Client authorization requires exact RPK pins or roots AND allowed leaf fingerprints")
     def authorize(material, evidence):
         fingerprint = hashlib.sha256(material[0]).digest()
         return any(hmac.compare_digest(fingerprint, allowed) for allowed in fingerprints)
     result.options.update(client_credential_policy=CredentialPolicy(trust_roots=roots, peer_name=identity,
-        raw_public_keys=bindings, authorize_client=authorize,
+        raw_public_keys=bindings, authorize_client=authorize, evidence_validator=evidence,
         require_delegation=_boolean(data.get("require_delegation", False), "client delegation requirement"),
         signature_provider=result.provider, its_policy=its),
         require_client_auth=_boolean(data.get("required", True), "required client authentication"),
+        client_certificate_evidence_extensions=evidence_offers,
         client_certificate_types=_ids(data.get("certificate_types", [3] if its else [2] if bindings and not roots else [0]), (0, 2, 3), "client certificate types"))
     if 3 in result.options["client_certificate_types"] and its is None:
         raise ConfigurationError("ITS client authentication requires an explicit ITS service policy")
     if data.get("require_delegation", False) and result.options["client_certificate_types"] != (0,):
         raise ConfigurationError("Required client delegation needs only X509 credential offers")
     types = result.options["client_certificate_types"]
+    if evidence is not None and types != (0,):
+        raise ConfigurationError("Client OCSP evidence requires only X509 credential offers")
     if 0 in types and (not roots or not fingerprints) or 2 in types and not bindings:
         raise ConfigurationError("Every offered client credential type needs its own explicit authorization")
     from .credential_selection import encode_certificate_authorities, encode_oid_filters

@@ -329,7 +329,8 @@ class SecureChannel:
     @protocol_boundary
     async def request_client_auth(self, *, required=False, max_pending=128,
                                   certificate_authorities=None, oid_filters=None,
-                                  certificate_algorithms=None, delegation_signature_algorithms=None):
+                                  certificate_algorithms=None, delegation_signature_algorithms=None,
+                                  certificate_evidence_extensions=None):
         """Return a Future completed by recv(); application must keep reading.
 
         max_pending is a local memory budget, not a TLS protocol maximum.
@@ -347,6 +348,11 @@ class SecureChannel:
             context = os.urandom(32)
         private = X25519PrivateKey.generate()
         request_offers = dict(self.client_auth_offers)
+        if certificate_evidence_extensions is not None:
+            evidence_offers = _client_evidence_offers(certificate_evidence_extensions,
+                self.client_credential_policy, (self.client_certificate_type,))
+            request_offers.pop(5, None)
+            request_offers.update(evidence_offers)
         signature_provider = getattr(self.client_credential_policy, "signature_provider", None) or self.native_provider
         if certificate_algorithms is not None:
             if self.client_certificate_type != 0:
@@ -640,6 +646,7 @@ class SecureChannel:
             return
         transport.abort()
 
+    @protocol_boundary
     async def recv(self):
         async with self.receive_lock:
             if self.received_close:
@@ -889,6 +896,10 @@ def _credential_frame(credentials, *, context=b"", offer_extensions=(), role="se
         metadata = tuple(tuple((kind, value) for kind, value in pairs
                                if kind != 5 or response_matches_request(_status_response(value), request))
                          for pairs in metadata)
+    else:
+        # A provisioned staple is reusable credential metadata, not permission
+        # to send an unsolicited CertificateEntry extension to this peer.
+        metadata = tuple(tuple(pair for pair in pairs if pair[0] != 5) for pairs in metadata)
     if any(59 in dict(pairs) for pairs in metadata):
         from .dnssec_credentials import DNSSECWireEvidence
         if role != "server" or any(59 in dict(pairs) for pairs in metadata[1:]):
@@ -1107,6 +1118,27 @@ def _signature_preferences(values, provider):
     return values
 
 
+def _client_evidence_offers(values, policy, certificate_types):
+    """Validate this implementation's explicit client-evidence request profile.
+
+    CertificateRequest status_request is empty, unlike ClientHello. Client CT
+    needs an independently specified application profile and is not inferred
+    from the corresponding server-certificate request encodings.
+    """
+    try:
+        pairs = tuple(values)
+        valid = all(len(pair) == 2 and type(pair[0]) is int and pair[0] == 5
+                    and type(pair[1]) is bytes and pair[1] == b"" for pair in pairs)
+    except (TypeError, ValueError):
+        raise ValueError("client certificate evidence requires empty status_request offers") from None
+    if not valid or len(pairs) > 1:
+        raise ValueError("client certificate evidence requires one empty status_request offer")
+    if pairs and (tuple(certificate_types) != (0,) or not isinstance(policy, CredentialPolicy)
+                  or policy.evidence_validator is None):
+        raise ValueError("client OCSP requests require an X.509 credential evidence validator")
+    return tuple((kind, value) for kind, value in pairs)
+
+
 @handshake_boundary
 async def server_handshake(reader, writer, credentials, server_name, timeout=10, *,
                            ticket_store=None, max_early_data=0, on_early_data=None,
@@ -1125,8 +1157,11 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                            client_certificate_authorities=(), client_oid_filters=(),
                            server_credential_candidates=(), native_provider=None, supported_groups=None,
                            retry_cookie_policy=None, client_certificate_algorithms=None,
-                           client_delegation_signature_algorithms=None):
+                           client_delegation_signature_algorithms=None,
+                           client_certificate_evidence_extensions=()):
     check_timeout(timeout)
+    client_evidence_offers = _client_evidence_offers(client_certificate_evidence_extensions,
+        client_credential_policy, client_certificate_types)
     from .retry_cookie import RetryCookiePolicy, validate_retry_cookie
     if retry_cookie_policy is not None and not isinstance(retry_cookie_policy, RetryCookiePolicy):
         raise ValueError("explicit RetryCookiePolicy required")
@@ -1209,6 +1244,7 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                     (0xff04, m._vec(b"".join(value.to_bytes(2,"big") for value in grant_algorithms), 2)))
             if certificate_compression:
                 client_auth_offers += ((27, m._vec(b"".join(value.to_bytes(2,"big") for value in certificate_compression),1)),)
+            client_auth_offers += client_evidence_offers
             send_limit = _peer_record_limit(ext_values[28], server=True) if 28 in ext_values else 16385
             receive_limit = local_limit if 28 in ext_values else 16385
             mfl = _peer_fragment_limit(ext_values[1]) if 1 in ext_values and 28 not in ext_values else None
