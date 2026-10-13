@@ -9,6 +9,7 @@ import hashlib
 
 from . import crypto as c, messages as m
 from .errors import ProtocolError
+from .secret_lifecycle import sync_protocol_boundary
 
 
 @dataclass(frozen=True, repr=False)
@@ -56,6 +57,7 @@ class ExternalPSK:
             len(value).to_bytes(4, "big") + value for value in fields))
 
 
+@sync_protocol_boundary
 def import_psk(base_key: bytes, external_identity: bytes, context: bytes, name: str, *,
                protocol=b"http/1.1", base_hash="sha256", target_hash="sha256",
                combined=False, cipher_suite=None, max_early_data=0):
@@ -71,11 +73,21 @@ def import_psk(base_key: bytes, external_identity: bytes, context: bytes, name: 
         raise ProtocolError("unsupported importer target KDF")
     identity = (m._vec(external_identity, 2) + m._vec(context, 2)
                 + m.VERSION + target.to_bytes(2, "big"))
+    # Reject public provisioning errors before creating the importer root or
+    # derived PSK. The boundary also releases owned frames on provider errors.
+    m.validate_service_identity(name)
+    if protocol:
+        m._protocol(protocol)
+    selected_suite = cipher_suite or (0x1302 if target_hash == "sha384" else 0x1301)
+    if (len(identity) > 65535 or c.suite(selected_suite).hash_name != target_hash
+            or type(max_early_data) is not int or not 0 <= max_early_data < 1 << 32
+            or combined and max_early_data):
+        raise ValueError("invalid external PSK provisioning")
     root = c.extract(bytes(hashlib.new(base_hash).digest_size), base_key, base_hash)
     derived = c.label_expand(root, "derived psk", c.digest(identity, base_hash),
                              hashlib.new(target_hash).digest_size, base_hash)
     return ExternalPSK(identity, derived, name, protocol, target_hash, "imp", combined,
-                       cipher_suite or (0x1302 if target_hash == "sha384" else 0x1301), max_early_data)
+                       selected_suite, max_early_data)
 
 
 def bootstrap_public_key_psk(public_key: bytes, name: str, *, target_hash="sha256",

@@ -13,6 +13,7 @@ import threading
 import time
 
 from . import crypto as c, messages as m
+from .secret_lifecycle import sync_protocol_boundary
 
 
 @dataclass(repr=False)
@@ -72,6 +73,7 @@ class TicketStore:
         _, ticket = self._tickets.popitem(last=False)
         self._bytes -= ticket._storage_size
 
+    @sync_protocol_boundary
     def issue(self, secret, name, protocol, max_early_data=0, context=b"", client_certificate_chain=None,
               *, cipher_suite=0x1301, client_certificate_type=0, client_certificate_extensions=(),
               external_psk_identity=b"", pake_identity=b"", native_provider=None,
@@ -85,8 +87,9 @@ class TicketStore:
         nonce, identity = os.urandom(8), os.urandom(32)
         age_add = int.from_bytes(os.urandom(4), "big")
         selected = c.suite(cipher_suite)
-        psk = c.label_expand(secret, "resumption", nonce, selected.hash_length, c.hash_context(selected.hash_name,native_provider))
+        # Serialize/validate public bounds before deriving retained key material.
         message = m.new_session_ticket(identity, nonce, self.lifetime, age_add, max_early_data)
+        psk = c.label_expand(secret, "resumption", nonce, selected.hash_length, c.hash_context(selected.hash_name,native_provider))
         chain = list(client_certificate_chain or [])
         # Count retained variable bytes plus a conservative per-object allowance.
         # This is a local cache resource policy, never a limit on TLS credentials.

@@ -127,6 +127,13 @@ creation, including validation errors before sending and cancellation during the
 write. A pre-send error leaves unrelated live authentication requests intact;
 a failed or cancelled write aborts and releases the connection's pending state.
 
+The synchronous PSK importer and ticket issuer apply the same failure-frame
+cleanup, including provider errors and chained exceptions. Public provisioning
+and ticket-encoding bounds are checked before deriving new secret material.
+Failure releases operation-owned references without clearing the caller's
+provisioned key, callback state or existing ticket cache. This also is a
+reference-lifetime guarantee, not physical erasure of immutable Python bytes.
+
 TLS Feature requirements use the actual serialized ClientHello and validated
 ServerHello/EncryptedExtensions or credential-message selection, not a caller's
 predeclared negotiated-extension policy. Resumption checks the new negotiation
