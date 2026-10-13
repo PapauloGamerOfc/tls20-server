@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from . import messages as m
 from .errors import ConfigurationError, ProtocolError
 from .pake_native import PakeProvider
+from .secret_lifecycle import sync_protocol_boundary
 
 SUITES = (0xc0b0, 0xc0b1, 0xc0b2, 0xc0b3)
 RESUMPTION_SUITES = {0xc0b0: 0x1301, 0xc0b1: 0x1302, 0xc0b2: 0x1304, 0xc0b3: 0x1302}
@@ -39,6 +40,7 @@ def opaque(value):
         raise ConfigurationError("invalid RFC8265 OpaqueString") from error
 
 
+@sync_protocol_boundary
 def password_base(username, password, salt=None):
     username, password = opaque(username), opaque(password)
     if not 1 <= len(username) <= 255 or not password:
@@ -59,11 +61,14 @@ def _protection_parameters(key):
     return width, algorithm, size
 
 
+@sync_protocol_boundary
 def protect_username(username, public_key):
     if not isinstance(public_key, ec.EllipticCurvePublicKey):
         raise ConfigurationError("provisioned username protection public key required")
     value = opaque(username)
     width, algorithm, size = _protection_parameters(public_key)
+    if width + max(128, len(value)) + 16 > 255:
+        raise ConfigurationError("protected username does not fit the RFC8492 vector")
     # Library native ECDH and AES-SIV; no private scalar arithmetic in Python.
     private = ec.generate_private_key(public_key.curve)
     secret = private.exchange(ec.ECDH(), public_key)
@@ -75,6 +80,7 @@ def protect_username(username, public_key):
     return result
 
 
+@sync_protocol_boundary
 def recover_username(value, private_key):
     if not isinstance(private_key, ec.EllipticCurvePrivateKey):
         raise ConfigurationError("provisioned username protection private key required")

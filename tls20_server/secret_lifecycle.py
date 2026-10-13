@@ -73,7 +73,7 @@ def protocol_boundary(method):
 
 
 def sync_protocol_boundary(method):
-    """Synchronous counterpart for application-authenticator operations."""
+    """Synchronous counterpart for secret-bearing protocol operations."""
     @functools.wraps(method)
     def guarded(*args, **kwargs):
         try:
@@ -81,6 +81,10 @@ def sync_protocol_boundary(method):
         except BaseException as error:
             clear_protocol_tracebacks(error)
             raise
+        finally:
+            # This wrapper is still executing while completed frames clear.
+            # Drop its own argument references too, without mutating callers.
+            args = kwargs = None
     return guarded
 
 

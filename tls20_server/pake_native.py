@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .errors import ConfigurationError, ProtocolError
 from .openssl_provider import OpenSSLProvider, _buffer, _wipe
+from .secret_lifecycle import sync_protocol_boundary
 from . import ffdhe
 
 
@@ -64,14 +65,19 @@ class PakeProvider:
         except (OSError, AttributeError, UnicodeError) as exc:
             raise ConfigurationError("could not load explicit PAKE helper ABI") from exc
 
+    @sync_protocol_boundary
     def create(self, base, client_random, *, group=23, hash_name="sha256"):
         if (not isinstance(base, bytes) or len(base) != 32 or not isinstance(client_random, bytes)
                 or len(client_random) != 32 or group not in GROUPS or hash_name not in ("sha256", "sha384")):
             raise ProtocolError("invalid PAKE primitive inputs")
-        base_buffer, random_buffer = _buffer(base), _buffer(client_random)
         with self.provider._native_scope():
             self.provider._ready()
+            base_buffer, pointer = None, None
             try:
+                # Allocate separately under cleanup: allocating the public
+                # random can fail after the secret base copy already exists.
+                base_buffer = _buffer(base)
+                random_buffer = _buffer(client_random)
                 if group in ffdhe.SIZES:
                     prime=_buffer(ffdhe.PRIMES[group].to_bytes(ffdhe.SIZES[group],"big"))
                     pointer=self.lib.tls20_pwd_ff_new(self.functions,len(self.functions),self.provider._context,
@@ -83,17 +89,28 @@ class PakeProvider:
                 if not pointer:
                     self.provider.lib.ERR_clear_error()
                     raise ProtocolError("native password element derivation failed")
-                return PakeState(self, pointer, group)
+                state = PakeState(self, pointer, group)
+                pointer = None  # Ownership transfers only after construction.
+                return state
             finally:
-                _wipe(base_buffer)
+                if base_buffer is not None:
+                    _wipe(base_buffer)
+                if pointer:
+                    self.lib.tls20_pwd_free(pointer)
 
 
 class PakeState:
     def __init__(self, provider, pointer, group):
-        self.provider, self.pointer, self.group = provider, pointer, group
+        # create() still owns the pointer while construction can fail. Reserve
+        # the attribute before accounting, then publish ownership last.
+        self.pointer = None
+        self.provider, self.group = provider, group
         provider.provider._live_keys += 1
+        self.pointer = pointer
 
     def close(self):
+        if not getattr(self, "pointer", None):
+            return  # Also safe for an object whose __init__ never completed.
         with self.provider.provider._native_scope():
             if self.pointer:
                 self.provider.lib.tls20_pwd_free(self.pointer)
