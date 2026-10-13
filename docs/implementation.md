@@ -31,6 +31,12 @@ Invalid certificate decompression or a decompressed-length mismatch produces
 limits retain their separate checks. CachedObject hashes must be nonempty even
 for unknown object types; well-formed unknown types are still ignored.
 
+CertificateVerify validation distinguishes malformed MAC envelopes or a proof
+length inconsistent with the negotiated hash (`decode_error`, 50), prohibited
+or wrong-direction algorithm identifiers (`illegal_parameter`, 47), and an
+incorrect MAC with valid syntax (`decrypt_error`, 51). Initial client/server
+authentication and post-handshake client authentication use the same checks.
+
 PHA request failures and cancellation clear completed protocol traceback
 frames, releasing abandoned ephemeral-key references. A validation error
 before sending a new request does not destroy independent pending requests.

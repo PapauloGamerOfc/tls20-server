@@ -113,9 +113,11 @@ def frame(kind: int, body: bytes) -> bytes:
         raise ProtocolError("invalid handshake type or length")
     if kind == 20 and len(body) not in (32, 48):
         raise ProtocolError("Finished body must have the negotiated hash length", alert=50)
-    if kind == 15 and (len(body) not in (36, 52) or body[:2] not in (b"\xfe\x00", b"\xfe\x01")
-                       or int.from_bytes(body[2:4], "big") != len(body) - 4):
-        raise ProtocolError("MAC envelope", alert=50)
+    if kind == 15:
+        if len(body) not in (36, 52) or int.from_bytes(body[2:4], "big") != len(body) - 4:
+            raise ProtocolError("MAC envelope", alert=50)
+        if body[:2] not in (b"\xfe\x00", b"\xfe\x01"):
+            raise ProtocolError("unsupported MAC proof code", alert=47)
     if kind == 5 and body:
         raise ProtocolError("EndOfEarlyData must be empty", alert=50)
     if kind == 24:
@@ -624,6 +626,16 @@ def parse_encrypted_extensions(body: bytes, protocol: bytes = HTTP_PROTOCOL, *, 
 
 def certificate_verify(proof: bytes, *, client: bool = False) -> bytes:
     return frame(15, (b"\xfe\x01" if client else b"\xfe\x00") + _vec(proof, 2))
+
+
+def parse_certificate_verify(body: bytes, *, hash_length: int, client: bool = False) -> bytes:
+    """Validate fixed MAC syntax and direction before cryptographic verification."""
+    frame(15, body)
+    if len(body) != hash_length + 4:
+        raise ProtocolError("MAC proof must have the negotiated hash length", alert=50)
+    if body[:2] != (b"\xfe\x01" if client else b"\xfe\x00"):
+        raise ProtocolError("MAC proof code has the wrong direction", alert=47)
+    return body[4:]
 
 
 def certificate_request(context: bytes, verifier_public: bytes,

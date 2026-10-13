@@ -477,9 +477,10 @@ class SecureChannel:
         if state is None:
             raise ProtocolError("unsolicited client authentication proof", alert=10)
         if kind == 15 and state["stage"] == "proof":
+            proof = m.parse_certificate_verify(body, hash_length=self.suite.hash_length, client=True)
             expected = self.schedule.client_proof(self.exporter_secret, state["private"],
                                      c.public_bytes(state["key"]), bytes(state["transcript"]))
-            if body[:2] != b"\xfe\x01" or not hmac.compare_digest(expected, body[4:]):
+            if not hmac.compare_digest(expected, proof):
                 raise ProtocolError("client MAC verification failed", alert=51)
             state["transcript"].extend(frame)
             state["stage"] = "finished"
@@ -1796,9 +1797,10 @@ async def server_handshake(reader, writer, credentials, server_name, timeout=10,
                         _check_certificate_offer(client_chain, certificate_algorithms, native_provider)
                         key = await _validate_client(client_auth_validator, client_chain)
                     cv = await wire.receive_frame(15, receiver)
+                    proof = m.parse_certificate_verify(cv[4:], hash_length=selected.hash_length, client=True)
                     expected = schedule.client_proof(exporter, client_auth_private,
                                              c.public_bytes(key), transcript.snapshot())
-                    if cv[4:6] != b"\xfe\x01" or not hmac.compare_digest(expected, cv[8:]):
+                    if not hmac.compare_digest(expected, proof):
                         raise ProtocolError("initial client MAC verification failed", alert=51)
                     transcript.add(cv)
             client_mac_verified = client_auth_private is not None
@@ -2510,7 +2512,8 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                 if not enable_authenticators:
                     auth_private = None
                 cv = await wire.receive_frame(15, receiver)
-                verified = cv[4:6] == b"\xfe\x00" and schedule.verify_proof(auth_root, transcript.snapshot(), cv[8:])
+                proof = m.parse_certificate_verify(cv[4:], hash_length=selected.hash_length)
+                verified = schedule.verify_proof(auth_root, transcript.snapshot(), proof)
                 auth_root = None
                 if not verified:
                     raise ProtocolError("server authentication verification failed", alert=51)
