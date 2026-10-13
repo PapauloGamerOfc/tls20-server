@@ -172,6 +172,12 @@ key. The server's restricted server-EKU validator is not substituted for this
 client policy. Callback approval is not identity establishment: MAC and Finished
 must also pass before `channel.authenticated_client` is populated.
 
+An initial CertificateRequest must have an empty request context, including
+the negotiated cached-request form. A structurally valid nonempty context is
+rejected with `illegal_parameter` before releasing any client credential or
+proof. Post-handshake requests retain their distinct nonempty-context rules;
+the shared request parser does not forbid contexts used by PHA.
+
 Certificate-chain signatures and delegation-grant signatures have independent
 preference lists. The server API accepts `client_certificate_algorithms` and
 `client_delegation_signature_algorithms`; the client API accepts

@@ -2460,7 +2460,7 @@ async def client_handshake(reader, writer, server_name, trust_roots, *, revocati
                     client_auth_request = _decode_request(cert, cache_enabled=2 in cache_selected, templates=request_snapshots)
                     learned_requests.append(b"".join(m.extension(kind, value) for kind, value in client_auth_request[3].items()))
                     if client_auth_request[0]:
-                        raise ProtocolError("initial certificate request context must be empty")
+                        raise ProtocolError("initial certificate request context must be empty", alert=47)
                     transcript.add(cert)
                     cert = await wire.receive_frame((11, 25, 253), receiver)
                 chain_der, certificate_metadata = _decode_credential(cert, offered_compression=certificate_compression,
