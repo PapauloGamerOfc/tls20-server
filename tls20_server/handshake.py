@@ -28,7 +28,7 @@ from .credential_cache import (compress_certificate, decompress_certificate, mat
     cached_request_body, resolve_cached_request)
 from .handshake_options import client_controls, server_controls, client_control_selection
 from .exporter_access import expose as expose_exporter
-from .secret_lifecycle import HandshakeSecrets, handshake_boundary, protocol_boundary
+from .secret_lifecycle import HandshakeSecrets, handshake_boundary, protocol_boundary, sync_protocol_boundary
 from .credential_selection import (encode_certificate_authorities, encode_oid_filters,
     preferred_credentials, match_credentials)
 from types import SimpleNamespace
@@ -497,11 +497,13 @@ class SecureChannel:
         else:
             raise ProtocolError("unexpected client authentication message", alert=10)
 
+    @sync_protocol_boundary
     def exporter(self, label, context=b"", length=32):
         if self.exporter_secret is None:
             raise ProtocolError("exporter unavailable")
         return self.schedule.exporter(self.exporter_secret, label, context, length)
 
+    @sync_protocol_boundary
     def early_exporter(self, label, context=b"", length=32):
         """Early exporter is replayable, and never implies fresh peer authentication."""
         if self.early_exporter_secret is None:

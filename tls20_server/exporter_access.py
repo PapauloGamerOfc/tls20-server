@@ -7,6 +7,7 @@ must not authorize irreversible effects from either fact alone.
 
 from . import crypto as c
 from .errors import ProtocolError
+from .secret_lifecycle import sync_protocol_boundary
 
 
 class ExporterAccess:
@@ -24,6 +25,7 @@ class ExporterAccess:
     def active(self):
         return self._secret is not None
 
+    @sync_protocol_boundary
     def export(self, label, context=b"", length=32):
         if not self.active:
             raise ProtocolError("exporter capability is no longer active")

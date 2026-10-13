@@ -85,6 +85,12 @@ the exact allowance remains usable.
    authentication (PHA) uses independent request contexts and verifier keys.
    Neither feature is enabled or configured by the forwarding CLI by default.
 
+Exporter API failures release completed protocol-frame references to roots and
+intermediate keys, including chained provider errors and cancellation. Invalid
+export arguments do not close an otherwise usable channel or revoke independent
+exporter handles. Application callback frames are preserved; this is managed
+reference cleanup, not a guarantee of erasing immutable Python allocations.
+
 Server authentication alone does not identify the client. The default forwarding
 CLI performs no client-certificate authentication. Even when the low-level API
 authenticates a client, application authorization remains an explicit policy.
