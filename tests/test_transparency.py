@@ -100,6 +100,46 @@ class TransparencyTests(unittest.TestCase):
             validate_ct_v2_list(listed(proof, corrupted, sct), der(self.cert), der(self.root),
                 {self.log_v2.log_id:self.log_v2}, now_ms=self.now, require_inclusion=True)
 
+    def test_v2_repeated_root_keeps_newest_signed_head_independent_of_order(self):
+        for precert in (False, True):
+            sct, leaf = self.v2(precert=precert)
+
+            def head(timestamp, root=leaf):
+                data = timestamp.to_bytes(8, 'big') + (1).to_bytes(8, 'big') + vec(root, 1) + b'\0\0'
+                signature = self.log_key.sign(data, ec.ECDSA(hashes.SHA256()))
+                return b'\x01\x04' + vec(self.log_v2.log_id, 1) + data + vec(signature)
+
+            older, newer = head(self.now), head(self.now + 2000)
+            proof = b'\x01\x06' + vec(self.log_v2.log_id, 1) + (1).to_bytes(8, 'big') + bytes(8) + b'\0\0'
+            prior = {self.log_v2.log_id: (1, self.now + 1000, leaf)}
+
+            def validate(heads, trusted):
+                return validate_ct_v2_list(listed(sct, proof, *heads), der(self.cert), der(self.root),
+                    {self.log_v2.log_id: self.log_v2}, now_ms=self.now + 3000,
+                    require_inclusion=True, trusted_tree_heads=trusted)
+
+            for trusted in (None, prior):
+                for order, heads in (("old-new", (older, newer)), ("new-old", (newer, older)),
+                                     ("new", (newer,)), ("new-new", (newer, newer))):
+                    with self.subTest(precert=precert, prior=trusted is not None, order=order):
+                        result = validate(heads, trusted)
+                        self.assertEqual([item.included for item in result], [True])
+                with self.subTest(precert=precert, prior=trusted is not None, only_older=True):
+                    if trusted is None:
+                        self.assertTrue(validate((older,), trusted)[0].included)
+                    else:
+                        with self.assertRaisesRegex(ProtocolError, 'rolled back'):
+                            validate((older,), trusted)
+                # Choosing the newest timestamp must not hide a conflicting
+                # signed root or a forged signature in another supplied head.
+                conflict = head(self.now + 2000, bytes([leaf[0] ^ 1]) + leaf[1:])
+                corrupted = newer[:-1] + bytes([newer[-1] ^ 1])
+                for fault, invalid in (("conflicting-root", conflict), ("bad-signature", corrupted)):
+                    for order, heads in (("valid-invalid", (older, invalid)), ("invalid-valid", (invalid, older))):
+                        with self.subTest(precert=precert, prior=trusted is not None, fault=fault, order=order):
+                            with self.assertRaises(ProtocolError):
+                                validate(heads, trusted)
+
     def test_v2_extensions_order_and_duplicate_enforced(self):
         for extensions in (b'\x00\x01\x00\x00' * 2,
                            b'\x00\x02\x00\x00\x00\x01\x00\x00'):

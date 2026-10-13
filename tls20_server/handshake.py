@@ -321,6 +321,9 @@ class SecureChannel:
         for state in pending.values():
             state["private"] = None
             if not state["future"].done():
+                # Peer half-close abandons PHA, not the independent send side.
+                # Do not suppress an already queued explicit user cancellation.
+                state["cancelled_by_cleanup"] = True
                 state["future"].cancel()
 
     def _clear_connection_secrets(self, *, keep_sender=False):
@@ -397,7 +400,8 @@ class SecureChannel:
                  "transcript": bytearray(self.handshake_transcript + request),
                  "stage": "certificate", "chain": [], "key": None, "context": context,
                  "offers": offers, "metadata": ()}
-        future.add_done_callback(lambda done: self.abort() if done.cancelled() and not self.closed else None)
+        future.add_done_callback(lambda done: self.abort()
+            if done.cancelled() and not state.get("cancelled_by_cleanup", False) and not self.closed else None)
         self.pending_client_auth[context] = state
         try:
             await self.send_handshake(request)

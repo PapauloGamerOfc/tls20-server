@@ -327,7 +327,10 @@ def validate_ct_v2_list(data, certificate_der, issuer_der, trusted_logs, *, now_
             key = (log_id, size)
             if key in heads and heads[key][1] != root:
                 raise ProtocolError("conflicting signed roots for the same CT tree size")
-            heads[key] = (timestamp, root)
+            # A TransItemList has no chronological ordering requirement. Keep
+            # the freshest signed head for this same root, not the last item.
+            if key not in heads or heads[key][0] < timestamp:
+                heads[key] = (timestamp, root)
         elif kind == 0x0106:
             if offset + 16 > len(value):
                 raise ProtocolError("truncated CT inclusion proof")
