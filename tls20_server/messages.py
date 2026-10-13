@@ -390,6 +390,11 @@ def parse_client_hello(body: bytes, *, enabled_groups=None, password_authenticat
     while shares.position < len(shares.data):
         group = int.from_bytes(shares.take(2), "big")
         share = shares.vector(2)
+        # KeyShareEntry.key_exchange<1..2^16-1> is nonempty for every
+        # group, including unknown/GREASE groups whose encoding we ignore.
+        # The enclosing client_shares vector may still be empty for HRR.
+        if not share:
+            raise ProtocolError("empty key share entry", alert=50)
         if group in seen:
             raise ProtocolError("duplicate key share", alert=47)
         seen.add(group)

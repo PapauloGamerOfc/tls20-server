@@ -121,6 +121,13 @@ reachability only, never credential authentication or replay-safe early data.
 The parser validates recognized extension placement and delegation offers
 before selecting ordinary credentials or resumption. This also applies to
 initial/PHA/cached certificate requests and application-authenticator requests.
+Every present KeyShareEntry must contain a nonempty `key_exchange`, including
+unknown and GREASE groups; an empty entry fails with `decode_error` (50).
+An entirely empty `client_shares` list remains valid for group selection through
+HelloRetryRequest and for PSK-only negotiation. Nonempty unknown entries remain
+ignorable, and a nonempty known-group share with an invalid width still fails
+with `illegal_parameter` (47). Parser and real CH1/CH2 regressions exercise these
+distinctions without weakening group selection or authentication.
 Version negotiation uses the specification's distinct `protocol_version`,
 `missing_extension`, `decode_error` and `illegal_parameter` alerts. Unknown
 offers still follow their defined ignore rules. An unknown-only supported-group
