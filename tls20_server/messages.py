@@ -523,24 +523,31 @@ def parse_server_hello(body: bytes, *, details: bool = False, with_suite: bool =
     cipher_suite = int.from_bytes(r.take(2), "big")
     if len(sid) > 32:
         raise ProtocolError("legacy session id echo length", alert=50)
-    if cipher_suite not in c.CIPHER_SUITES or r.take(1) != b"\x00":
-        raise ProtocolError("invalid ServerHello", alert=47)
+    compression = r.take(1)
     ext = extensions(r.vector(2)); r.end()
     retry = random == HRR_RANDOM
-    validate_extension_context(ext, "HRR" if retry else "SH")
-    pwd = c.suite(cipher_suite).password_authenticated
+    # Decode the framing first, then select the protocol before processing
+    # the other negotiated parameters (including suite-specific extensions).
     if 43 not in ext:
         raise ProtocolError("missing required ServerHello version", alert=109)
     if len(ext[43]) != 2:
         raise ProtocolError("malformed ServerHello version", alert=50)
     if ext[43] != VERSION:
         raise ProtocolError("unsupported ServerHello version", alert=47)
+    if cipher_suite not in c.CIPHER_SUITES or compression != b"\x00":
+        raise ProtocolError("invalid ServerHello", alert=47)
+    validate_extension_context(ext, "HRR" if retry else "SH")
+    pwd = c.suite(cipher_suite).password_authenticated
     if set(ext) - ({43, 51, 44, 31} if retry and pwd else {43, 51, 44} if retry else {43, 51, 41, 33}):
         raise ProtocolError("unsupported ServerHello extension", alert=110)
     group, E = 0, b""
     if 51 in ext:
         sr = _Reader(ext[51]); group = int.from_bytes(sr.take(2), "big")
         E = b"" if retry else sr.vector(2); sr.end()
+        if not retry and not E:
+            # KeyShareEntry.key_exchange is opaque<1..2^16-1>, including
+            # unknown groups. HRR has only selected_group, not this vector.
+            raise ProtocolError("empty server key share entry", alert=50)
         valid_share = pwd_share_valid(group, E) if pwd else len(E) == c.SERVER_GROUP_LENGTHS.get(group)
         if group not in c.GROUP_LENGTHS or not retry and not valid_share:
             raise ProtocolError("invalid server traffic share", alert=47)

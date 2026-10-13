@@ -123,14 +123,22 @@ before selecting ordinary credentials or resumption. This also applies to
 initial/PHA/cached certificate requests and application-authenticator requests.
 Every present KeyShareEntry must contain a nonempty `key_exchange`, including
 unknown and GREASE groups; an empty entry fails with `decode_error` (50).
+The reference client applies the same syntax check to ServerHello, including
+the final ServerHello after a retry; HRR itself carries only a selected group,
+not a KeyShareEntry. A nonempty but invalid server share remains
+`illegal_parameter` (47).
 An entirely empty `client_shares` list remains valid for group selection through
-HelloRetryRequest and for PSK-only negotiation. Nonempty unknown entries remain
-ignorable, and a nonempty known-group share with an invalid width still fails
+HelloRetryRequest and for PSK-only negotiation. Nonempty unknown ClientHello
+entries remain ignorable, and a nonempty known-group share with an invalid width still fails
 with `illegal_parameter` (47). Parser and real CH1/CH2 regressions exercise these
 distinctions without weakening group selection or authentication.
 Version negotiation uses the specification's distinct `protocol_version`,
-`missing_extension`, `decode_error` and `illegal_parameter` alerts. Unknown
-offers still follow their defined ignore rules. An unknown-only supported-group
+`missing_extension`, `decode_error` and `illegal_parameter` alerts. Invalid
+ServerHello/HRR cipher suites or compression selections do not mask a
+missing or malformed version selection: the client checks `supported_versions`
+first, after parsing the enclosing syntax. A second HRR is still an unexpected
+message and cannot initiate another negotiation. Unknown offers still follow
+their defined ignore rules. An unknown-only supported-group
 list does not prevent an otherwise valid PSK-only (`psk_ke`) exchange. Received
 DNS SNI is compared case-insensitively; the original extension bytes remain in
 the transcript and retry-continuity checks. Configuration names stay canonical.

@@ -1,6 +1,7 @@
 """Certificate codec alerts and cached-object framing on authenticated wires."""
 
 import asyncio
+from contextlib import contextmanager
 import unittest
 import zlib
 from unittest.mock import patch
@@ -52,6 +53,46 @@ def altered_compression(body, algorithm, variant):
 VARIANT_ALERTS = {"garbage": 42, "short": 42, "long": 42, "truncated": 50,
     "trailing": 50, "empty-vector": 50, "unoffered": 47, "unknown": 47,
     "declared-zero": 42, "empty-decoded": 50}
+
+
+@contextmanager
+def coalesce_codec_flights(testcase, *, before_send=None):
+    """Send each test credential/proof/Finished flight in one record.
+
+    These tests assert the peer's exact alert, not transport-close races. If
+    the malformed credential goes out separately, the peer can close before
+    the remaining proof/Finished writes, and TCP may reset instead of exposing
+    its alert. Keep the actual generated handshake bytes and transcript intact.
+    """
+    original_send = handshake.Wire.send_frame
+    pending, sent = {}, []
+
+    async def send(wire, message, state=None):
+        if message[0] != 25 and wire not in pending:
+            return await original_send(wire, message, state)
+        if wire not in pending:
+            pending[wire] = (state, [])
+        expected_state, frames = pending[wire]
+        testcase.assertIs(state, expected_state)
+        frames.append(message)
+        if message[0] != 20:
+            return
+        del pending[wire]
+        testcase.assertEqual([frame[0] for frame in frames], [25, 15, 20])
+        flight = b"".join(frames)
+        testcase.assertIsNotNone(state)
+        testcase.assertLessEqual(len(flight), min(16384, state.record_limit - 1))
+        if before_send is not None:
+            await before_send(wire, tuple(frames))
+        sent.append(flight)
+        await original_send(wire, flight, state)
+
+    try:
+        with patch.object(handshake.Wire, "send_frame", send):
+            yield sent
+        testcase.assertFalse(pending, "incomplete test credential flight")
+    finally:
+        pending.clear()
 
 
 class CodecAlertTests(unittest.TestCase):
@@ -147,7 +188,8 @@ class CodecWireTests(unittest.IsolatedAsyncioTestCase):
                             return altered_compression(body, selected, variant)
 
                         with patch.object(handshake, "compress_certificate", compress), \
-                             patch.object(handshake.Wire, "read_record", capture):
+                             patch.object(handshake.Wire, "read_record", capture), \
+                             coalesce_codec_flights(self) as flights:
                             if variant == "valid":
                                 client = await self.connect(**options)
                                 await client.send(b"codec control")
@@ -161,6 +203,7 @@ class CodecWireTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertEqual(caught.exception.alert, VARIANT_ALERTS[variant])
                                 await asyncio.wait_for(received.wait(), 2)
                                 self.assertEqual(seen, [(True, bytes((2, VARIANT_ALERTS[variant])))])
+                            self.assertEqual(len(flights), 1)
 
     async def test_post_handshake_client_codec_errors_use_bad_certificate(self):
         credential, policy = self.client_credential()
@@ -175,7 +218,8 @@ class CodecWireTests(unittest.IsolatedAsyncioTestCase):
                     def compress(body, selected):
                         self.assertEqual(selected, algorithm)
                         return altered_compression(body, selected, variant)
-                    with patch.object(handshake, "compress_certificate", compress):
+                    with patch.object(handshake, "compress_certificate", compress), \
+                         coalesce_codec_flights(self) as flights:
                         await client.send(b"drive codec PHA")
                         # Existing application data may be echoed before the
                         # server receives the subsequent PHA response. Read it
@@ -194,6 +238,68 @@ class CodecWireTests(unittest.IsolatedAsyncioTestCase):
                             with self.assertRaises(asyncio.CancelledError):
                                 await asyncio.wait_for(pending, 2)
                             self.assertTrue(pending.cancelled())
+                        self.assertEqual(len(flights), 1)
+
+    async def test_codec_flight_is_complete_before_peer_can_abort(self):
+        """A forced scheduling break cannot expose a partial malformed flight."""
+        credential, policy = self.client_credential()
+        self.server_options = {"client_credential_policy": policy, "require_client_auth": True,
+            "client_certificate_types": (2,), "certificate_compression": (2,)}
+        client = await self.connect(client_credentials=credential, post_handshake_auth=True)
+        server = self.channels[-1]
+        pending = await server.request_client_auth(required=True)
+        reached_flush, release_flush, received_flight = (asyncio.Event() for _ in range(3))
+        observed, fatal_alerts = [], []
+        original_read, original_fatal = handshake.Wire.read_record, handshake.Wire.fatal
+
+        async def before_send(wire, frames):
+            self.assertIs(wire, client.wire)
+            self.assertEqual([frame[0] for frame in frames], [25, 15, 20])
+            reached_flush.set()
+            await release_flush.wait()
+
+        async def capture(wire, state=None):
+            data, kind = await original_read(wire, state)
+            if wire is server.wire and kind == 22:
+                observed.append(data)
+                received_flight.set()
+            return data, kind
+
+        async def fatal(wire, error, state=None):
+            if wire is server.wire:
+                self.assertTrue(received_flight.is_set())
+                fatal_alerts.append(error.alert)
+            return await original_fatal(wire, error, state)
+
+        drive = None
+        try:
+            with patch.object(handshake, "compress_certificate", lambda body, algorithm:
+                    altered_compression(body, algorithm, "unknown")), \
+                 patch.object(handshake.Wire, "read_record", capture), \
+                 patch.object(handshake.Wire, "fatal", fatal), \
+                 coalesce_codec_flights(self, before_send=before_send) as flights:
+                await client.send(b"drive codec PHA")
+                drive = asyncio.create_task(client.recv())
+                await asyncio.wait_for(reached_flush.wait(), 2)
+                self.assertFalse(received_flight.is_set())
+                self.assertEqual(fatal_alerts, [])
+                self.assertFalse(pending.done())
+                release_flush.set()
+                self.assertEqual(await asyncio.wait_for(drive, 2), b"drive codec PHA")
+                with self.assertRaises(ProtocolError) as received:
+                    await asyncio.wait_for(client.recv(), 2)
+                self.assertEqual(received.exception.alert, 47)
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(pending, 2)
+                self.assertTrue(pending.cancelled())
+                self.assertEqual(fatal_alerts, [47])
+                self.assertEqual(len(flights), 1)
+                self.assertEqual(observed, flights)
+        finally:
+            release_flush.set()
+            if drive is not None:
+                drive.cancel()
+                await asyncio.gather(drive, return_exceptions=True)
 
     async def test_unknown_cache_type_ignores_only_well_framed_hashes(self):
         original = messages.client_hello
