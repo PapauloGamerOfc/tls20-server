@@ -37,6 +37,12 @@ or wrong-direction algorithm identifiers (`illegal_parameter`, 47), and an
 incorrect MAC with valid syntax (`decrypt_error`, 51). Initial client/server
 authentication and post-handshake client authentication use the same checks.
 
+The SNI decoder validates the complete ServerNameList before routing. Empty
+HostName vectors and malformed lengths produce `decode_error` (50); duplicate
+host-name entries and invalid DNS values produce `illegal_parameter` (47).
+Valid but unrecognized service names retain `unrecognized_name` (112). DNS
+matching remains case-insensitive, and IP reference identities omit SNI.
+
 PHA request failures and cancellation clear completed protocol traceback
 frames, releasing abandoned ephemeral-key references. A validation error
 before sending a new request does not destroy independent pending requests.

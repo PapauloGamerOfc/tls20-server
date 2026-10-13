@@ -237,14 +237,29 @@ def parse_server_name(data: bytes) -> str:
     Callers retain the original extension bytes for transcripts and retry checks.
     """
     outer = _Reader(data); names = _Reader(outer.vector(2)); outer.end()
-    if names.take(1) != b"\x00":
+    entries = []
+    while names.position < len(names.data):
+        kind = names.take(1)[0]
+        value = names.vector(2)
+        entries.append((kind, value))
+    # Parse every vector before classifying duplicates or unsupported types.
+    # RFC6066 gives all NameTypes a uint16 vector and HostName a minimum of 1.
+    if not entries or any(kind == 0 and not value for kind, value in entries):
+        raise ProtocolError("empty server name list or host name", alert=50)
+    if any(kind != 0 for kind, _ in entries):
         raise ProtocolError("unsupported name type", alert=47)
+    if len(entries) != 1:
+        raise ProtocolError("duplicate server name type", alert=47)
     try:
-        name = names.vector(2).decode("ascii").lower()
+        name = entries[0][1].decode("ascii").lower()
     except UnicodeDecodeError as exc:
         raise ProtocolError("non-ASCII server name", alert=47) from exc
-    validate_name(name)
-    names.end()
+    try:
+        validate_name(name)
+    except ProtocolError as exc:
+        # Preserve validate_name's local-configuration error contract while
+        # classifying a well-framed peer hostname as an invalid parameter.
+        raise ProtocolError(str(exc), alert=47) from exc
     return name
 
 

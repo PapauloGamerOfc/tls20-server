@@ -71,6 +71,7 @@ class CertificateVerifyAlertTests(unittest.IsolatedAsyncioTestCase):
     async def exchange(self, suite, mutated_sender, mutation, *, pha=False):
         roles, errors, channels, flights = {}, {}, {}, {}
         tasks, writers, wire_alerts, scopes, records, states = [], [], [], [], [], []
+        client_started, accepted = asyncio.Event(), asyncio.Event()
         listener = None
         initial = True
         send, read = hs.Wire.send_frame, hs.Wire.read_record
@@ -120,8 +121,13 @@ class CertificateVerifyAlertTests(unittest.IsolatedAsyncioTestCase):
             except ProtocolError as error:
                 errors[role] = error
 
-        def accept(reader, writer):
-            tasks.append(asyncio.create_task(run("server", reader, writer)))
+        async def accept(reader, writer):
+            # Force registration after the client task exists. Different event
+            # loops can otherwise hide a snapshot race in gather(*tasks).
+            await client_started.wait()
+            tasks.append(asyncio.current_task())
+            accepted.set()
+            await run("server", reader, writer)
 
         try:
             with patch.object(hs.Wire, "send_frame", changed), patch.object(hs.Wire, "read_record", observed), \
@@ -129,6 +135,8 @@ class CertificateVerifyAlertTests(unittest.IsolatedAsyncioTestCase):
                 listener = await asyncio.start_server(accept, "127.0.0.1", 0)
                 reader, writer = await asyncio.open_connection("127.0.0.1", listener.sockets[0].getsockname()[1])
                 tasks.append(asyncio.create_task(run("client", reader, writer)))
+                client_started.set()
+                await asyncio.wait_for(accepted.wait(), 4)
                 await asyncio.wait_for(asyncio.gather(*tasks), 4)
                 initial = False
                 if pha:
